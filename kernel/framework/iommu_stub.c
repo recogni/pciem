@@ -112,9 +112,45 @@ static const struct iommu_domain_ops pciem_stub_domain_ops = {
     .free            = pciem_stub_domain_free,
 };
 
+/* Static "blocked" domain ops — modern iommu drivers expose a
+ * single-instance ops->blocked_domain so the core never allocates one
+ * via domain_alloc_paging. attach is a no-op (we don't actually
+ * translate; for synthetic devices "blocked" and "anything" look the
+ * same). free is NULL because the core never tries to free statics. */
+static int pciem_stub_blocked_attach(struct iommu_domain *domain, struct device *dev)
+{
+    return 0;
+}
+
+static const struct iommu_domain_ops pciem_stub_blocked_ops = {
+    .attach_dev = pciem_stub_blocked_attach,
+};
+
+static struct iommu_domain pciem_stub_blocked_domain = {
+    .type = IOMMU_DOMAIN_BLOCKED,
+    .ops  = &pciem_stub_blocked_ops,
+};
+
 /* ---------------------------------------------------------------- */
 /* iommu_ops — per-device probe + per-device group + paging alloc   */
 /* ---------------------------------------------------------------- */
+
+static bool pciem_stub_capable(struct device *dev, enum iommu_cap cap)
+{
+    /* vfio_register_group_dev() refuses to bind a device whose IOMMU
+     * doesn't advertise IOMMU_CAP_CACHE_COHERENCY (vfio_main.c:
+     * "VFIO always sets IOMMU_CACHE..."). For our pass-through stub on
+     * synthetic devices, cache coherency is trivially "true" — there is
+     * no DMA to incoherent memory because there is no real DMA at all.
+     */
+    switch (cap) {
+    case IOMMU_CAP_CACHE_COHERENCY:
+    case IOMMU_CAP_DEFERRED_FLUSH:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static struct iommu_device *pciem_stub_probe_device(struct device *dev)
 {
@@ -147,10 +183,12 @@ static struct iommu_domain *pciem_stub_domain_alloc_paging(struct device *dev)
 }
 
 static const struct iommu_ops pciem_stub_iommu_ops = {
+    .capable             = pciem_stub_capable,
     .device_group        = pciem_stub_device_group,
     .probe_device        = pciem_stub_probe_device,
     .release_device      = pciem_stub_release_device,
     .domain_alloc_paging = pciem_stub_domain_alloc_paging,
+    .blocked_domain      = &pciem_stub_blocked_domain,
     .default_domain_ops  = &pciem_stub_domain_ops,
     .owner               = THIS_MODULE,
 };
@@ -204,6 +242,32 @@ void pciem_iommu_stub_exit(void)
 /* per-device hookup                                                */
 /* ---------------------------------------------------------------- */
 
+/*
+ * !!! ILC_emulator PROTO / LOCAL HACK !!!
+ *
+ * The iommu_probe_device() symbol is not exported in mainline
+ * (drivers/iommu/iommu.c). For pciem to retrigger iommu probe after
+ * setting fwspec late on synthetic devices, we depend on a local
+ * kernel patch that adds EXPORT_SYMBOL_GPL(iommu_probe_device).
+ * Search-tag: ILC-PROTO-IOMMU-EXPORT.
+ *
+ * The upstream-clean path is one of:
+ *   (1) export iommu_probe_device upstream
+ *   (2) add iommu_register_synthetic_dev() helper symmetric with
+ *       iommu_mock_device_add() but for already-bus-added devices
+ *   (3) software_node "iommus" property honoured by pci_dma_configure
+ * Both (1) and (2) are simple kernel patches; (3) is bigger.
+ *
+ * The forward declaration below lets iommu_stub.c build standalone
+ * regardless of whether the export is present: in mainline the
+ * declaration matches the (private) function and link succeeds because
+ * the local kernel patch makes it visible. On unpatched mainline the
+ * MODPOST step will report iommu_probe_device as undefined and pciem
+ * fails to load — which is the correct behaviour, since this build
+ * configuration cannot escape noiommu mode anyway.
+ */
+extern int iommu_probe_device(struct device *dev);
+
 int pciem_iommu_stub_attach(struct device *dev)
 {
     struct fwnode_handle *fwnode;
@@ -213,31 +277,6 @@ int pciem_iommu_stub_attach(struct device *dev)
     if (!fwnode)
         return -ENODEV;
 
-    /* iommu_fwspec_init associates @dev with the iommu identified by
-     * @fwnode. The iommu core will pick up our ops the next time it
-     * probes the device — typically via the BUS_NOTIFY_ADD_DEVICE
-     * notifier (already registered by iommu_subsys_init for
-     * pci_bus_type). For devices added BEFORE we set fwspec the
-     * notifier already fired with no ops; in that case the kernel core
-     * exposes no public re-probe API, so vfio-pci bind below requires
-     * the device to have been ADDed AFTER we set fwspec.
-     *
-     * In pciem the typical call sequence is:
-     *   pci_scan_root_bus_bridge() -> pci_device_add() -> device_add()
-     *     -> BUS_NOTIFY_ADD_DEVICE -> iommu_bus_notifier ->
-     *        iommu_probe_device() (fwspec is NULL → no group)
-     *   ... activation_work_func runs later ...
-     *     -> pci_bus_add_devices() (driver_initial_probe)
-     *
-     * To get our fwspec in BEFORE the bus notifier fires, callers must
-     * invoke pciem_iommu_stub_attach() between pci_scan_single_device
-     * and pci_bus_add_devices, ideally right after pci_device_add for
-     * a freshly created pci_dev. The pciem virtual-root path scans
-     * the bus all-at-once so we have to fwspec-init each device after
-     * it's already added; the kernel core's "fwspec set late" path is
-     * not yet wired up upstream. See the upstream-followup notes in
-     * the commit message.
-     */
     rc = iommu_fwspec_init(dev, fwnode);
     if (rc && rc != -EALREADY) {
         pr_err("pciem-iommu-stub: fwspec_init(%s) failed: %d\n",
@@ -245,8 +284,20 @@ int pciem_iommu_stub_attach(struct device *dev)
         return rc;
     }
 
-    pr_info("pciem-iommu-stub: %s fwspec-initialised "
-            "(iommu_group will be assigned on next iommu probe trigger)\n",
-            dev_name(dev));
+    /* Re-trigger iommu probe now that fwspec is set. The bus notifier
+     * already fired with NULL fwspec at pci_device_add time, so we
+     * have to drive this manually. Requires the local kernel patch
+     * tagged ILC-PROTO-IOMMU-EXPORT. */
+    rc = iommu_probe_device(dev);
+    if (rc) {
+        pr_warn("pciem-iommu-stub: iommu_probe_device(%s) failed: %d "
+                "(kernel without EXPORT_SYMBOL_GPL(iommu_probe_device)?)\n",
+                dev_name(dev), rc);
+        return rc;
+    }
+
+    pr_info("pciem-iommu-stub: %s attached, iommu_group=%d\n",
+            dev_name(dev),
+            dev->iommu_group ? iommu_group_id(dev->iommu_group) : -1);
     return 0;
 }
