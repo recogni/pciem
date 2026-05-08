@@ -13,6 +13,7 @@
 #include "p2p.h"
 #include "pool.h"
 #include "userspace.h"
+#include "iommu_stub.h"
 
 #include <linux/pci.h>
 #include <linux/pci_ids.h>
@@ -738,7 +739,24 @@ static void pciem_activation_work_func(struct work_struct *work)
                 pci_bus_add_device(fn->pciem_pdev);
         }
     }
-    
+
+    /*
+     * Hook each synthetic device to the stub IOMMU so vfio-pci's probe
+     * path doesn't need vfio.enable_unsafe_noiommu_mode. Failure is
+     * non-fatal — userspace can still fall back to noiommu mode.
+     */
+    if (v->bus_mode == PCIEM_BUS_MODE_VIRTUAL_ROOT && v->root_bus) {
+        struct pci_dev *pdev;
+        list_for_each_entry(pdev, &v->root_bus->devices, bus_list)
+            (void)pciem_iommu_stub_attach(&pdev->dev);
+    } else if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
+        for (f = 0; f < PCIEM_MAX_FUNCTIONS; f++) {
+            struct pciem_root_complex *fn = v->sibling_funcs[f];
+            if (fn && fn->pciem_pdev)
+                (void)pciem_iommu_stub_attach(&fn->pciem_pdev->dev);
+        }
+    }
+
     v->activated = true;
 }
 
@@ -1192,6 +1210,13 @@ static int __init pciem_init(void)
         goto fail_misc;
     }
 
+    /* Register the stub IOMMU so synthetic devices can be vfio-pci'd
+     * without enable_unsafe_noiommu_mode. Failure here is non-fatal —
+     * pciem still works, just without VFIO-without-noiommu. */
+    ret = pciem_iommu_stub_init();
+    if (ret)
+        pr_warn("init: stub IOMMU registration failed: %d (vfio-pci bind will need noiommu)\n", ret);
+
     pr_info("init: Created /dev/pciem for userspace device creation\n");
     pr_info("init: pciem framework loaded\n");
     return 0;
@@ -1209,6 +1234,7 @@ static void __exit pciem_exit(void)
 {
     pr_info("exit: unloading pciem framework\n");
 
+    pciem_iommu_stub_exit();
     misc_deregister(&pciem_dev);
     pciem_userspace_cleanup();
     pciem_cleanup_virtual_root_nomsi_domain();
