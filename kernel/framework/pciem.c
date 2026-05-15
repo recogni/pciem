@@ -28,6 +28,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
+#include <linux/msi.h>
 #include <linux/ioport.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
@@ -202,6 +203,19 @@ int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
         int max_vec = pci_msix_vec_count(dev);
         if (vector < 0 || vector >= max_vec) {
             pr_debug("pciem: vector %d out of range (max %d), using 0\n", vector, max_vec - 1);
+            vector = 0;
+        }
+        irq = pci_irq_vector(dev, vector);
+    }
+    else if (dev->msi_enabled) {
+        /*
+         * Multi-vector MSI: route per-vector via pci_irq_vector(). The
+         * old fallback to dev->irq only delivered to vector 0 even when
+         * the device advertised num_vectors_log2 > 0.
+         */
+        int max_vec = pci_msi_vec_count(dev);
+        if (vector < 0 || vector >= max_vec) {
+            pr_debug("pciem: msi vector %d out of range (max %d), using 0\n", vector, max_vec - 1);
             vector = 0;
         }
         irq = pci_irq_vector(dev, vector);
@@ -785,11 +799,23 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     bridge->ops = &vph_pci_ops;
     list_splice_init(resources, &bridge->windows);
     /*
-     * Virtual-root instances are synthetic and have no firmware-described
-     * MSI routing. Install a private no-MSI domain before bridge
-     * registration so the PCI core does not walk the ACPI/IORT MSI path.
+     * Originally pciem set bridge->dev->msi_domain to a private no-MSI
+     * placeholder here to bypass firmware MSI discovery. The side effect
+     * is that during pci_scan_root_bus_bridge, pcibios_add_device walks
+     * dev_get_msi_domain(&dev->bus->dev) and inherits the placeholder
+     * onto every scanned pci_dev — which forces the kernel down the
+     * pci_msi_legacy_setup_msi_irqs path. That path's __weak
+     * arch_setup_msi_irqs hard-rejects multi-vector MSI on x86 (see
+     * drivers/pci/msi/legacy.c: `if (type == PCI_CAP_ID_MSI && nvec > 1)
+     * return 1;`).
+     *
+     * Leaving msi_domain NULL lets pcibios_add_device fall through to
+     * x86_pci_msi_default_domain (the hierarchical x86 MSI domain),
+     * which DOES support multi-vector MSI and is what every standard
+     * x86 PCI device gets. Synthetic devices have no firmware MSI
+     * data to walk anyway, so there's nothing for the lookup to find
+     * and the fallback kicks in cleanly.
      */
-    dev_set_msi_domain(&bridge->dev, pciem_virtual_root_nomsi_domain);
 
     v->intx_domain = irq_domain_add_linear(NULL, 4, &irq_domain_simple_ops, v);
     if (!v->intx_domain) {
@@ -825,11 +851,16 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     }
 
     /*
-     * Keep MSI disabled after registration. The temporary bridge MSI domain
-     * only exists to bypass firmware MSI discovery during setup.
+     * Originally pciem set PCI_BUS_FLAGS_NO_MSI on the root bus here.
+     * We drop that flag: with the bridge left at msi_domain=NULL above,
+     * pcibios_add_device installs x86_pci_msi_default_domain on every
+     * scanned pci_dev, giving us the hierarchical MSI path that supports
+     * multi-vector MSI. PCI_BUS_FLAGS_NO_MSI would gate this in
+     * pci_msi_supported() and is no longer wanted.
+     *
+     * Device-side delivery still flows through pciem_trigger_msi() →
+     * pci_irq_vector() → generic_handle_irq().
      */
-    v->root_bus->bus_flags |= PCI_BUS_FLAGS_NO_MSI;
-    dev_set_msi_domain(&v->root_bus->dev, NULL);
 
     pciem_bus_init_resources(v);
     pci_bus_assign_resources(v->root_bus);
@@ -838,6 +869,53 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     if (!v->pciem_pdev) {
         pr_err("init: Failed to find emulated device (func %u)\n", v->func_index);
         return -ENODEV;
+    }
+    /*
+     * Synthetic pciem devices aren't in any ACPI DMAR scope, so the
+     * intel-iommu bus notifier's dmar_find_matched_drhd_unit() lookup
+     * returns NULL and our device's msi_domain stays NULL. Without an
+     * msi_domain, pci_msi_domain_supports() returns false on kernels
+     * with CONFIG_PCI_MSI_ARCH_FALLBACKS=n and pci_enable_msi*() bail
+     * with ENOTSUPP.
+     *
+     * For *multi-vector* MSI specifically we need an MSI parent whose
+     * msi_parent_ops::supported_flags include MSI_FLAG_MULTI_PCI_MSI.
+     * On x86 with IRQ remapping (VT-d / AMD-Vi) that's the IR-MSI
+     * domain (dmar_msi_parent_ops / amd_iommu's equivalent), held as
+     * iommu->ir_domain per IOMMU unit.
+     *
+     * Neither x86_pci_msi_default_domain nor x86_vector_domain is
+     * exported in a way that gives us the IR domain directly. Instead,
+     * walk the existing pci_dev list and adopt the first MSI parent
+     * that already advertises MSI_FLAG_MULTI_PCI_MSI — that's the IR
+     * domain belonging to one of the system's IOMMUs. Synthetic
+     * devices then route MSI through that IOMMU's IRTE table.
+     */
+    if (!dev_get_msi_domain(&v->pciem_pdev->dev)) {
+        struct pci_dev *donor = NULL;
+        struct irq_domain *ir_domain = NULL;
+        for_each_pci_dev(donor) {
+            struct irq_domain *d = dev_get_msi_domain(&donor->dev);
+            if (!d)
+                continue;
+            if (!(d->flags & IRQ_DOMAIN_FLAG_MSI_PARENT))
+                continue;
+            if (!d->msi_parent_ops)
+                continue;
+            if (d->msi_parent_ops->supported_flags & MSI_FLAG_MULTI_PCI_MSI) {
+                ir_domain = d;
+                break;
+            }
+        }
+        if (ir_domain) {
+            dev_set_msi_domain(&v->pciem_pdev->dev, ir_domain);
+            pr_info("pciem: %s msi_domain <- borrowed IR-MSI parent from %s\n",
+                    dev_name(&v->pciem_pdev->dev), dev_name(&donor->dev));
+        } else {
+            pr_warn("pciem: %s no IR-MSI parent found on the system — "
+                    "multi-vector MSI will not work\n",
+                    dev_name(&v->pciem_pdev->dev));
+        }
     }
 
     v->mode_state.virtual_root.bridge = bridge;
