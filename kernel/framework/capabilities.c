@@ -195,7 +195,19 @@ int pciem_add_cap_msi(struct pciem_root_complex *v, struct pciem_cap_msi_config 
     cap->config.msi = *cfg;
 
     memset(&cap->state.msi_state, 0, sizeof(cap->state.msi_state));
-    cap->state.msi_state.control = 0;
+    /*
+     * Seed control with the read-only fields (MMC = num_vectors_log2,
+     * 64BIT, MASKBIT) so that pci_read_config_word(PCI_MSI_FLAGS) via
+     * the cap handler returns the correct capability. Without this,
+     * vfio_pci_get_irq_count() / pci_msi_vec_count() see MMC=0 and
+     * report only 1 vector, even though the rendered cfg bytes contain
+     * the right num_vectors_log2.
+     */
+    cap->state.msi_state.control = (u16)(cfg->num_vectors_log2 << 1);
+    if (cfg->has_64bit)
+        cap->state.msi_state.control |= PCI_MSI_FLAGS_64BIT;
+    if (cfg->has_per_vector_masking)
+        cap->state.msi_state.control |= PCI_MSI_FLAGS_MASKBIT;
 
     mgr->next_offset += cap->size;
     mgr->num_caps++;
@@ -719,9 +731,19 @@ static bool handle_msi_write(struct pciem_cap_entry *cap, u8 *storage,
     struct pciem_msi_state *st = &cap->state.msi_state;
 
     if (offset == PCI_MSI_FLAGS && size == 2) {
-        st->control = value & 0xffff;
+        /*
+         * Preserve the read-only fields (MMC, 64BIT, MASKBIT) seeded
+         * at registration; only let writes touch the RW bits
+         * (Enable + MME + PVMASK + … depending on the spec).
+         */
+        u16 ro_mask = PCI_MSI_FLAGS_QMASK
+                    | PCI_MSI_FLAGS_64BIT
+                    | PCI_MSI_FLAGS_MASKBIT;
+        st->control = (st->control & ro_mask)
+                    | ((u16)value & (u16)~ro_mask);
         put_unaligned_le16(st->control, storage + offset);
-        pr_info("MSI Control written: 0x%04x (Enable: %d)\n", value, !!(value & PCI_MSI_FLAGS_ENABLE));
+        pr_info("MSI Control written: 0x%04x (Enable: %d)\n",
+                st->control, !!(st->control & PCI_MSI_FLAGS_ENABLE));
         return true;
     }
     if (offset == PCI_MSI_ADDRESS_LO && size == 4)
