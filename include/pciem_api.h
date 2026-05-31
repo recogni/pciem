@@ -315,15 +315,21 @@ struct pciem_trace_bar
  * Lock-free single-producer/single-consumer event ring shared between the
  * kernel and userspace.
  *
- * The kernel writes events by advancing @head; userspace consumes them by
- * advancing @tail. Each counter is cache-line padded.
+ * The kernel writes events by advancing @tail; userspace consumes them by
+ * advancing @head. Each counter is cache-line padded.
  * The ring is mapped read-only into userspace via mmap on the PCIem fd.
  *
- * @param head    Write index, owned by the kernel. Incremented atomically
- *                after each event is committed.
- * @param _pad1   Cache-line padding to isolate @head from @tail.
- * @param tail    Read index, owned by userspace. Incremented after each event
+ * Note: this is the reverse of the doc-comment that used to live here.
+ * Earlier prose said "kernel advances head; userspace advances tail" but
+ * pciem_shared_ring_push has always advanced tail (and the protopciem
+ * example userspace daemon has always consumed by advancing head). The
+ * doc-comment was wrong; the code is the contract.
+ *
+ * @param head    Read index, owned by userspace. Incremented after each event
  *                is consumed.
+ * @param _pad1   Cache-line padding to isolate @head from @tail.
+ * @param tail    Write index, owned by the kernel. Incremented atomically
+ *                after each event is committed.
  * @param _pad2   Cache-line padding to isolate @tail from the event array.
  * @param events  Circular buffer of PCIEM_RING_SIZE events.
  */
