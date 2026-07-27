@@ -31,6 +31,14 @@ typedef void (*smptrace_handler_t)(struct smptrace_ctx *ctx, struct smptrace_io 
 struct smptrace_notifier {
 	smptrace_handler_t read;
 	smptrace_handler_t write;
+	/*
+	 * Synchronous read hook. Called BEFORE the shadow read with
+	 * io->offset / io->size filled in. Returns 0 with io->data set to
+	 * the value the faulting instruction must observe; nonzero falls
+	 * back to the shadow read. Runs in the #PF emulation path
+	 * (atomic context) — implementations must not sleep.
+	 */
+	int (*read_sync)(struct smptrace_ctx *ctx, struct smptrace_io *io);
 };
 
 /* An un-poisoned PTE */
