@@ -9,6 +9,8 @@
 
 #include "pool.h"
 
+#include <linux/mm.h>
+
 struct pciem_mempool {
     phys_addr_t         base;
     resource_size_t     total_size;
@@ -82,6 +84,22 @@ int pciem_pool_init(const char *phys_region)
     if (!size || (size & (size - 1))) {
         pr_err("Region size 0x%llx must be a power of 2\n", (u64)size);
         return -EINVAL;
+    }
+
+    /*
+     * insert_resource() nests the pool inside an enclosing resource when it
+     * fits, so a window that lies within System RAM is accepted and reserves
+     * nothing: the pages stay owned by the page allocator while we hand their
+     * physical addresses out as BAR backing store. Reject that here, while the
+     * address is still attributable to the module parameter.
+     */
+    if (region_intersects(base, size, IORESOURCE_SYSTEM_RAM,
+                          IORES_DESC_NONE) != REGION_DISJOINT) {
+        pr_err("phys_region [0x%llx-0x%llx] overlaps System RAM\n",
+               (u64)base, (u64)(base + size - 1));
+        pr_err("reserve it first, e.g. memmap=0x%llx$0x%llx\n",
+               (u64)size, (u64)base);
+        return -EBUSY;
     }
 
     res->start = base;
