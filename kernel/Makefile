@@ -7,7 +7,8 @@ pciem-objs := framework/pciem.o \
               framework/p2p.o \
               framework/dma.o \
               framework/userspace.o \
-              framework/pool.o
+              framework/pool.o \
+              framework/iommu_stub.o
 
 pciem-objs += trace/smptrace.o \
               trace/arch/$(ARCH)/smptrace_arch.o

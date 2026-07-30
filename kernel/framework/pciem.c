@@ -13,6 +13,7 @@
 #include "p2p.h"
 #include "pool.h"
 #include "userspace.h"
+#include "iommu_stub.h"
 
 #include <linux/pci.h>
 #include <linux/pci_ids.h>
@@ -738,7 +739,17 @@ static void pciem_activation_work_func(struct work_struct *work)
                 pci_bus_add_device(fn->pciem_pdev);
         }
     }
-    
+
+    /*
+     * Stub IOMMU hookup is automatic now: pciem_iommu_stub_register_bridge
+     * was called when the host_bridge was allocated, and the high-priority
+     * pci_bus_type notifier installed by the stub fires on every
+     * BUS_NOTIFY_ADD_DEVICE for our bus, installing iommu_fwspec ahead of
+     * the iommu core's notifier. ATTACH_TO_HOST devices live on a real
+     * bus with a real platform IOMMU and intentionally take no part in
+     * this — their iommu_group comes from intel-iommu / amd-iommu / smmu.
+     */
+
     v->activated = true;
 }
 
@@ -784,6 +795,16 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     bridge->busnr = busnr;
     bridge->ops = &vph_pci_ops;
     list_splice_init(resources, &bridge->windows);
+
+    /*
+     * Mark this bridge as pciem-owned BEFORE the bus is scanned — the
+     * scan fires BUS_NOTIFY_ADD_DEVICE for every synthetic pci_dev, and
+     * the stub IOMMU's high-priority notifier looks up pdev->bus->bridge
+     * in its bridge list to decide whether to install fwspec. Doing this
+     * after the scan would leave the very first cohort of devices
+     * unbound to the stub.
+     */
+    (void)pciem_iommu_stub_register_bridge(&bridge->dev);
     /*
      * Virtual-root instances are synthetic and have no firmware-described
      * MSI routing. Install a private no-MSI domain before bridge
@@ -795,6 +816,7 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     if (!v->intx_domain) {
         pr_err("init: failed to create INTx irq_domain\n");
         dev_set_msi_domain(&bridge->dev, NULL);
+        pciem_iommu_stub_unregister_bridge(&bridge->dev);
         pci_free_host_bridge(bridge);
         return -ENOMEM;
     }
@@ -812,6 +834,7 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     if (rc < 0) {
         pr_err("init: pci_scan_root_bus_bridge failed: %d\n", rc);
         dev_set_msi_domain(&bridge->dev, NULL);
+        pciem_iommu_stub_unregister_bridge(&bridge->dev);
         pci_free_host_bridge(bridge);
         return -ENODEV;
     }
@@ -1068,6 +1091,8 @@ fail_device:
         v->pciem_pdev = NULL;
     }
     if (v->bus_mode == PCIEM_BUS_MODE_VIRTUAL_ROOT && v->root_bus) {
+        if (v->root_bus->bridge)
+            pciem_iommu_stub_unregister_bridge(v->root_bus->bridge);
         pci_remove_root_bus(v->root_bus);
         v->root_bus = NULL;
     } else if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
@@ -1124,6 +1149,8 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
     if (v->root_bus)
     {
         if (v->bus_mode == PCIEM_BUS_MODE_VIRTUAL_ROOT) {
+            if (v->root_bus->bridge)
+                pciem_iommu_stub_unregister_bridge(v->root_bus->bridge);
             pci_remove_root_bus(v->root_bus);
         } else if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
             if (v->mode_state.hijack.original_ops) {
@@ -1192,6 +1219,13 @@ static int __init pciem_init(void)
         goto fail_misc;
     }
 
+    /* Register the stub IOMMU so synthetic devices can be vfio-pci'd
+     * without enable_unsafe_noiommu_mode. Failure here is non-fatal —
+     * pciem still works, just without VFIO-without-noiommu. */
+    ret = pciem_iommu_stub_init();
+    if (ret)
+        pr_warn("init: stub IOMMU registration failed: %d (vfio-pci bind will need noiommu)\n", ret);
+
     pr_info("init: Created /dev/pciem for userspace device creation\n");
     pr_info("init: pciem framework loaded\n");
     return 0;
@@ -1209,6 +1243,7 @@ static void __exit pciem_exit(void)
 {
     pr_info("exit: unloading pciem framework\n");
 
+    pciem_iommu_stub_exit();
     misc_deregister(&pciem_dev);
     pciem_userspace_cleanup();
     pciem_cleanup_virtual_root_nomsi_domain();
