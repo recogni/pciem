@@ -47,7 +47,7 @@
 #include "trace/smptrace.h"
 #include "trace/smptrace_internal.h"
 
-static void __fill_io_notif(struct smptrace_io *io, const u8 *data, u32 size,
+static bool __fill_io_notif(struct smptrace_io *io, const u8 *data, u32 size,
                             u64 off)
 {
 	io->offset = off;
@@ -66,8 +66,11 @@ static void __fill_io_notif(struct smptrace_io *io, const u8 *data, u32 size,
 		io->data.qword = *(u64 *)data;
 		break;
 	default:
-		BUG();
+		pr_warn_once("unsupported access size %u, dropping notification\n",
+		             size);
+		return false;
 	}
+	return true;
 }
 
 void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
@@ -77,13 +80,16 @@ void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
 	struct smptrace_io io;
 
 	off = (map->pa - ctx->pa) + (addr - map->va);
-	BUG_ON(off >= ctx->len || off + size > ctx->len);
+	if (off >= ctx->len || off + size > ctx->len) {
+		pr_warn_once("read off 0x%llx size %u outside region len 0x%llx\n",
+		             off, size, (u64)ctx->len);
+		memset(dst, 0, size);
+		return;
+	}
 	memcpy_fromio(dst, ctx->shadow_va + off, size);
 
-	if (ctx->notif.read) {
-		__fill_io_notif(&io, dst, size, off);
+	if (ctx->notif.read && __fill_io_notif(&io, dst, size, off))
 		ctx->notif.read(ctx, &io);
-	}
 }
 
 void smptrace_emulate_write(struct smptrace_ctx *ctx, struct smptrace_map *map,
@@ -93,17 +99,19 @@ void smptrace_emulate_write(struct smptrace_ctx *ctx, struct smptrace_map *map,
 	struct smptrace_io io = {0};
 
 	off = (map->pa - ctx->pa) + (addr - map->va);
-	BUG_ON(off >= ctx->len || off + size > ctx->len);
+	if (off >= ctx->len || off + size > ctx->len) {
+		pr_warn_once("write off 0x%llx size %u outside region len 0x%llx\n",
+		             off, size, (u64)ctx->len);
+		return;
+	}
 
 	if (!ctx->stop_writes)
 		memcpy_toio(ctx->shadow_va + off, src, size);
 
 	pr_debug("Write @ 0x%llx:%x", off, size);
 
-	if (ctx->notif.write) {
-		__fill_io_notif(&io, src, size, off);
+	if (ctx->notif.write && __fill_io_notif(&io, src, size, off))
 		ctx->notif.write(ctx, &io);
-	}
 }
 
 int smptrace_enter_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
