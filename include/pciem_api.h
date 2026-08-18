@@ -276,16 +276,6 @@ struct pciem_dma_indirect
  */
 #define PCIEM_TRACE_STOP_WRITES   (1 << 2)
 
-/*
- * Route reads through userspace synchronously: on a read fault the kernel
- * pushes a PCIEM_EVENT_MMIO_READ request onto the ring and spins (bounded)
- * until the daemon answers via write(fd, struct pciem_response). The
- * response's @data becomes the value the faulting instruction reads.
- * Required for destructive-read registers (FIFO data ports). Falls back
- * to the BAR shadow on timeout.
- */
-#define PCIEM_TRACE_SYNC_READS    (1 << 3)
-
 /**
  * Parameters for PCIEM_IOCTL_TRACE_BAR.
  *

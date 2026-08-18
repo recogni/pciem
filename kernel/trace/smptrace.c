@@ -86,19 +86,6 @@ void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
 		memset(dst, 0, size);
 		return;
 	}
-
-	/* Handler-routed read: the device model produces the value. */
-	if (ctx->notif.read_sync) {
-		io.offset = off;
-		io.size = size;
-		if (!ctx->notif.read_sync(ctx, &io)) {
-			/* Union members alias the low bytes; LE layout. */
-			memcpy(dst, &io.data, size);
-			return;
-		}
-		/* Timeout or ring-full: fall through to the shadow. */
-	}
-
 	memcpy_fromio(dst, ctx->shadow_va + off, size);
 
 	if (ctx->notif.read && __fill_io_notif(&io, dst, size, off))

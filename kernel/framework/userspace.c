@@ -69,6 +69,7 @@ struct pciem_userspace_state
 
     struct hlist_head pending_requests[256];
     spinlock_t pending_lock;
+    uint64_t next_seq;
 
     atomic_t registered;
     atomic_t event_pending;
@@ -83,10 +84,6 @@ struct pciem_userspace_state
 
     /* BAR read/write trackers */
     struct pciem_tracer tracers[PCIEM_MAX_FUNCTIONS][PCI_STD_NUM_BARS];
-
-    /* Monotonic event sequence numbers; sync-read requests are matched
-     * to responses by seq, so every ring event gets a real one. */
-    atomic64_t event_seq;
 
     struct kref refcnt;
 };
@@ -300,8 +297,8 @@ struct pciem_userspace_state *pciem_userspace_create(void)
 
     for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++)
         INIT_HLIST_HEAD(&us->pending_requests[i]);
-    atomic64_set(&us->event_seq, 0);
     spin_lock_init(&us->pending_lock);
+    us->next_seq = 1;
 
     atomic_set(&us->registered, PCIEM_UNREGISTERED);
     atomic_set(&us->event_pending, 0);
@@ -401,8 +398,6 @@ static void pciem_userspace_queue_event(struct pciem_userspace_state *us,
         return;
 
     event->timestamp = ktime_get_ns();
-    if (!event->seq)
-        event->seq = atomic64_inc_return(&us->event_seq);
 
     if (!pciem_shared_ring_push(us, event))
         pr_warn_ratelimited("Shared ring buffer full, dropping event for userspace (seq=%llu)\n",
@@ -1384,93 +1379,6 @@ static void pciem_notif_read(struct smptrace_ctx *ctx, struct smptrace_io *io)
     pciem_notif_trace(ctx, io, PCIEM_EVENT_MMIO_READ);
 }
 
-/*
- * Synchronous handler-routed read (PCIEM_TRACE_SYNC_READS).
- *
- * Runs in the #PF emulation path: atomic context, so we cannot sleep.
- * Push a request event, then spin (bounded) until the daemon answers
- * through pciem_device_write(), which completes the pending request.
- * The daemon runs on another CPU, so the spin resolves in the time one
- * event round-trip takes (microseconds when the daemon is healthy).
- *
- * Returns 0 with io->data holding the value on success; -ETIMEDOUT if
- * the daemon never answered (caller falls back to the BAR shadow).
- */
-#define PCIEM_SYNC_READ_TIMEOUT_MS 100
-
-static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *io)
-{
-    struct pciem_tracer *tracer = container_of(ctx, struct pciem_tracer, ctx);
-    struct pciem_userspace_state *us = tracer->us;
-    struct pciem_pending_request req;
-    struct pciem_event ev = {0};
-    unsigned long deadline = jiffies + msecs_to_jiffies(PCIEM_SYNC_READ_TIMEOUT_MS);
-    unsigned long flags;
-    int hash;
-    bool answered;
-
-    ev.type = PCIEM_EVENT_MMIO_READ;
-    ev.bar = ctx->opaque;
-    ev.offset = io->offset;
-    ev.size = io->size;
-    ev.seq = atomic64_inc_return(&us->event_seq);
-
-    req.seq = ev.seq;
-    req.response_data = 0;
-    req.response_status = -ETIMEDOUT;
-    init_completion(&req.done);
-
-    hash = (int)(req.seq % ARRAY_SIZE(us->pending_requests));
-
-    /* Publish the request before the event so the response always
-     * finds it. */
-    spin_lock_irqsave(&us->pending_lock, flags);
-    hlist_add_head(&req.node, &us->pending_requests[hash]);
-    spin_unlock_irqrestore(&us->pending_lock, flags);
-
-    pciem_userspace_queue_event(us, &ev);
-
-    while (!completion_done(&req.done)) {
-        if (time_after(jiffies, deadline))
-            break;
-        cpu_relax();
-    }
-
-    /* Unpublish under the lock; the responder also runs under it, so
-     * after this either the completion fired or it never will. */
-    spin_lock_irqsave(&us->pending_lock, flags);
-    hlist_del(&req.node);
-    answered = completion_done(&req.done);
-    spin_unlock_irqrestore(&us->pending_lock, flags);
-
-    if (!answered || req.response_status) {
-        pr_warn_ratelimited("sync read timed out/failed (bar=%llu off=0x%llx seq=%llu status=%d)\n",
-                            (unsigned long long)ev.bar,
-                            (unsigned long long)ev.offset,
-                            (unsigned long long)ev.seq,
-                            answered ? req.response_status : -ETIMEDOUT);
-        return -ETIMEDOUT;
-    }
-
-    switch (io->size) {
-    case 1:
-        io->data.byte = (u8)req.response_data;
-        break;
-    case 2:
-        io->data.word = (u16)req.response_data;
-        break;
-    case 4:
-        io->data.dword = (u32)req.response_data;
-        break;
-    case 8:
-        io->data.qword = req.response_data;
-        break;
-    default:
-        return -EINVAL;
-    }
-    return 0;
-}
-
 static int pciem_ioctl_trace_bar(struct pciem_userspace_state *us,
                                  struct pciem_trace_bar __user *arg)
 {
@@ -1530,8 +1438,6 @@ static int pciem_ioctl_trace_bar(struct pciem_userspace_state *us,
             tracer->ctx.notif.write = pciem_notif_write;
         if (req.flags & PCIEM_TRACE_READS)
             tracer->ctx.notif.read  = pciem_notif_read;
-        if (req.flags & PCIEM_TRACE_SYNC_READS)
-            tracer->ctx.notif.read_sync = pciem_notif_read_sync;
         tracer->ctx.stop_writes = req.flags & PCIEM_TRACE_STOP_WRITES;
     }
 
