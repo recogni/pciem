@@ -316,6 +316,7 @@ static void pciem_userspace_destroy(struct kref *refcnt)
     struct pciem_userspace_state *us = container_of(refcnt, struct pciem_userspace_state, refcnt);
     struct pciem_pending_request *req;
     struct hlist_node *tmp;
+    unsigned long flags;
     int i, f;
 
     if (!us)
@@ -324,15 +325,26 @@ static void pciem_userspace_destroy(struct kref *refcnt)
     pciem_tracing_destroy(us);
     pciem_irqfds_shutdown(&us->irqfds);
 
+    /* Force-complete any reads still blocked in pciem_submit_mmio_read()
+     * before this us (and the root complexes it owns) goes away, so a
+     * blocked .read() can never deadlock against device removal.
+     *
+     * Unlink under pending_lock BEFORE complete() — once complete()
+     * runs, the waiter may wake and free req at any point, so nothing
+     * here may touch req afterward. hlist_del_init() (not hlist_del())
+     * so pciem_submit_mmio_read()'s own timeout path can reliably tell
+     * via hlist_unhashed() whether this loop already claimed a given
+     * request. */
     for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++)
     {
+        spin_lock_irqsave(&us->pending_lock, flags);
         hlist_for_each_entry_safe(req, tmp, &us->pending_requests[i], node)
         {
             req->response_status = -ENODEV;
+            hlist_del_init(&req->node);
             complete(&req->done);
-            hlist_del(&req->node);
-            kfree(req);
         }
+        spin_unlock_irqrestore(&us->pending_lock, flags);
     }
 
     __free_pages(virt_to_page(us->shared_ring), get_order(sizeof(struct pciem_shared_ring)));
@@ -502,6 +514,12 @@ static ssize_t pciem_device_write(struct file *file, const char __user *buf, siz
     {
         req->response_data = response.data;
         req->response_status = response.status;
+        /* Unlink before waking the waiter — see the matching comment
+         * in pciem_userspace_destroy(). Whoever unlinks the request
+         * (this completer, or pciem_submit_mmio_read()'s own timeout
+         * path) is the only one still permitted to touch it; the
+         * waiter always performs the actual kfree(), exactly once. */
+        hlist_del_init(&req->node);
         complete(&req->done);
     }
     spin_unlock_irqrestore(&us->pending_lock, flags);
@@ -511,6 +529,88 @@ static ssize_t pciem_device_write(struct file *file, const char __user *buf, siz
 
     return sizeof(response);
 }
+
+/*
+ * Called from pciem_vfio_pci.ko's .read override — ordinary process
+ * context servicing a guest pread(), never atomic — for an offset
+ * registered via PCIEM_IOCTL_SET_BAR_READ_INTERCEPTS. Queues a
+ * PCIEM_EVENT_MMIO_READ_REQUEST and blocks until the daemon answers
+ * via pciem_device_write() with a matching struct pciem_response, or
+ * until timeout_ms elapses.
+ *
+ * Returns 0 and fills *out_value on success, or a negative errno
+ * (notably -ETIMEDOUT) on failure. Deliberately never falls back to
+ * BAR shadow memory on failure — for a destructive read in particular,
+ * a consistent, honest failure beats a silently stale or duplicated
+ * answer.
+ */
+int pciem_submit_mmio_read(struct pciem_root_complex *v, u32 bar, u64 offset,
+                          u32 size, u64 *out_value, unsigned int timeout_ms)
+{
+    struct pciem_userspace_state *us;
+    struct pciem_pending_request *req;
+    struct pciem_event ev = {0};
+    unsigned long flags;
+    unsigned long left;
+    int hash;
+    int status;
+
+    if (!v || !out_value || size == 0 || size > sizeof(*out_value))
+        return -EINVAL;
+
+    us = v->owner_us;
+    if (!us)
+        return -ENODEV;
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+
+    init_completion(&req->done);
+
+    spin_lock_irqsave(&us->pending_lock, flags);
+    req->seq = us->next_seq++;
+    hash = (int)(req->seq % ARRAY_SIZE(us->pending_requests));
+    hlist_add_head(&req->node, &us->pending_requests[hash]);
+    spin_unlock_irqrestore(&us->pending_lock, flags);
+
+    ev.seq    = req->seq;
+    ev.type   = PCIEM_EVENT_MMIO_READ_REQUEST;
+    ev.bar    = bar;
+    ev.offset = offset;
+    ev.size   = size;
+    pciem_userspace_queue_event(us, &ev);
+
+    left = wait_for_completion_timeout(&req->done, msecs_to_jiffies(timeout_ms));
+    if (left == 0)
+    {
+        /* Timed out (from our perspective). Whoever unlinks req first —
+         * us here, or a completer whose complete() genuinely raced past
+         * our deadline — is the only side still permitted to touch it;
+         * the other side must back off rather than double-free/UAF. */
+        spin_lock_irqsave(&us->pending_lock, flags);
+        if (!hlist_unhashed(&req->node))
+        {
+            hlist_del_init(&req->node);
+            spin_unlock_irqrestore(&us->pending_lock, flags);
+            kfree(req);
+            return -ETIMEDOUT;
+        }
+        spin_unlock_irqrestore(&us->pending_lock, flags);
+        /* A completer (or pciem_userspace_destroy()'s forced-completion
+         * sweep) won the race and already unlinked req — its
+         * response_data/response_status are valid; fall through and
+         * use them rather than discarding a real answer. */
+    }
+
+    status = req->response_status;
+    if (status == 0)
+        *out_value = req->response_data;
+    kfree(req);
+
+    return status;
+}
+EXPORT_SYMBOL(pciem_submit_mmio_read);
 
 static int pciem_device_mmap(struct file *file, struct vm_area_struct *vma)
 {
@@ -562,6 +662,7 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
         return PTR_ERR(v);
 
     v->func_index = func;
+    v->owner_us = us;
 
     if (func == 0) {
         switch (cfg.flags & PCIEM_CREATE_FLAG_BUS_MODE_MASK) {
@@ -631,6 +732,51 @@ static long pciem_ioctl_add_bar(struct pciem_userspace_state *us, struct pciem_b
     }
 
     return ret;
+}
+
+static long pciem_ioctl_set_bar_read_intercepts(struct pciem_userspace_state *us,
+                                                struct pciem_bar_read_intercepts __user *arg)
+{
+    struct pciem_bar_read_intercepts cfg;
+    struct pciem_root_complex *v;
+    struct pciem_bar_info *bar;
+    unsigned int i;
+
+    /* No registration-state guard, matching pciem_ioctl_trace_bar:
+     * this is metadata consulted later by pciem_vfio_pci.ko, not
+     * something REGISTER needs to have finalized. Called from the
+     * daemon's Instance (post-REGISTER, ctl_fd) right alongside
+     * trace_bar in Spec::run(). */
+    if (copy_from_user(&cfg, arg, sizeof(cfg)))
+        return -EFAULT;
+
+    v = us_get_rc(us, cfg.func);
+    if (!v)
+        return -ENODEV;
+
+    if (cfg.bar_index >= PCI_STD_NUM_BARS)
+        return -EINVAL;
+
+    if (cfg.count > PCIEM_MAX_READ_INTERCEPTS)
+        return -EINVAL;
+
+    for (i = 0; i < cfg.count; i++)
+    {
+        if (cfg.ranges[i].len == 0)
+            return -EINVAL;
+    }
+
+    guard(write_lock_irqsave)(&v->bars_lock);
+
+    bar = &v->bars[cfg.bar_index];
+    for (i = 0; i < cfg.count; i++)
+        bar->read_intercepts[i] = cfg.ranges[i];
+    bar->num_read_intercepts = cfg.count;
+
+    pr_info("func%u BAR%u: %u handler-backed read range(s) registered\n",
+            cfg.func, cfg.bar_index, cfg.count);
+
+    return 0;
 }
 
 static long pciem_ioctl_add_capability(struct pciem_userspace_state *us, struct pciem_cap_config __user *arg)
@@ -1498,6 +1644,9 @@ static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned lon
 
     case PCIEM_IOCTL_GET_BAR_INFO:
         return pciem_ioctl_get_bar_info(us, (struct pciem_bar_info_query __user *)arg);
+
+    case PCIEM_IOCTL_SET_BAR_READ_INTERCEPTS:
+        return pciem_ioctl_set_bar_read_intercepts(us, (struct pciem_bar_read_intercepts __user *)arg);
 
     case PCIEM_IOCTL_SET_EVENTFD:
         return pciem_ioctl_set_eventfd(us, (struct pciem_eventfd_config __user *)arg);

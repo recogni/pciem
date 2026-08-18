@@ -32,6 +32,7 @@
 #endif
 
 struct pciem_root_complex;
+struct pciem_userspace_state;
 
 struct pciem_host_bridge_priv {
     struct pciem_root_complex *funcs[PCIEM_MAX_FUNCTIONS];
@@ -83,6 +84,11 @@ struct pciem_bar_info
 
     struct list_head vma_list;
     spinlock_t vma_lock;
+
+    /* Handler-backed read ranges, set via PCIEM_IOCTL_SET_BAR_READ_INTERCEPTS
+     * and consulted by pciem_vfio_pci.ko's .read override. */
+    struct pciem_bar_read_range read_intercepts[PCIEM_MAX_READ_INTERCEPTS];
+    unsigned int num_read_intercepts;
 };
 
 struct pciem_hijack_state {
@@ -144,6 +150,15 @@ struct pciem_root_complex
     bool activated;
 
     bool detaching;
+
+    /*
+     * Opaque back-pointer to the pciem_userspace_state that owns this
+     * function, set once at CREATE_DEVICE time. Lets a pci_dev-rooted
+     * lookup (pciem_lookup_root_complex(), used by pciem_vfio_pci.ko)
+     * reach the daemon's pending-request/completion machinery without
+     * userspace.c's internals leaking outside userspace.c itself.
+     */
+    struct pciem_userspace_state *owner_us;
 };
 
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector);
@@ -160,5 +175,22 @@ int pciem_init_bar_tracking(void);
 void pciem_cleanup_bar_tracking(void);
 void pciem_disable_bar_tracking(void);
 void __iomem *pciem_get_driver_bar_vaddr(struct pci_dev *pdev, u32 bar);
+
+/* Defined in pciem.c, EXPORT_SYMBOL'd for pciem_vfio_pci.ko: resolves a
+ * pci_dev on one of pciem's own virtual-root buses back to the
+ * pciem_root_complex tracking that function, or NULL if pdev isn't
+ * one of ours. */
+struct pciem_root_complex *pciem_lookup_root_complex(struct pci_dev *pdev);
+
+/*
+ * Defined in userspace.c, EXPORT_SYMBOL'd for pciem_vfio_pci.ko: block
+ * the calling thread (ordinary process context only — never call this
+ * from atomic/interrupt context) until the daemon answers a read of
+ * `size` bytes at `offset` in BAR `bar`, or until timeout_ms elapses.
+ * Returns 0 and fills *out_value on success, else a negative errno
+ * (notably -ETIMEDOUT); never falls back to BAR shadow memory.
+ */
+int pciem_submit_mmio_read(struct pciem_root_complex *v, u32 bar, u64 offset,
+                          u32 size, u64 *out_value, unsigned int timeout_ms);
 
 #endif /* PCIEM_FRAMEWORK_H */

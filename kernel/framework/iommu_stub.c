@@ -361,7 +361,7 @@ void pciem_iommu_stub_unregister_bridge(struct device *bridge_dev)
     mutex_unlock(&pciem_stub_bridges_lock);
 }
 
-static bool pciem_stub_owns_bus(struct pci_bus *bus)
+bool pciem_stub_owns_bus(struct pci_bus *bus)
 {
     struct pciem_stub_bridge *entry;
     struct device *bridge_dev;

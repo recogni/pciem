@@ -29,4 +29,13 @@ void pciem_iommu_stub_exit(void);
 int  pciem_iommu_stub_register_bridge(struct device *bridge_dev);
 void pciem_iommu_stub_unregister_bridge(struct device *bridge_dev);
 
+struct pci_bus;
+
+/*
+ * Is this bus one of pciem's own virtual-root buses? Shared with
+ * pciem_lookup_root_complex() (pciem.c) so bus-ownership checking has a
+ * single implementation instead of being duplicated per call site.
+ */
+bool pciem_stub_owns_bus(struct pci_bus *bus);
+
 #endif /* PCIEM_IOMMU_STUB_H */

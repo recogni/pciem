@@ -147,6 +147,15 @@ struct pciem_event
 #define PCIEM_EVENT_CONFIG_WRITE 4
 #define PCIEM_EVENT_MSI_ACK 5
 #define PCIEM_EVENT_RESET 6
+/*
+ * A guest read landed on an offset registered via
+ * PCIEM_IOCTL_SET_BAR_READ_INTERCEPTS. Unlike every other event type,
+ * this one is synchronous: the kernel thread servicing the guest's
+ * read is blocked in pciem_submit_mmio_read() waiting for userspace to
+ * reply with a matching struct pciem_response (write(2) on this fd),
+ * not just observing after the fact like PCIEM_EVENT_MMIO_READ.
+ */
+#define PCIEM_EVENT_MMIO_READ_REQUEST 7
 
 struct pciem_response
 {
@@ -290,6 +299,39 @@ struct pciem_trace_bar
     uint8_t  reserved[3];
 };
 
+#define PCIEM_MAX_READ_INTERCEPTS 16
+
+struct pciem_bar_read_range
+{
+    uint64_t offset;
+    uint64_t len;
+};
+
+/**
+ * Parameters for PCIEM_IOCTL_SET_BAR_READ_INTERCEPTS.
+ *
+ * Marks up to PCIEM_MAX_READ_INTERCEPTS byte ranges of one BAR as
+ * handler-backed: a guest read landing entirely inside one of these
+ * ranges is routed to pciem_vfio_pci.ko's synchronous read path
+ * (PCIEM_EVENT_MMIO_READ_REQUEST) instead of being answered directly
+ * from BAR shadow memory. Replaces any ranges previously set for this
+ * (func, bar_index) pair. No registration-state requirement (unlike
+ * ADD_BAR) — call any time after the BAR exists, e.g. right alongside
+ * PCIEM_IOCTL_TRACE_BAR.
+ *
+ * @param func       Function index this BAR belongs to.
+ * @param bar_index  BAR to configure (0–PCI_STD_NUM_BARS-1).
+ * @param count      Number of valid entries in @ranges (<= PCIEM_MAX_READ_INTERCEPTS).
+ */
+struct pciem_bar_read_intercepts
+{
+    uint32_t bar_index;
+    uint32_t count;
+    uint8_t  func;
+    uint8_t  reserved[7];
+    struct pciem_bar_read_range ranges[PCIEM_MAX_READ_INTERCEPTS];
+};
+
 #define PCIEM_IOCTL_MAGIC 0xAF
 
 #define PCIEM_IOCTL_CREATE_DEVICE _IOWR(PCIEM_IOCTL_MAGIC, 10, struct pciem_create_device)
@@ -302,6 +344,7 @@ struct pciem_trace_bar
 #define PCIEM_IOCTL_DMA_ATOMIC _IOWR(PCIEM_IOCTL_MAGIC, 17, struct pciem_dma_atomic)
 #define PCIEM_IOCTL_P2P _IOWR(PCIEM_IOCTL_MAGIC, 18, struct pciem_p2p_op_user)
 #define PCIEM_IOCTL_GET_BAR_INFO _IOWR(PCIEM_IOCTL_MAGIC, 19, struct pciem_bar_info_query)
+#define PCIEM_IOCTL_SET_BAR_READ_INTERCEPTS _IOW(PCIEM_IOCTL_MAGIC, 20, struct pciem_bar_read_intercepts)
 #define PCIEM_IOCTL_SET_EVENTFD _IOW(PCIEM_IOCTL_MAGIC, 21, struct pciem_eventfd_config)
 #define PCIEM_IOCTL_SET_IRQFD _IOW(PCIEM_IOCTL_MAGIC, 22, struct pciem_irqfd_config)
 #define PCIEM_IOCTL_DMA_INDIRECT _IOWR(PCIEM_IOCTL_MAGIC, 24, struct pciem_dma_indirect)

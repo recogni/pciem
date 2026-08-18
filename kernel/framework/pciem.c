@@ -151,6 +151,39 @@ static int pciem_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
     return 0;
 }
 
+/*
+ * Reverse lookup for pciem_vfio_pci.ko: resolve a pci_dev it's bound to
+ * back to the pciem_root_complex tracking that function, so its .read
+ * override can reach the daemon's pending-request machinery (owner_us)
+ * without duplicating any of this bus/func bookkeeping.
+ *
+ * Verifies bus ownership the same way iommu_stub.c's notifier does
+ * before touching bridge private data, rather than trusting the PCI ID
+ * match alone — a real device that happened to report pyxis's
+ * vendor:device pair must still be safely rejected here, not crash.
+ */
+struct pciem_root_complex *pciem_lookup_root_complex(struct pci_dev *pdev)
+{
+    struct pci_host_bridge *bridge;
+    struct pciem_host_bridge_priv *priv;
+    unsigned int func;
+
+    if (!pdev || !pciem_stub_owns_bus(pdev->bus))
+        return NULL;
+
+    bridge = pci_find_host_bridge(pdev->bus);
+    priv = pci_host_bridge_priv(bridge);
+    if (!priv)
+        return NULL;
+
+    func = PCI_FUNC(pdev->devfn);
+    if (func >= PCIEM_MAX_FUNCTIONS)
+        return NULL;
+
+    return priv->funcs[func];
+}
+EXPORT_SYMBOL(pciem_lookup_root_complex);
+
 int pciem_register_bar(struct pciem_root_complex *v, u32 bar_num, resource_size_t size, u32 flags)
 {
     phys_addr_t phys;

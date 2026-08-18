@@ -22,6 +22,10 @@ endif
 
 obj-m += pciem.o
 
+pciem_vfio_pci-objs := vfio/pciem_vfio_pci.o
+
+obj-m += pciem_vfio_pci.o
+
 ccflags-y += -Wall
 
 # Only add build rules when not invoked by kbuild
