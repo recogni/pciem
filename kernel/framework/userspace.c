@@ -318,7 +318,7 @@ static void pciem_userspace_destroy(struct kref *refcnt)
 {
     struct pciem_userspace_state *us = container_of(refcnt, struct pciem_userspace_state, refcnt);
     struct pciem_pending_request *req;
-    struct hlist_node *tmp;
+    unsigned long flags;
     int i, f;
 
     if (!us)
@@ -327,15 +327,25 @@ static void pciem_userspace_destroy(struct kref *refcnt)
     pciem_tracing_destroy(us);
     pciem_irqfds_shutdown(&us->irqfds);
 
+    /* Force-complete any request still blocked waiting on a response
+     * (e.g. pciem_notif_read_sync's on-stack req), so that path can
+     * never deadlock against this teardown. pending_lock is held so
+     * this doesn't race pciem_notif_read_sync's own locked unlink, but
+     * this loop must NOT unlink or free req itself: the waiter is the
+     * sole owner of both, always unlinking itself (under the same
+     * lock) after waking, whether by completion or timeout — req may
+     * be stack-allocated, so calling kfree() on it here would corrupt
+     * the allocator, and unlinking it here would make the waiter's own
+     * later hlist_del() operate on an already-unhashed node.  */
     for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++)
     {
-        hlist_for_each_entry_safe(req, tmp, &us->pending_requests[i], node)
+        spin_lock_irqsave(&us->pending_lock, flags);
+        hlist_for_each_entry(req, &us->pending_requests[i], node)
         {
             req->response_status = -ENODEV;
             complete(&req->done);
-            hlist_del(&req->node);
-            kfree(req);
         }
+        spin_unlock_irqrestore(&us->pending_lock, flags);
     }
 
     __free_pages(virt_to_page(us->shared_ring), get_order(sizeof(struct pciem_shared_ring)));
@@ -1394,7 +1404,9 @@ static void pciem_notif_read(struct smptrace_ctx *ctx, struct smptrace_io *io)
  * event round-trip takes (microseconds when the daemon is healthy).
  *
  * Returns 0 with io->data holding the value on success; -ETIMEDOUT if
- * the daemon never answered (caller falls back to the BAR shadow).
+ * the daemon never answered. The caller (smptrace_emulate_read) treats
+ * a nonzero return as a failed transaction and returns the standard
+ * PCIe master-abort sentinel (all-1s), not the BAR shadow.
  */
 #define PCIEM_SYNC_READ_TIMEOUT_MS 100
 
