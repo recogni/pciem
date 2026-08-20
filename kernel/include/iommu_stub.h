@@ -6,10 +6,21 @@
 #ifndef PCIEM_IOMMU_STUB_H
 #define PCIEM_IOMMU_STUB_H
 
+#include <linux/types.h>
+
 struct device;
+struct pci_bus;
 
 int  pciem_iommu_stub_init(void);
 void pciem_iommu_stub_exit(void);
+
+/*
+ * Is this bus one pciem itself created?
+ * Non-static so pciem.c's pciem_lookup_root_complex() can reuse this
+ * same check, instead of trusting an arbitrary pci_dev's host bridge
+ * to be ours.
+ */
+bool pciem_stub_owns_bus(struct pci_bus *bus);
 
 /*
  * Register/unregister a host_bridge device (the &bridge->dev returned by

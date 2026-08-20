@@ -299,6 +299,36 @@ struct pciem_trace_bar
     uint8_t  reserved[3];
 };
 
+#define PCIEM_MAX_MMAP_TRAPS 16
+
+struct pciem_bar_range
+{
+    uint64_t offset;
+    uint64_t len;
+};
+
+/**
+ * Parameters for PCIEM_IOCTL_SET_BAR_MMAP_TRAPS.
+ *
+ * Marks up to PCIEM_MAX_MMAP_TRAPS byte ranges of one BAR as
+ * handler-backed for guest mmap access: a guest load/store landing
+ * inside one of these ranges is routed through pciem.ko's fault
+ * handler instead of a normal, permanently valid mapping. 
+ * Replaces any ranges previously set for this (func,
+ * bar_index) pair. 
+ *
+ * @param func  Function index this BAR belongs to (0–PCIEM_MAX_FUNCTIONS-1).
+ *              Defaults to 0 if zero-initialised.
+ */
+struct pciem_bar_mmap_traps
+{
+    uint32_t bar_index;
+    uint32_t count;
+    uint8_t  func;
+    uint8_t  reserved[7];
+    struct pciem_bar_range ranges[PCIEM_MAX_MMAP_TRAPS];
+};
+
 #define PCIEM_IOCTL_MAGIC 0xAF
 
 #define PCIEM_IOCTL_CREATE_DEVICE _IOWR(PCIEM_IOCTL_MAGIC, 10, struct pciem_create_device)
@@ -311,6 +341,7 @@ struct pciem_trace_bar
 #define PCIEM_IOCTL_DMA_ATOMIC _IOWR(PCIEM_IOCTL_MAGIC, 17, struct pciem_dma_atomic)
 #define PCIEM_IOCTL_P2P _IOWR(PCIEM_IOCTL_MAGIC, 18, struct pciem_p2p_op_user)
 #define PCIEM_IOCTL_GET_BAR_INFO _IOWR(PCIEM_IOCTL_MAGIC, 19, struct pciem_bar_info_query)
+#define PCIEM_IOCTL_SET_BAR_MMAP_TRAPS _IOW(PCIEM_IOCTL_MAGIC, 20, struct pciem_bar_mmap_traps)
 #define PCIEM_IOCTL_SET_EVENTFD _IOW(PCIEM_IOCTL_MAGIC, 21, struct pciem_eventfd_config)
 #define PCIEM_IOCTL_SET_IRQFD _IOW(PCIEM_IOCTL_MAGIC, 22, struct pciem_irqfd_config)
 #define PCIEM_IOCTL_DMA_INDIRECT _IOWR(PCIEM_IOCTL_MAGIC, 24, struct pciem_dma_indirect)
