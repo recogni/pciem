@@ -282,11 +282,7 @@ struct pciem_dma_indirect
  * until the daemon answers via write(fd, struct pciem_response). The
  * response's @data becomes the value the faulting instruction reads.
  * Required for destructive-read registers (FIFO data ports). On timeout
- * (daemon never answered) or a full ring, returns all-1s — the same
- * master-abort sentinel real PCIe returns for a failed read — rather
- * than falling back to BAR shadow memory, which could look like a
- * valid answer instead of a failure.
- */
+ * (daemon never answered) or a full ring, returns all-1s */
 #define PCIEM_TRACE_SYNC_READS    (1 << 3)
 
 /**

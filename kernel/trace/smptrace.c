@@ -96,12 +96,7 @@ void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
 			memcpy(dst, &io.data, size);
 			return;
 		}
-		/* Daemon never answered (timeout) or the ring was full —
-		 * a genuine failed transaction, not a "we don't know, go
-		 * check the shadow" case. Real PCIe returns all-1s on a
-		 * failed/aborted read (master abort); mirror that instead
-		 * of leaking a stale/never-written BAR shadow value, which
-		 * could be mistaken for a real answer. */
+		/* Daemon never answered or the ring was full */
 		memset(dst, 0xff, size);
 		return;
 	}

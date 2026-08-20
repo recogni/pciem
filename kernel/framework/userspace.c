@@ -328,15 +328,7 @@ static void pciem_userspace_destroy(struct kref *refcnt)
     pciem_irqfds_shutdown(&us->irqfds);
 
     /* Force-complete any request still blocked waiting on a response
-     * (e.g. pciem_notif_read_sync's on-stack req), so that path can
-     * never deadlock against this teardown. pending_lock is held so
-     * this doesn't race pciem_notif_read_sync's own locked unlink, but
-     * this loop must NOT unlink or free req itself: the waiter is the
-     * sole owner of both, always unlinking itself (under the same
-     * lock) after waking, whether by completion or timeout — req may
-     * be stack-allocated, so calling kfree() on it here would corrupt
-     * the allocator, and unlinking it here would make the waiter's own
-     * later hlist_del() operate on an already-unhashed node.  */
+     * so that path can never deadlock against this teardown. */
     for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++)
     {
         spin_lock_irqsave(&us->pending_lock, flags);
@@ -1406,7 +1398,7 @@ static void pciem_notif_read(struct smptrace_ctx *ctx, struct smptrace_io *io)
  * Returns 0 with io->data holding the value on success; -ETIMEDOUT if
  * the daemon never answered. The caller (smptrace_emulate_read) treats
  * a nonzero return as a failed transaction and returns the standard
- * PCIe master-abort sentinel (all-1s), not the BAR shadow.
+ * PCIe master-abort sentinel (all-1s).
  */
 #define PCIEM_SYNC_READ_TIMEOUT_MS 100
 
