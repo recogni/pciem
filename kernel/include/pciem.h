@@ -85,10 +85,6 @@ struct pciem_bar_info
     struct list_head vma_list;
     spinlock_t vma_lock;
 
-    /*
-     * Byte ranges of this BAR that framework/mmap_trap.c traps
-     * Set via PCIEM_IOCTL_SET_BAR_MMAP_TRAPS
-     */
     struct pciem_bar_range mmap_trap_ranges[PCIEM_MAX_MMAP_TRAPS];
     unsigned int num_mmap_trap_ranges;
 };
@@ -156,11 +152,6 @@ struct pciem_root_complex
     struct pciem_userspace_state *owner_us;
 };
 
-/*
- * Reverse lookup: pci_dev -> pciem_root_complex, for callers outside
- * pciem.c's own bus/bridge machinery (framework/mmap_trap.c). Verifies
- * bus ownership via pciem_stub_owns_bus().
- */
 struct pciem_root_complex *pciem_lookup_root_complex(struct pci_dev *pdev);
 
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector);
@@ -178,10 +169,6 @@ void pciem_cleanup_bar_tracking(void);
 void pciem_disable_bar_tracking(void);
 void __iomem *pciem_get_driver_bar_vaddr(struct pci_dev *pdev, u32 bar);
 
-/*
- * Guest-mmap trap (framework/mmap_trap.c): a kretprobe on
- * vfio_pci_core_mmap() plus a #DB die notifier. 
- */
 int pciem_mmap_trap_init(void);
 void pciem_mmap_trap_cleanup(void);
 

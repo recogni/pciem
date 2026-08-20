@@ -313,9 +313,7 @@ struct pciem_bar_range
  * Marks up to PCIEM_MAX_MMAP_TRAPS byte ranges of one BAR as
  * handler-backed for guest mmap access: a guest load/store landing
  * inside one of these ranges is routed through pciem.ko's fault
- * handler instead of a normal, permanently valid mapping. 
- * Replaces any ranges previously set for this (func,
- * bar_index) pair. 
+ * handler
  *
  * @param func  Function index this BAR belongs to (0–PCIEM_MAX_FUNCTIONS-1).
  *              Defaults to 0 if zero-initialised.
