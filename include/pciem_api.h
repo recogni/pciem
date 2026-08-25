@@ -305,6 +305,16 @@ struct pciem_bar_range
 {
     uint64_t offset;
     uint64_t len;
+    /*
+     * Access width in bytes (1/2/4/8) for every offset in
+     * [offset, offset+len). pciem.ko's fault handler never decodes the
+     * faulting instruction, so it can't discover width on its own —
+     * this is what tells it how many bytes to read from/write to the
+     * daemon on a hit anywhere in the range. One range can cover many
+     * same-width registers at once; it must not span registers of
+     * different widths.
+     */
+    uint64_t width;
 };
 
 /**

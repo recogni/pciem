@@ -228,7 +228,10 @@ static vm_fault_t pciem_mmap_trap_fault(struct vm_fault *vmf)
 
                 if (bar_offset >= start && bar_offset < start + len) {
                     trapped = true;
-                    range_len = (u32)len;
+                    /* width, not len: len is the whole range's span,
+                     * which can cover many registers — width is the
+                     * declared per-access size to actually use. */
+                    range_len = (u32)bar->mmap_trap_ranges[i].width;
                     break;
                 }
             }
@@ -287,7 +290,12 @@ static vm_fault_t pciem_mmap_trap_fault(struct vm_fault *vmf)
             return ret;
     }
 
-    if (trapped) {
+    /*
+     * Always re-arm, even when this byte isn't in any registered trap
+     * range: this vm_ops is only installed on a BAR that has at least
+     * one trapped range. 
+     */
+    {
         struct pt_regs *regs = task_pt_regs(current);
 
         pciem_arm_singlestep(vma, vmf->address, is_write, ctx, kva,
