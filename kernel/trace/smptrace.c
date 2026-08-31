@@ -96,7 +96,9 @@ void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
 			memcpy(dst, &io.data, size);
 			return;
 		}
-		/* Timeout or ring-full: fall through to the shadow. */
+		/* Daemon never answered or the ring was full */
+		memset(dst, 0xff, size);
+		return;
 	}
 
 	memcpy_fromio(dst, ctx->shadow_va + off, size);

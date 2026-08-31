@@ -318,7 +318,7 @@ static void pciem_userspace_destroy(struct kref *refcnt)
 {
     struct pciem_userspace_state *us = container_of(refcnt, struct pciem_userspace_state, refcnt);
     struct pciem_pending_request *req;
-    struct hlist_node *tmp;
+    unsigned long flags;
     int i, f;
 
     if (!us)
@@ -327,15 +327,17 @@ static void pciem_userspace_destroy(struct kref *refcnt)
     pciem_tracing_destroy(us);
     pciem_irqfds_shutdown(&us->irqfds);
 
+    /* Force-complete any request still blocked waiting on a response
+     * so that path can never deadlock against this teardown. */
     for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++)
     {
-        hlist_for_each_entry_safe(req, tmp, &us->pending_requests[i], node)
+        spin_lock_irqsave(&us->pending_lock, flags);
+        hlist_for_each_entry(req, &us->pending_requests[i], node)
         {
             req->response_status = -ENODEV;
             complete(&req->done);
-            hlist_del(&req->node);
-            kfree(req);
         }
+        spin_unlock_irqrestore(&us->pending_lock, flags);
     }
 
     __free_pages(virt_to_page(us->shared_ring), get_order(sizeof(struct pciem_shared_ring)));
@@ -1394,7 +1396,9 @@ static void pciem_notif_read(struct smptrace_ctx *ctx, struct smptrace_io *io)
  * event round-trip takes (microseconds when the daemon is healthy).
  *
  * Returns 0 with io->data holding the value on success; -ETIMEDOUT if
- * the daemon never answered (caller falls back to the BAR shadow).
+ * the daemon never answered. The caller (smptrace_emulate_read) treats
+ * a nonzero return as a failed transaction and returns the standard
+ * PCIe master-abort sentinel (all-1s).
  */
 #define PCIEM_SYNC_READ_TIMEOUT_MS 100
 
