@@ -12,13 +12,10 @@
  *   2. Build a default paging domain for the group
  *   3. Let vfio_register_iommu_group claim DMA ownership cleanly
  *
- * ->iova_to_phys performs a real lookup against the {iova, paddr, size}
- * entries recorded by ->map_pages / removed by ->unmap_pages. This 
- * matters once a synthetic device's userspace model actually issues DMA: 
- * a caller-chosen VFIO_IOMMU_MAP_DMA iova is not in general equal to the
- * backing physical address, so passthrough would silently resolve to the
- * wrong host memory. The tracking here is intentionally minimal which is 
- * enough for a device model that issues a handful of long-lived mappings 
+ * ->iova_to_phys performs a real lookup against a per-page {iova -> paddr}
+ * table filled in by ->map_pages / erased by ->unmap_pages. Tracked per-page 
+ * rather than per-call because the iommu core is free to split one logical 
+ * map/unmap into several calls.
  *
  * Hookup model — the upstream-clean way:
  *
@@ -61,25 +58,18 @@
 #include <linux/property.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
+#include <linux/xarray.h>
 #include <linux/module.h>
 
 #include "iommu_stub.h"
 
 static struct iommu_device pciem_stub_iommu;
 
-// One entry per live map_pages() call. 
-struct pciem_stub_mapping {
-    struct list_head list;
-    unsigned long    iova;
-    phys_addr_t      paddr;
-    size_t           size;
-};
+#define PCIEM_STUB_PAGE_SIZE   SZ_4K
 
 struct pciem_stub_domain {
     struct iommu_domain domain;
-    spinlock_t           lock;
-    struct list_head     mappings;
+    struct xarray        pfns;   /* index = iova / PCIEM_STUB_PAGE_SIZE, value = paddr / PCIEM_STUB_PAGE_SIZE */
 };
 
 static struct pciem_stub_domain *to_stub_domain(struct iommu_domain *domain)
@@ -108,23 +98,25 @@ static int pciem_stub_map_pages(struct iommu_domain *domain, unsigned long iova,
                                 int prot, gfp_t gfp, size_t *mapped)
 {
     struct pciem_stub_domain *sd = to_stub_domain(domain);
-    struct pciem_stub_mapping *m;
+    unsigned long start_iova = iova;
+    size_t cur;
 
-    // iommu_map_pages() is called once per contiguous {iova, paddr}
-    // run, so a single entry covers the whole pgsize*pgcount request 
-    m = kzalloc(sizeof(*m), gfp);
-    if (!m)
-        return -ENOMEM;
+    for (cur = 0; cur < pgsize * pgcount; cur += PCIEM_STUB_PAGE_SIZE) {
+        void *old;
 
-    m->iova  = iova;
-    m->paddr = paddr;
-    m->size  = pgsize * pgcount;
+        old = xa_store(&sd->pfns, (iova + cur) / PCIEM_STUB_PAGE_SIZE,
+                       xa_mk_value((paddr + cur) / PCIEM_STUB_PAGE_SIZE), gfp);
+        if (xa_is_err(old)) {
+            /* unwind whatever this call already stored */
+            for (; start_iova != iova + cur; start_iova += PCIEM_STUB_PAGE_SIZE)
+                xa_erase(&sd->pfns, start_iova / PCIEM_STUB_PAGE_SIZE);
+            *mapped = 0;
+            return xa_err(old);
+        }
+        WARN_ON(old);
+    }
 
-    spin_lock(&sd->lock);
-    list_add_tail(&m->list, &sd->mappings);
-    spin_unlock(&sd->lock);
-
-    *mapped = m->size;
+    *mapped = pgsize * pgcount;
     return 0;
 }
 
@@ -133,51 +125,29 @@ static size_t pciem_stub_unmap_pages(struct iommu_domain *domain, unsigned long 
                                      struct iommu_iotlb_gather *gather)
 {
     struct pciem_stub_domain *sd = to_stub_domain(domain);
-    struct pciem_stub_mapping *m, *found = NULL;
     size_t size = pgsize * pgcount;
+    size_t cur;
 
-    spin_lock(&sd->lock);
-    list_for_each_entry(m, &sd->mappings, list) {
-        if (m->iova == iova) {
-            found = m;
-            list_del(&m->list);
-            break;
-        }
-    }
-    spin_unlock(&sd->lock);
+    for (cur = 0; cur < size; cur += PCIEM_STUB_PAGE_SIZE) {
+        void *ent = xa_erase(&sd->pfns, (iova + cur) / PCIEM_STUB_PAGE_SIZE);
 
-    if (!found) {
-        // No exact-match tracking for partial/sub-range unmaps.
-        // Report success anyway since VFIO's unmap path
-        // doesn't expect this callback to fail.
-        pr_warn_ratelimited("unmap of untracked iova=0x%lx size=0x%zx\n", iova, size);
-        return size;
+        if (!ent)
+            pr_warn_ratelimited("unmap of untracked iova=0x%lx\n",
+                                (unsigned long)(iova + cur));
     }
 
-    if (found->size != size)
-        pr_warn_ratelimited("unmap size mismatch iova=0x%lx mapped=0x%zx unmap=0x%zx\n",
-                            iova, found->size, size);
-
-    kfree(found);
     return size;
 }
 
 static phys_addr_t pciem_stub_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
 {
     struct pciem_stub_domain *sd = to_stub_domain(domain);
-    struct pciem_stub_mapping *m;
-    phys_addr_t phys = 0;
+    void *ent = xa_load(&sd->pfns, iova / PCIEM_STUB_PAGE_SIZE);
 
-    spin_lock(&sd->lock);
-    list_for_each_entry(m, &sd->mappings, list) {
-        if (iova >= m->iova && iova < m->iova + m->size) {
-            phys = m->paddr + (iova - m->iova);
-            break;
-        }
-    }
-    spin_unlock(&sd->lock);
+    if (!ent)
+        return 0;
 
-    return phys;   /* 0 == "not mapped"; callers already treat that as failure */
+    return (xa_to_value(ent) * PCIEM_STUB_PAGE_SIZE) + (iova % PCIEM_STUB_PAGE_SIZE);
 }
 
 static void pciem_stub_iotlb_sync(struct iommu_domain *domain,
@@ -194,12 +164,8 @@ static void pciem_stub_flush_iotlb_all(struct iommu_domain *domain)
 static void pciem_stub_domain_free(struct iommu_domain *domain)
 {
     struct pciem_stub_domain *sd = to_stub_domain(domain);
-    struct pciem_stub_mapping *m, *tmp;
 
-    list_for_each_entry_safe(m, tmp, &sd->mappings, list) {
-        list_del(&m->list);
-        kfree(m);
-    }
+    xa_destroy(&sd->pfns);
     kfree(sd);
 }
 
@@ -277,8 +243,7 @@ static struct iommu_domain *pciem_stub_domain_alloc_paging(struct device *dev)
     if (!sd)
         return ERR_PTR(-ENOMEM);
 
-    spin_lock_init(&sd->lock);
-    INIT_LIST_HEAD(&sd->mappings);
+    xa_init(&sd->pfns);
 
     /* No hardware page-size restriction to honour since we're not a
      * real walker — accept whatever granularity the caller maps at. */
@@ -287,13 +252,11 @@ static struct iommu_domain *pciem_stub_domain_alloc_paging(struct device *dev)
 
     /* Leaving geometry zeroed (the kzalloc default) makes
      * vfio_iommu_type1_attach_group() call vfio_iommu_aper_resize() with
-     * aperture_start=aperture_end=0. On a fresh container (empty
-     * iova_list) that inserts a degenerate {0,0} "valid" range instead
-     * of leaving the range unrestricted, so every subsequent
-     * VFIO_IOMMU_MAP_DMA on a real userspace address fails -EINVAL in
-     * vfio_iommu_iova_dma_valid() — this isn't gated on force_aperture
-     * in current vfio_iommu_type1.c, so it applies even though we don't
-     * set force_aperture either. Advertise the full 64-bit space.       */
+     * aperture_start=aperture_end=0. On a fresh container that inserts a 
+     * degenerate {0,0} range instead of leaving the range unrestricted, 
+     * so every subsequent VFIO_IOMMU_MAP_DMA on a real userspace address 
+     * fails -EINVAL in vfio_iommu_iova_dma_valid(). Advertise the full 
+     * 64-bit space. */
     sd->domain.geometry.aperture_start = 0;
     sd->domain.geometry.aperture_end   = ~(dma_addr_t)0;
     sd->domain.geometry.force_aperture = true;
