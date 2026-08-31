@@ -12,17 +12,10 @@
  *   2. Build a default paging domain for the group
  *   3. Let vfio_register_iommu_group claim DMA ownership cleanly
  *
- * It does NOT provide real address translation. ->iova_to_phys is
- * passthrough (iova == paddr), and map/unmap callbacks are no-ops that
- * report success. This is fine for synthetic devices that don't
- * actually issue DMA — userspace driver code under test that calls
- * dma_map_*() will get a valid IOVA back, write it to the device, and
- * the device just doesn't dereference it (because it's emulated by
- * pciem-mock and doesn't really do DMA).
- *
- * If/when pciem grows real device-side DMA simulation, this stub becomes
- * the point where iova→userspace-vaddr translations are recorded so the
- * userspace daemon can resolve them.
+ * ->iova_to_phys performs a real lookup against a per-page {iova -> paddr}
+ * table filled in by ->map_pages / erased by ->unmap_pages. Tracked per-page 
+ * rather than per-call because the iommu core is free to split one logical 
+ * map/unmap into several calls.
  *
  * Hookup model — the upstream-clean way:
  *
@@ -65,11 +58,24 @@
 #include <linux/property.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/xarray.h>
 #include <linux/module.h>
 
 #include "iommu_stub.h"
 
 static struct iommu_device pciem_stub_iommu;
+
+#define PCIEM_STUB_PAGE_SIZE   SZ_4K
+
+struct pciem_stub_domain {
+    struct iommu_domain domain;
+    struct xarray        pfns;   /* index = iova / PCIEM_STUB_PAGE_SIZE, value = paddr / PCIEM_STUB_PAGE_SIZE */
+};
+
+static struct pciem_stub_domain *to_stub_domain(struct iommu_domain *domain)
+{
+    return container_of(domain, struct pciem_stub_domain, domain);
+}
 
 /* Synthetic fwnode used as the "iommu controller" identity. The real
  * PCIe devices in the system never reference this fwnode, so there's
@@ -79,7 +85,7 @@ static const struct software_node pciem_stub_iommu_swnode = {
 };
 
 /* ---------------------------------------------------------------- */
-/* domain ops — no-op map/unmap, passthrough iova_to_phys           */
+/* domain ops — real iova->phys bookkeeping                         */
 /* ---------------------------------------------------------------- */
 
 static int pciem_stub_attach_dev(struct iommu_domain *domain, struct device *dev)
@@ -91,12 +97,25 @@ static int pciem_stub_map_pages(struct iommu_domain *domain, unsigned long iova,
                                 phys_addr_t paddr, size_t pgsize, size_t pgcount,
                                 int prot, gfp_t gfp, size_t *mapped)
 {
-    /* Real driver-under-test that does dma_map_single() will pass an
-     * IOVA the user picked (or the dma-iommu glue picked); our stub
-     * accepts any mapping and reports success. iova == paddr at
-     * iova_to_phys time, so the IOVA returned to userspace is just the
-     * physical address — which is fine since our synthetic device
-     * doesn't actually dereference it. */
+    struct pciem_stub_domain *sd = to_stub_domain(domain);
+    unsigned long start_iova = iova;
+    size_t cur;
+
+    for (cur = 0; cur < pgsize * pgcount; cur += PCIEM_STUB_PAGE_SIZE) {
+        void *old;
+
+        old = xa_store(&sd->pfns, (iova + cur) / PCIEM_STUB_PAGE_SIZE,
+                       xa_mk_value((paddr + cur) / PCIEM_STUB_PAGE_SIZE), gfp);
+        if (xa_is_err(old)) {
+            /* unwind whatever this call already stored */
+            for (; start_iova != iova + cur; start_iova += PCIEM_STUB_PAGE_SIZE)
+                xa_erase(&sd->pfns, start_iova / PCIEM_STUB_PAGE_SIZE);
+            *mapped = 0;
+            return xa_err(old);
+        }
+        WARN_ON(old);
+    }
+
     *mapped = pgsize * pgcount;
     return 0;
 }
@@ -105,12 +124,30 @@ static size_t pciem_stub_unmap_pages(struct iommu_domain *domain, unsigned long 
                                      size_t pgsize, size_t pgcount,
                                      struct iommu_iotlb_gather *gather)
 {
-    return pgsize * pgcount;
+    struct pciem_stub_domain *sd = to_stub_domain(domain);
+    size_t size = pgsize * pgcount;
+    size_t cur;
+
+    for (cur = 0; cur < size; cur += PCIEM_STUB_PAGE_SIZE) {
+        void *ent = xa_erase(&sd->pfns, (iova + cur) / PCIEM_STUB_PAGE_SIZE);
+
+        if (!ent)
+            pr_warn_ratelimited("unmap of untracked iova=0x%lx\n",
+                                (unsigned long)(iova + cur));
+    }
+
+    return size;
 }
 
 static phys_addr_t pciem_stub_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
 {
-    return (phys_addr_t)iova;   /* passthrough */
+    struct pciem_stub_domain *sd = to_stub_domain(domain);
+    void *ent = xa_load(&sd->pfns, iova / PCIEM_STUB_PAGE_SIZE);
+
+    if (!ent)
+        return 0;
+
+    return (xa_to_value(ent) * PCIEM_STUB_PAGE_SIZE) + (iova % PCIEM_STUB_PAGE_SIZE);
 }
 
 static void pciem_stub_iotlb_sync(struct iommu_domain *domain,
@@ -126,7 +163,10 @@ static void pciem_stub_flush_iotlb_all(struct iommu_domain *domain)
 
 static void pciem_stub_domain_free(struct iommu_domain *domain)
 {
-    kfree(domain);
+    struct pciem_stub_domain *sd = to_stub_domain(domain);
+
+    xa_destroy(&sd->pfns);
+    kfree(sd);
 }
 
 static const struct iommu_domain_ops pciem_stub_domain_ops = {
@@ -199,14 +239,28 @@ static struct iommu_group *pciem_stub_device_group(struct device *dev)
 
 static struct iommu_domain *pciem_stub_domain_alloc_paging(struct device *dev)
 {
-    struct iommu_domain *domain = kzalloc(sizeof(*domain), GFP_KERNEL);
-    if (!domain)
+    struct pciem_stub_domain *sd = kzalloc(sizeof(*sd), GFP_KERNEL);
+    if (!sd)
         return ERR_PTR(-ENOMEM);
-    /* Pass-through translation, so any page size is acceptable for the
-     * "mapping bookkeeping" we don't actually do. */
-    domain->pgsize_bitmap = SZ_4K | SZ_2M | SZ_1G;
-    domain->ops           = &pciem_stub_domain_ops;
-    return domain;
+
+    xa_init(&sd->pfns);
+
+    /* No hardware page-size restriction to honour since we're not a
+     * real walker — accept whatever granularity the caller maps at. */
+    sd->domain.pgsize_bitmap = SZ_4K | SZ_2M | SZ_1G;
+    sd->domain.ops           = &pciem_stub_domain_ops;
+
+    /* Leaving geometry zeroed (the kzalloc default) makes
+     * vfio_iommu_type1_attach_group() call vfio_iommu_aper_resize() with
+     * aperture_start=aperture_end=0. On a fresh container that inserts a 
+     * degenerate {0,0} range instead of leaving the range unrestricted, 
+     * so every subsequent VFIO_IOMMU_MAP_DMA on a real userspace address 
+     * fails -EINVAL in vfio_iommu_iova_dma_valid(). Advertise the full 
+     * 64-bit space. */
+    sd->domain.geometry.aperture_start = 0;
+    sd->domain.geometry.aperture_end   = ~(dma_addr_t)0;
+    sd->domain.geometry.force_aperture = true;
+    return &sd->domain;
 }
 
 static const struct iommu_ops pciem_stub_iommu_ops = {
