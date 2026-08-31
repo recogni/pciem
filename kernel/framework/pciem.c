@@ -151,6 +151,30 @@ static int pciem_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
     return 0;
 }
 
+struct pciem_root_complex *pciem_lookup_root_complex(struct pci_dev *pdev)
+{
+    struct pci_host_bridge *bridge;
+    struct pciem_host_bridge_priv *priv;
+    unsigned int func;
+
+    if (!pdev || !pciem_stub_owns_bus(pdev->bus))
+        return NULL;
+
+    bridge = pci_find_host_bridge(pdev->bus);
+    if (!bridge)
+        return NULL;
+
+    priv = pci_host_bridge_priv(bridge);
+    if (!priv)
+        return NULL;
+
+    func = PCI_FUNC(pdev->devfn);
+    if (func >= PCIEM_MAX_FUNCTIONS)
+        return NULL;
+
+    return priv->funcs[func];
+}
+
 int pciem_register_bar(struct pciem_root_complex *v, u32 bar_num, resource_size_t size, u32 flags)
 {
     phys_addr_t phys;
@@ -1226,6 +1250,12 @@ static int __init pciem_init(void)
     if (ret)
         pr_warn("init: stub IOMMU registration failed: %d (vfio-pci bind will need noiommu)\n", ret);
 
+    /* Non-fatal, same as the stub IOMMU above: mmap trapping just
+     * won't work */
+    ret = pciem_mmap_trap_init();
+    if (ret)
+        pr_warn("init: mmap-trap kprobe registration failed: %d (guest mmap of traced BARs will not be intercepted)\n", ret);
+
     pr_info("init: Created /dev/pciem for userspace device creation\n");
     pr_info("init: pciem framework loaded\n");
     return 0;
@@ -1243,6 +1273,7 @@ static void __exit pciem_exit(void)
 {
     pr_info("exit: unloading pciem framework\n");
 
+    pciem_mmap_trap_cleanup();
     pciem_iommu_stub_exit();
     misc_deregister(&pciem_dev);
     pciem_userspace_cleanup();

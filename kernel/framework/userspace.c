@@ -142,6 +142,14 @@ static inline struct pciem_root_complex *us_get_rc(struct pciem_userspace_state 
     return us->slot.funcs[func];
 }
 
+struct smptrace_ctx *pciem_get_tracer_ctx(struct pciem_userspace_state *us,
+                                          u8 func, u32 bar_index)
+{
+    if (!us || func >= PCIEM_MAX_FUNCTIONS || bar_index >= PCI_STD_NUM_BARS)
+        return NULL;
+    return &us->tracers[func][bar_index].ctx;
+}
+
 static int pciem_instance_mmap(struct file *file, struct vm_area_struct *vma)
 {
     struct pciem_userspace_state *us = file->private_data;
@@ -592,6 +600,8 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
 
     v->bus_mode = mode;
     pciem_init_cap_manager(v);
+
+    v->owner_us = us;
 
     spin_lock_irqsave(&us->slot.slot_lock, flags);
     us->slot.funcs[func] = v;
@@ -1376,7 +1386,7 @@ static void pciem_notif_trace(struct smptrace_ctx *ctx, struct smptrace_io *io,
     pciem_userspace_queue_event(tracer->us, &ev);
 }
 
-static void pciem_notif_write(struct smptrace_ctx *ctx, struct smptrace_io *io)
+void pciem_notif_write(struct smptrace_ctx *ctx, struct smptrace_io *io)
 {
     pciem_notif_trace(ctx, io, PCIEM_EVENT_MMIO_WRITE);
 }
@@ -1402,7 +1412,7 @@ static void pciem_notif_read(struct smptrace_ctx *ctx, struct smptrace_io *io)
  */
 #define PCIEM_SYNC_READ_TIMEOUT_MS 100
 
-static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *io)
+int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *io)
 {
     struct pciem_tracer *tracer = container_of(ctx, struct pciem_tracer, ctx);
     struct pciem_userspace_state *us = tracer->us;
@@ -1558,6 +1568,48 @@ static int pciem_ioctl_trace_bar(struct pciem_userspace_state *us,
     return 0;
 }
 
+static long pciem_ioctl_set_bar_mmap_traps(struct pciem_userspace_state *us,
+                                           struct pciem_bar_mmap_traps __user *arg)
+{
+    struct pciem_bar_mmap_traps req;
+    struct pciem_root_complex *v;
+    struct pciem_bar_info *bar;
+
+    if (copy_from_user(&req, arg, sizeof(req)))
+        return -EFAULT;
+
+    if (req.func >= PCIEM_MAX_FUNCTIONS)
+        return -EINVAL;
+
+    if (req.bar_index >= PCI_STD_NUM_BARS)
+        return -EINVAL;
+
+    if (req.count > PCIEM_MAX_MMAP_TRAPS)
+        return -EINVAL;
+
+    v = us_get_rc(us, req.func);
+    if (!v)
+        return -ENODEV;
+
+    guard(write_lock)(&v->bars_lock);
+
+    bar = &v->bars[req.bar_index];
+    if (!bar->carved_start || !bar->size) {
+        pr_warn("cannot set mmap traps on func%u BAR%u: not registered\n",
+                req.func, req.bar_index);
+        return -ENXIO;
+    }
+
+    memcpy(bar->mmap_trap_ranges, req.ranges,
+           req.count * sizeof(req.ranges[0]));
+    bar->num_mmap_trap_ranges = req.count;
+
+    pr_info("Set %u mmap trap range(s) on func%u BAR%u\n",
+            req.count, req.func, req.bar_index);
+
+    return 0;
+}
+
 static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct pciem_userspace_state *us = file->private_data;
@@ -1608,6 +1660,9 @@ static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned lon
 
     case PCIEM_IOCTL_TRACE_BAR:
         return pciem_ioctl_trace_bar(us, (struct pciem_trace_bar __user*)arg);
+
+    case PCIEM_IOCTL_SET_BAR_MMAP_TRAPS:
+        return pciem_ioctl_set_bar_mmap_traps(us, (struct pciem_bar_mmap_traps __user *)arg);
 
     default:
         return -ENOTTY;
