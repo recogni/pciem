@@ -42,7 +42,7 @@ static u64 level2size(unsigned int level)
 	}
 }
 
-int smptrace_arch_poison_pte(struct smptrace_ctx *ctx, struct smptrace_map *map)
+int smptrace_arch_poison_pte(struct smptrace_map *map)
 {
 	int64_t remain = map->len;
 	unsigned long va = map->va;
@@ -119,7 +119,7 @@ fail:
 	return ret;
 }
 
-void smptrace_arch_restore_pte(struct smptrace_ctx *ctx, struct smptrace_map *map)
+void smptrace_arch_restore_pte(struct smptrace_map *map)
 {
 	unsigned long va = map->va;
 	int64_t remain = map->len;
@@ -285,36 +285,14 @@ static int __enter_badarea(struct kprobe *kp, struct pt_regs *regs)
 	struct pt_regs *pf_regs  = (struct pt_regs *)regs_get_kernel_argument(regs, 0);
 	unsigned long pf_va      = regs_get_kernel_argument(regs, 2);
 	unsigned long pf_err     = regs_get_kernel_argument(regs, 1);
-	struct smptrace_map *tmp_map, map_copy = {0};
-	unsigned long flags;
-	bool found = false;
+	struct smptrace_map map = {0};
 	int ret;
-	int map_count = 0;
 
 	pr_debug("badarea: kprobe fired pf_va=0x%lx err=0x%lx pf_ip=0x%lx pf_user=%d ctx.pa=0x%llx ctx.len=0x%lx",
 	        pf_va, pf_err, pf_regs->ip, user_mode(pf_regs),
 	        (unsigned long long)ctx->pa, ctx->len);
 
-	/* Find the matching memory mapping. We copy it by value so we don't hold the spinlock
-	   during the entire emulate_pf_instruction sequence (which triggers user callbacks). */
-	spin_lock_irqsave(&ctx->lock, flags);
-	list_for_each_entry(tmp_map, &ctx->maps, list) {
-		map_count++;
-		pr_debug("badarea: map[%d] va=0x%lx len=0x%lx pa=0x%llx (probe pf_va=0x%lx)",
-		        map_count - 1, tmp_map->va, tmp_map->len,
-		        (unsigned long long)tmp_map->pa, pf_va);
-		if (pf_va >= tmp_map->va && pf_va < tmp_map->va + tmp_map->len) {
-			map_copy = *tmp_map;
-			found = true;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&ctx->lock, flags);
-
-	pr_debug("badarea: lookup done pf_va=0x%lx found=%d (maps_scanned=%d)",
-	        pf_va, found, map_count);
-
-	if (!found)
+	if (!smptrace_find_map_rcu(ctx, pf_va, &map))
 		return 0;
 
 	if (this_cpu_xchg(*ctx->in_pf, true)) {
@@ -322,7 +300,7 @@ static int __enter_badarea(struct kprobe *kp, struct pt_regs *regs)
 		return 0;
 	}
 
-	ret = emulate_pf_instruction(ctx, &map_copy, pf_regs);
+	ret = emulate_pf_instruction(ctx, &map, pf_regs);
 	this_cpu_write(*ctx->in_pf, false);
 
 	pr_debug("badarea: emulate_pf_instruction returned %d pf_va=0x%lx", ret, pf_va);
