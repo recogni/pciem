@@ -185,99 +185,184 @@ static int decode_pf_instr(struct pt_regs *regs, struct insn *insn)
 	return insn_decode_kernel(insn, buf);
 }
 
-static int emulate_pf_instruction(struct smptrace_ctx *ctx,
-                                  struct smptrace_map *map,
-                                  struct pt_regs *regs)
-{
+/* A decoded trapped instruction: what to access, how wide, and where the
+ * register operand lives in the faulting context's pt_regs. */
+struct smptrace_x86_op {
 	struct insn insn;
 	enum insn_mmio_type mmio;
-	long *data = NULL;
-	u64 addr;
 	unsigned int len;
+	long *data;
+	u64 addr;
+};
+
+/*
+ * Decodes the instruction at regs->ip without performing it. Called twice per
+ * fault, from the kprobe to decide whether to claim it and again from the
+ * continuation to perform it; decoding reads only kernel text and pt_regs, so
+ * both calls agree.
+ */
+static int plan_pf_instruction(struct pt_regs *regs, struct smptrace_x86_op *op)
+{
 	int ret;
-	u8 sign_byte;
 
-	pr_debug("emulate: enter ip=0x%lx mode=%s map.va=0x%lx map.len=0x%lx",
-	        regs->ip, user_mode(regs) ? "USER" : "KERNEL",
-	        map->va, map->len);
-
-	if (user_mode(regs)) {
-		pr_debug("emulate: user_mode -> EACCES");
+	if (user_mode(regs))
 		return -EACCES;
-	}
 
-	ret = decode_pf_instr(regs, &insn);
+	ret = decode_pf_instr(regs, &op->insn);
 	if (ret) {
 		pr_warn("failed to decode #PF instr ip=0x%lx", regs->ip);
 		return ret;
 	}
-	pr_debug("emulate: decode_pf_instr OK, insn.length=%d", insn.length);
 
-	mmio = insn_decode_mmio(&insn, &len);
-	pr_debug("emulate: insn_decode_mmio -> mmio=%d len=%u", mmio, len);
-	if (mmio == INSN_MMIO_DECODE_FAILED) {
+	op->mmio = insn_decode_mmio(&op->insn, &op->len);
+	switch (op->mmio) {
+	case INSN_MMIO_WRITE:
+	case INSN_MMIO_WRITE_IMM:
+	case INSN_MMIO_READ:
+	case INSN_MMIO_READ_ZERO_EXTEND:
+	case INSN_MMIO_READ_SIGN_EXTEND:
+		break;
+	case INSN_MMIO_DECODE_FAILED:
 		pr_warn("failed to decode MMIO instr ip=0x%lx", regs->ip);
 		return -EINVAL;
-	}
-
-    /* Get a pointer to the data if not writing an immediate, or if
-	 * not doing MOVS (which we do not handle yet) */
-	if (mmio != INSN_MMIO_WRITE_IMM && mmio != INSN_MMIO_MOVS) {
-		data = insn_get_modrm_reg_ptr(&insn, regs);
-		if (!data) {
-			pr_warn("failed to get modrm reg ptr");
-			return -EINVAL;
-		}
-	}
-
-    /* Get the MMIO source/destination address */
-	addr = (u64)insn_get_addr_ref(&insn, regs);
-
-	switch (mmio) {
-	case INSN_MMIO_WRITE:
-		smptrace_emulate_write(ctx, map, addr, len, (u8 *)data);
-		break;
-	case INSN_MMIO_WRITE_IMM:
-		BUG_ON(len > 4);
-		smptrace_emulate_write(ctx, map, addr, len, (u8 *)insn.immediate1.bytes);
-		break;
-	case INSN_MMIO_READ:
-		if (len == 4)
-			*data = 0;
-		smptrace_emulate_read(ctx, map, addr, len, (u8 *)data);
-		break;
-	case INSN_MMIO_READ_ZERO_EXTEND:
-		memset(data, 0, insn.opnd_bytes);
-		smptrace_emulate_read(ctx, map, addr, len, (u8 *)data);
-		break;
-	case INSN_MMIO_READ_SIGN_EXTEND:
-        /* Sign extend based on operand size */
-		if (len == 1) {
-			u8 val;
-			smptrace_emulate_read(ctx, map, addr, len, &val);
-			sign_byte = (val & 0x80) ? 0xff : 0x00;
-		} else {
-			u16 val;
-			smptrace_emulate_read(ctx, map, addr, len, (u8 *)&val);
-			sign_byte = (val & 0x8000) ? 0xff : 0x00;
-		}
-		memset(data, sign_byte, insn.opnd_bytes);
-		smptrace_emulate_read(ctx, map, addr, len, (u8 *)data);
-		break;
 	case INSN_MMIO_MOVS:
 		pr_warn_ratelimited("unhandled MOVS instruction ip=0x%lx", regs->ip);
 		return -ENOTSUPP;
 	default:
 		pr_warn_ratelimited("unhandled MMIO instruction ip=0x%lx (%d)",
-		                    regs->ip, mmio);
+		                    regs->ip, op->mmio);
 		return -ENOTSUPP;
 	}
 
-	pr_debug("emulate: success, advancing ip 0x%lx -> 0x%lx",
-	        regs->ip, regs->ip + insn.length);
-	regs->ip += insn.length;
+	op->data = NULL;
+	if (op->mmio != INSN_MMIO_WRITE_IMM) {
+		op->data = insn_get_modrm_reg_ptr(&op->insn, regs);
+		if (!op->data) {
+			pr_warn("failed to get modrm reg ptr");
+			return -EINVAL;
+		}
+	}
+
+	op->addr = (u64)insn_get_addr_ref(&op->insn, regs);
 	return 0;
 }
+
+static bool op_is_read(const struct smptrace_x86_op *op)
+{
+	return op->mmio == INSN_MMIO_READ ||
+	       op->mmio == INSN_MMIO_READ_ZERO_EXTEND ||
+	       op->mmio == INSN_MMIO_READ_SIGN_EXTEND;
+}
+
+/* Performs a planned access and steps the faulting context past it. */
+static void execute_pf_instruction(struct smptrace_ctx *ctx,
+                                   struct smptrace_map *map,
+                                   struct pt_regs *regs,
+                                   struct smptrace_x86_op *op)
+{
+	u8 sign_byte;
+
+	switch (op->mmio) {
+	case INSN_MMIO_WRITE:
+		smptrace_emulate_write(ctx, map, op->addr, op->len, (u8 *)op->data);
+		break;
+	case INSN_MMIO_WRITE_IMM: {
+		/* The immediate is at most 32 bits; a 64-bit store sign-extends it. */
+		u64 imm = (s64)op->insn.immediate1.value;
+
+		smptrace_emulate_write(ctx, map, op->addr, op->len, (u8 *)&imm);
+		break;
+	}
+	case INSN_MMIO_READ:
+		if (op->len == 4)
+			*op->data = 0;
+		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)op->data);
+		break;
+	case INSN_MMIO_READ_ZERO_EXTEND:
+		memset(op->data, 0, op->insn.opnd_bytes);
+		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)op->data);
+		break;
+	case INSN_MMIO_READ_SIGN_EXTEND:
+		/* Sign extend based on operand size */
+		if (op->len == 1) {
+			u8 val;
+			smptrace_emulate_read(ctx, map, op->addr, op->len, &val);
+			sign_byte = (val & 0x80) ? 0xff : 0x00;
+		} else {
+			u16 val;
+			smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)&val);
+			sign_byte = (val & 0x8000) ? 0xff : 0x00;
+		}
+		memset(op->data, sign_byte, op->insn.opnd_bytes);
+		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)op->data);
+		break;
+	default:
+		/* plan_pf_instruction() admits nothing else */
+		break;
+	}
+
+	regs->ip += op->insn.length;
+}
+
+/* The tracer whose kprobe claimed this CPU's current fault, handed from the
+ * kprobe to the continuation. Nothing runs on this CPU in between: the kprobe
+ * returns straight into the continuation with interrupts still disabled. */
+static DEFINE_PER_CPU(struct smptrace_ctx *, smptrace_cont_ctx);
+
+/*
+ * Runs in place of bad_area_nosemaphore() for a fault the kprobe claimed, with
+ * the same arguments, and returns to its caller. Unlike the kprobe handler it
+ * may run with interrupts enabled, so a read that waits on userspace restores
+ * the faulting context's interrupt state for the wait: a CPU that spins with
+ * interrupts off cannot acknowledge TLB-flush IPIs, and every CPU waiting on
+ * that acknowledgement is one the device model cannot run on.
+ *
+ * Returning without advancing pf_regs->ip retries the access, which faults
+ * again and is re-judged by the kprobe.
+ */
+static void smptrace_badarea_cont(struct pt_regs *pf_regs, unsigned long error_code,
+                                  unsigned long address)
+{
+	struct smptrace_ctx *ctx = this_cpu_read(smptrace_cont_ctx);
+	struct smptrace_map map = {0};
+	struct smptrace_x86_op op;
+	bool irqs_on;
+
+	this_cpu_write(smptrace_cont_ctx, NULL);
+	if (WARN_ON_ONCE(!ctx))
+		return;
+
+	/* smptrace_deactivate() unregisters the kprobe, which waits for an RCU
+	 * grace period, before it frees what this reads. */
+	guard(rcu)();
+
+	if (!smptrace_find_map_rcu(ctx, address, &map))
+		return;
+	if (WARN_ON_ONCE(plan_pf_instruction(pf_regs, &op)))
+		return;
+
+	irqs_on = op_is_read(&op) && (pf_regs->flags & X86_EFLAGS_IF);
+
+	/* ctx->in_pf and the eventual return stay on this CPU. */
+	preempt_disable();
+	if (irqs_on) {
+		/* An interrupt taken here may fault on a traced BAR itself; that
+		 * fault is claimed afresh, so in_pf is left clear. */
+		local_irq_enable();
+		execute_pf_instruction(ctx, &map, pf_regs, &op);
+		local_irq_disable();
+	} else {
+		this_cpu_write(*ctx->in_pf, true);
+		execute_pf_instruction(ctx, &map, pf_regs, &op);
+		this_cpu_write(*ctx->in_pf, false);
+	}
+	preempt_enable();
+
+	pr_debug("badarea: emulated %s at %pS with interrupts %s",
+	         op_is_read(&op) ? "read" : "write", (void *)pf_regs->ip,
+	         irqs_on ? "enabled" : "disabled");
+}
+NOKPROBE_SYMBOL(smptrace_badarea_cont);
 
 static int __enter_badarea(struct kprobe *kp, struct pt_regs *regs)
 {
@@ -286,7 +371,7 @@ static int __enter_badarea(struct kprobe *kp, struct pt_regs *regs)
 	unsigned long pf_va      = regs_get_kernel_argument(regs, 2);
 	unsigned long pf_err     = regs_get_kernel_argument(regs, 1);
 	struct smptrace_map map = {0};
-	int ret;
+	struct smptrace_x86_op op;
 
 	pr_debug("badarea: kprobe fired pf_va=0x%lx err=0x%lx pf_ip=0x%lx pf_user=%d ctx.pa=0x%llx ctx.len=0x%lx",
 	        pf_va, pf_err, pf_regs->ip, user_mode(pf_regs),
@@ -295,26 +380,22 @@ static int __enter_badarea(struct kprobe *kp, struct pt_regs *regs)
 	if (!smptrace_find_map_rcu(ctx, pf_va, &map))
 		return 0;
 
-	if (this_cpu_xchg(*ctx->in_pf, true)) {
+	if (this_cpu_read(*ctx->in_pf)) {
 		pr_warn("reentrant #PF on 0x%lx, ignoring", pf_va);
 		return 0;
 	}
 
-	ret = emulate_pf_instruction(ctx, &map, pf_regs);
-	this_cpu_write(*ctx->in_pf, false);
-
-	pr_debug("badarea: emulate_pf_instruction returned %d pf_va=0x%lx", ret, pf_va);
-
-    /* Update return address to skip the whole function we hooked */
-	if (!ret) {
-		instruction_pointer_set(regs, (unsigned long)smptrace_ret_gadget);
-		pr_debug("badarea: claimed, RIP set to smptrace_ret_gadget, returning 1");
-		return 1;
+	if (plan_pf_instruction(pf_regs, &op)) {
+		pr_debug("badarea: NOT claimed pf_va=0x%lx -> default kernel handler will oops",
+		         pf_va);
+		return 0;
 	}
 
-	pr_debug("badarea: NOT claimed (ret=%d), returning 0 -> default kernel handler will oops",
-	        ret);
-	return 0;
+	/* Emulate in the continuation, outside kprobe context, where the wait
+	 * for a read's answer may run with interrupts enabled. */
+	this_cpu_write(smptrace_cont_ctx, ctx);
+	instruction_pointer_set(regs, (unsigned long)smptrace_badarea_cont);
+	return 1;
 }
 
 /*

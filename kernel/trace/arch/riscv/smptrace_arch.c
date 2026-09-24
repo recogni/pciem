@@ -395,15 +395,21 @@ static int riscv_decode_ls_insn(u32 insn, struct riscv_ls_insn *out)
 	return 0;
 }
 
-static int emulate_riscv_fault(struct smptrace_ctx *ctx,
-                               struct smptrace_map *map,
-                               unsigned long fault_va,
-                               struct pt_regs *regs)
-{
+/* A decoded trapped load or store, and how long its encoding is. */
+struct smptrace_riscv_op {
 	struct riscv_ls_insn ls;
-	u32 insn;
-	u64 val;
 	bool is_rvc;
+};
+
+/*
+ * Decodes the instruction at regs->epc without performing it. Called twice per
+ * fault, from the kprobe to decide whether to claim it and again from the
+ * continuation to perform it; decoding reads only kernel text and pt_regs, so
+ * both calls agree.
+ */
+static int plan_riscv_fault(struct pt_regs *regs, struct smptrace_riscv_op *op)
+{
+	u32 insn;
 
 	if (user_mode(regs))
 		return -EACCES;
@@ -413,16 +419,16 @@ static int emulate_riscv_fault(struct smptrace_ctx *ctx,
 		return -EFAULT;
 	}
 
-	is_rvc = (insn & 0x3) != 0x3;
-	if (is_rvc) {
-		if (riscv_decode_rvc_ls_insn((u16)insn, &ls)) {
+	op->is_rvc = (insn & 0x3) != 0x3;
+	if (op->is_rvc) {
+		if (riscv_decode_rvc_ls_insn((u16)insn, &op->ls)) {
 			pr_warn_ratelimited(
 				"unhandled RVC instruction at epc=0x%lx (insn=0x%04x)",
 				regs->epc, insn & 0xFFFF);
 			return -EINVAL;
 		}
 	} else {
-		if (riscv_decode_ls_insn(insn, &ls)) {
+		if (riscv_decode_ls_insn(insn, &op->ls)) {
 			pr_warn_ratelimited(
 				"unrecognised load/store at epc=0x%lx insn=0x%08x",
 				regs->epc, insn);
@@ -430,28 +436,101 @@ static int emulate_riscv_fault(struct smptrace_ctx *ctx,
 		}
 	}
 
-	if (ls.is_store) {
-		unsigned long src = riscv_get_reg(regs, ls.rs2);
-		smptrace_emulate_write(ctx, map, fault_va, ls.size, (u8 *)&src);
+	return 0;
+}
+
+/* Performs a planned access and steps the faulting context past it. */
+static void execute_riscv_fault(struct smptrace_ctx *ctx,
+                                struct smptrace_map *map,
+                                unsigned long fault_va,
+                                struct pt_regs *regs,
+                                const struct smptrace_riscv_op *op)
+{
+	const struct riscv_ls_insn *ls = &op->ls;
+	u64 val;
+
+	if (ls->is_store) {
+		unsigned long src = riscv_get_reg(regs, ls->rs2);
+		smptrace_emulate_write(ctx, map, fault_va, ls->size, (u8 *)&src);
 	} else {
 		val = 0;
-		smptrace_emulate_read(ctx, map, fault_va, ls.size, (u8 *)&val);
+		smptrace_emulate_read(ctx, map, fault_va, ls->size, (u8 *)&val);
 
-		if (ls.rd != 0) {
-			if (ls.sign_extend) {
-				unsigned int sbits = ls.size * 8;
+		if (ls->rd != 0) {
+			if (ls->sign_extend) {
+				unsigned int sbits = ls->size * 8;
 				s64 sval = (s64)(val << (64 - sbits)) >> (64 - sbits);
-				riscv_set_reg(regs, ls.rd, (unsigned long)sval);
+				riscv_set_reg(regs, ls->rd, (unsigned long)sval);
 			} else {
-				riscv_set_reg(regs, ls.rd, (unsigned long)val);
+				riscv_set_reg(regs, ls->rd, (unsigned long)val);
 			}
 		}
 	}
 
 	// Compressed opcodes are 2 bytes, let's take that into account or fun stuff awaits us
-	regs->epc += is_rvc ? 2 : 4;
-	return 0;
+	regs->epc += op->is_rvc ? 2 : 4;
 }
+
+/* The tracer whose kprobe claimed this CPU's current fault, handed from the
+ * kprobe to the continuation. Nothing runs on this CPU in between: the kprobe
+ * returns straight into the continuation with interrupts still disabled. */
+static DEFINE_PER_CPU(struct smptrace_ctx *, smptrace_cont_ctx);
+
+/*
+ * Runs in place of handle_page_fault() for a fault the kprobe claimed, with the
+ * same argument, and returns to its caller. Unlike the kprobe handler it may run
+ * with interrupts enabled, so a load that waits on userspace restores the
+ * faulting context's interrupt state (SR_PIE) for the wait, as
+ * handle_page_fault() itself does: a hart that spins with interrupts off cannot
+ * take the IPIs that remote TLB flushes and other cross-CPU calls wait on, and
+ * every hart waiting on it is one the device model cannot run on.
+ *
+ * Returning without advancing regs->epc retries the access, which faults again
+ * and is re-judged by the kprobe.
+ */
+static void smptrace_page_fault_cont(struct pt_regs *regs)
+{
+	struct smptrace_ctx *ctx = this_cpu_read(smptrace_cont_ctx);
+	unsigned long fault_va = regs->badaddr;
+	struct smptrace_map map = {0};
+	struct smptrace_riscv_op op;
+	bool irqs_on;
+
+	this_cpu_write(smptrace_cont_ctx, NULL);
+	if (WARN_ON_ONCE(!ctx))
+		return;
+
+	/* smptrace_deactivate() unregisters the kprobe, which waits for an RCU
+	 * grace period, before it frees what this reads. */
+	guard(rcu)();
+
+	if (!smptrace_find_map_rcu(ctx, fault_va, &map))
+		return;
+	if (WARN_ON_ONCE(plan_riscv_fault(regs, &op)))
+		return;
+
+	irqs_on = !op.ls.is_store && !regs_irqs_disabled(regs);
+
+	/* ctx->in_pf and the eventual return stay on this hart. */
+	preempt_disable();
+	if (irqs_on) {
+		/* An interrupt taken here may fault on a traced BAR itself; that
+		 * fault is claimed afresh, so in_pf is left clear. */
+		local_irq_enable();
+		execute_riscv_fault(ctx, &map, fault_va, regs, &op);
+		local_irq_disable();
+	} else {
+		this_cpu_write(*ctx->in_pf, true);
+		execute_riscv_fault(ctx, &map, fault_va, regs, &op);
+		this_cpu_write(*ctx->in_pf, false);
+	}
+	preempt_enable();
+
+	pr_debug("page fault: emulated %s at %pS with interrupts %s",
+	         op.ls.is_store ? "store" : "load", (void *)regs->epc,
+	         irqs_on ? "enabled" : "disabled");
+}
+NOKPROBE_SYMBOL(smptrace_page_fault_cont);
 
 // do_trap_load_page_fault and do_trap_store_page are NOKPROBE, let's do handle_page_fault
 static int __enter_riscv_handle_page_fault(struct kprobe *kp,
@@ -463,7 +542,7 @@ static int __enter_riscv_handle_page_fault(struct kprobe *kp,
 	unsigned long fault_va = fault_regs->badaddr;
 	unsigned long cause    = fault_regs->cause;
 	struct smptrace_map map = {0};
-	int ret;
+	struct smptrace_riscv_op op;
 
 	if (cause != EXC_LOAD_PAGE_FAULT && cause != EXC_STORE_PAGE_FAULT)
 		return 0;
@@ -474,20 +553,19 @@ static int __enter_riscv_handle_page_fault(struct kprobe *kp,
 	if (!smptrace_find_map_rcu(ctx, fault_va, &map))
 		return 0;
 
-	if (this_cpu_xchg(*ctx->in_pf, true)) {
+	if (this_cpu_read(*ctx->in_pf)) {
 		pr_warn("reentrant fault on 0x%lx, ignoring", fault_va);
 		return 0;
 	}
 
-	ret = emulate_riscv_fault(ctx, &map, fault_va, fault_regs);
-	this_cpu_write(*ctx->in_pf, false);
+	if (plan_riscv_fault(fault_regs, &op))
+		return 0;
 
-	if (!ret) {
-		instruction_pointer_set(regs, (unsigned long)smptrace_ret_gadget);
-		return 1;
-	}
-
-	return 0;
+	/* Emulate in the continuation, outside kprobe context, where the wait
+	 * for a load's answer may run with interrupts enabled. */
+	this_cpu_write(smptrace_cont_ctx, ctx);
+	instruction_pointer_set(regs, (unsigned long)smptrace_page_fault_cont);
+	return 1;
 }
 
 int smptrace_arch_activate(struct smptrace_ctx *ctx)
