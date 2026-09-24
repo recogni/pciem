@@ -24,4 +24,9 @@ struct pciem_userspace_state *pciem_userspace_create(void);
 
 extern const struct file_operations pciem_device_fops;
 
+void pciem_notif_write(struct smptrace_ctx *ctx, struct smptrace_io *io);
+int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *io);
+struct smptrace_ctx *pciem_get_tracer_ctx(struct pciem_userspace_state *us,
+                                         u8 func, u32 bar_index);
+
 #endif
