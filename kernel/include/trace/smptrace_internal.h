@@ -47,6 +47,7 @@ static inline bool smptrace_find_map_rcu(struct smptrace_ctx *ctx,
 int smptrace_register_probes(struct smptrace_ctx *ctx);
 int smptrace_enter_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs);
 int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs);
+void smptrace_untrace_map(struct smptrace_ctx *ctx, unsigned long va);
 int smptrace_enter_iounmap(struct kprobe *rp, struct pt_regs *regs);
 void smptrace_emulate_write(struct smptrace_ctx *ctx, struct smptrace_map *map,
                             u64 addr, u32 size, const u8 *src);

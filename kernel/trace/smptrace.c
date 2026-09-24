@@ -43,6 +43,7 @@
 #include <linux/ptrace.h>
 #include <linux/version.h>
 #include <linux/rculist.h>
+#include <linux/wait_bit.h>
 #include <asm/io.h>
 #include <asm/tlbflush.h>
 #include "trace/smptrace.h"
@@ -181,11 +182,8 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-int smptrace_enter_iounmap(struct kprobe *kp, struct pt_regs *regs)
+void smptrace_untrace_map(struct smptrace_ctx *ctx, unsigned long va)
 {
-	struct smptrace_ctx *ctx = container_of(kp, struct smptrace_ctx,
-	                                        iounmap_kp);
-	unsigned long va = regs_get_kernel_argument(regs, 0);
 	struct smptrace_map *map, *found = NULL;
 	unsigned long flags;
 
@@ -200,12 +198,20 @@ int smptrace_enter_iounmap(struct kprobe *kp, struct pt_regs *regs)
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
 	if (!found)
-		return 0;
+		return;
 
 	pr_info("restoring VA=0x%lx (PA=0x%llx)", found->va,
 	        (unsigned long long)found->pa);
 	smptrace_arch_restore_pte(found);
 	kfree_rcu(found, rcu);
+}
+
+int smptrace_enter_iounmap(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct smptrace_ctx *ctx = container_of(kp, struct smptrace_ctx,
+	                                        iounmap_kp);
+
+	smptrace_untrace_map(ctx, regs_get_kernel_argument(regs, 0));
 	return 0;
 }
 
@@ -252,6 +258,7 @@ int smptrace_init(struct smptrace_ctx *ctx)
 
 	INIT_LIST_HEAD(&ctx->maps);
 	spin_lock_init(&ctx->lock);
+	atomic_set(&ctx->unmaps_pending, 0);
 
 	ctx->in_pf = alloc_percpu_gfp(bool, GFP_KERNEL_ACCOUNT);
 	if (!ctx->in_pf)
@@ -275,6 +282,8 @@ static void smptrace_deactivate(struct smptrace_ctx *ctx)
 	 * and removing poisoned PTEs */
 	unregister_kretprobe(&ctx->ioremap_krp);
 	unregister_kprobe(&ctx->iounmap_kp);
+	wait_var_event(&ctx->unmaps_pending,
+	               !atomic_read(&ctx->unmaps_pending));
 
 	/*
 	 * Now unpoison PTEs so that we stop hitting #PF, and only then forget

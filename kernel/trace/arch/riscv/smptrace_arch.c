@@ -3,6 +3,7 @@
  *  Copyright (C) 2026  Carlos López <carlos.lopezr4096@gmail.com>
  *  Copyright (C) 2026  Joel Bueno <buenocalvachejoel@gmail.com>
  */
+#include <linux/wait_bit.h>
 #include <asm/csr.h>
 #include "trace/smptrace_internal.h"
 
@@ -570,6 +571,57 @@ static int __enter_riscv_handle_page_fault(struct kprobe *kp,
 	return 1;
 }
 
+/*
+ * Runs in place of iounmap() for an address the kprobe found traced, with ctx
+ * passed in a1, and returns to iounmap()'s caller. The kprobe runs in NMI
+ * context (kernel-mode ebreak), where taking ctx->lock or restoring PTEs, with
+ * the cross-CPU fence that needs, is not allowed; this runs in the caller's
+ * context instead.
+ *
+ * The map is off ctx->maps before iounmap() is called again, so its kprobe
+ * lets that call through.
+ */
+static void smptrace_iounmap_cont(volatile void __iomem *addr,
+                                  struct smptrace_ctx *ctx)
+{
+	smptrace_untrace_map(ctx, (unsigned long)addr);
+
+	/* Last use of ctx: smptrace_deactivate() may free it once this drops
+	 * to zero. */
+	if (atomic_dec_and_test(&ctx->unmaps_pending))
+		wake_up_var(&ctx->unmaps_pending);
+
+	iounmap(addr);
+}
+NOKPROBE_SYMBOL(smptrace_iounmap_cont);
+
+static int __enter_riscv_iounmap(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct smptrace_ctx *ctx = container_of(kp, struct smptrace_ctx, iounmap_kp);
+	unsigned long va = regs_get_kernel_argument(regs, 0);
+	struct smptrace_map *map;
+	bool traced = false;
+
+	scoped_guard(rcu) {
+		list_for_each_entry_rcu(map, &ctx->maps, list) {
+			if (map->va == va) {
+				traced = true;
+				break;
+			}
+		}
+	}
+	if (!traced)
+		return 0;
+
+	/* The caller may be preempted before the continuation runs, so ctx
+	 * goes in a1, which iounmap() does not take, rather than in a per-CPU
+	 * variable, and is kept alive by unmaps_pending rather than by RCU. */
+	atomic_inc(&ctx->unmaps_pending);
+	regs->a1 = (unsigned long)ctx;
+	instruction_pointer_set(regs, (unsigned long)smptrace_iounmap_cont);
+	return 1;
+}
+
 int smptrace_arch_activate(struct smptrace_ctx *ctx)
 {
 	unsigned long satp;
@@ -593,7 +645,7 @@ int smptrace_arch_activate(struct smptrace_ctx *ctx)
 		.symbol_name = "handle_page_fault",
 	};
 	ctx->iounmap_kp = (struct kprobe){
-		.pre_handler = smptrace_enter_iounmap,
+		.pre_handler = __enter_riscv_iounmap,
 		.symbol_name = "iounmap",
 	};
 	ctx->ioremap_krp = (struct kretprobe){

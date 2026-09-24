@@ -93,6 +93,10 @@ struct smptrace_ctx {
 	/* Address of the shadow memory we maintain. Size is ctx->len */
 	void __iomem *shadow_va;
 
+	/* iounmap() continuations that were handed this ctx and have not yet
+	 * finished with it (riscv) */
+	atomic_t unmaps_pending;
+
 	/* Whether this CPU is handling #PF or not */
 	bool __percpu *in_pf;
 };
