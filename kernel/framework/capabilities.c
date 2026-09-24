@@ -125,20 +125,29 @@ static int pciem_check_msi_address_width(u8 device_type, bool has_64bit)
 
 void pciem_init_cap_manager(struct pciem_root_complex *v)
 {
-    guard(write_lock)(&v->cap_lock);
+    struct pciem_cap_manager *mgr;
 
-    if (v->cap_mgr)
-        return;
-
-    v->cap_mgr = kzalloc(sizeof(*v->cap_mgr), GFP_KERNEL);
-    if (!v->cap_mgr)
+    /* cap_lock is a spinning lock: allocate before taking it. */
+    mgr = kzalloc(sizeof(*mgr), GFP_KERNEL);
+    if (!mgr)
     {
         pr_err("Failed to allocate capability manager\n");
         return;
     }
-    v->cap_mgr->num_caps = 0;
-    v->cap_mgr->next_offset = 0x40;
-    v->cap_mgr->ext_next_offset = PCI_CFG_SPACE_SIZE;
+    mgr->num_caps = 0;
+    mgr->next_offset = 0x40;
+    mgr->ext_next_offset = PCI_CFG_SPACE_SIZE;
+
+    scoped_guard(write_lock, &v->cap_lock)
+    {
+        if (!v->cap_mgr)
+        {
+            v->cap_mgr = mgr;
+            mgr = NULL;
+        }
+    }
+
+    kfree(mgr);
 }
 
 void pciem_cleanup_cap_manager(struct pciem_root_complex *v)
@@ -299,7 +308,12 @@ int pciem_add_cap_vsec(struct pciem_root_complex *v, struct pciem_cap_vsec_confi
 {
     struct pciem_cap_manager *mgr;
     struct pciem_cap_entry *cap;
-    u8 *data_copy;
+    u8 *data_copy __free(kfree) = NULL;
+
+    /* cap_lock is a spinning lock: allocate before taking it. */
+    data_copy = kmemdup(cfg->data, cfg->vsec_length, GFP_KERNEL);
+    if (!data_copy)
+        return -ENOMEM;
 
     guard(write_lock)(&v->cap_lock);
 
@@ -307,18 +321,12 @@ int pciem_add_cap_vsec(struct pciem_root_complex *v, struct pciem_cap_vsec_confi
     if (!mgr || mgr->num_caps >= MAX_PCI_CAPS)
         return -ENOMEM;
 
-    data_copy = kmalloc(cfg->vsec_length, GFP_KERNEL);
-    if (!data_copy)
-        return -ENOMEM;
-
-    memcpy(data_copy, cfg->data, cfg->vsec_length);
-
     cap = &mgr->caps[mgr->num_caps];
     cap->type = PCIEM_CAP_VSEC;
     cap->offset = mgr->next_offset;
     cap->size = 8 + cfg->vsec_length;
     cap->config.vsec = *cfg;
-    cap->config.vsec.data = data_copy;
+    cap->config.vsec.data = no_free_ptr(data_copy);
 
     mgr->next_offset += cap->size;
     mgr->num_caps++;
