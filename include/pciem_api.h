@@ -277,12 +277,24 @@ struct pciem_dma_indirect
 #define PCIEM_TRACE_STOP_WRITES   (1 << 2)
 
 /*
- * Route reads through userspace synchronously: on a read fault the kernel
- * pushes a PCIEM_EVENT_MMIO_READ request onto the ring and spins (bounded)
- * until the daemon answers via write(fd, struct pciem_response). The
- * response's @data becomes the value the faulting instruction reads.
- * Required for destructive-read registers (FIFO data ports). On timeout
- * (daemon never answered) or a full ring, returns all-1s */
+ * Route reads through userspace synchronously: the kernel pushes a
+ * PCIEM_EVENT_MMIO_READ request onto the ring and waits until the device
+ * model answers via write(fd, struct pciem_response). The response's @data
+ * becomes the value the read returns. Required for destructive-read
+ * registers (FIFO data ports).
+ *
+ * A read that vfio-pci makes for userspace (read() or write() on the device
+ * fd, or an access through an mmap() of the BAR) sleeps while it waits. A
+ * read from kernel code spins, because a fault cannot tell whether the code
+ * that took it may sleep, so it is answered only while the device model can
+ * run on another CPU: on a single CPU, or from an interrupt taken on the
+ * device model's own CPU, it times out. The kernel reads an MSI-X table with
+ * interrupts disabled when it masks a vector, so do not set this flag on a
+ * BAR that holds one.
+ *
+ * On timeout or a full ring the read returns all-1s, the value of a PCIe
+ * master abort. For a destructive register, the value the device model
+ * produced for that read is lost. */
 #define PCIEM_TRACE_SYNC_READS    (1 << 3)
 
 /**
