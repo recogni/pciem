@@ -276,16 +276,22 @@ static void smptrace_deactivate(struct smptrace_ctx *ctx)
 	unregister_kretprobe(&ctx->ioremap_krp);
 	unregister_kprobe(&ctx->iounmap_kp);
 
-	/* Now unpoison PTEs so that we stop hitting #PF */
+	/*
+	 * Now unpoison PTEs so that we stop hitting #PF, and only then forget
+	 * the maps. A fault already taken on a poisoned PTE runs with
+	 * interrupts disabled until the kprobe has looked its map up, so after
+	 * a grace period none is left that could miss it and go unclaimed.
+	 * Nothing adds or removes maps any more, so the list is walked
+	 * unlocked: restoring a PTE may flush the TLB, which needs interrupts.
+	 */
+	list_for_each_entry(map, &ctx->maps, list)
+		smptrace_arch_restore_pte(map);
+	synchronize_rcu();
+
 	spin_lock_irqsave(&ctx->lock, flags);
 	list_for_each_entry_safe(map, tmp, &ctx->maps, list) {
 		list_del_rcu(&map->list);
-		spin_unlock_irqrestore(&ctx->lock, flags);
-
-		smptrace_arch_restore_pte(map);
 		kfree_rcu(map, rcu);
-
-		spin_lock_irqsave(&ctx->lock, flags);
 	}
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
