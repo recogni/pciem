@@ -292,10 +292,11 @@ static int riscv_decode_rvc_ls_insn(u16 insn16, struct riscv_ls_insn *out)
 		u32 rp = (insn16 >> 2) & 0x7;
 
 		switch (funct3) {
-		// C.LW
+		// C.LW, which sign-extends like LW
 		case 0x2:
 			out->rd = 8 + rp; out->rs2 = 0;
-			out->size = 4;    out->is_store = false; break;
+			out->size = 4;    out->is_store = false;
+			out->sign_extend = true; break;
 		// C.LD
 		case 0x3:
 			out->rd = 8 + rp; out->rs2 = 0;
@@ -314,10 +315,11 @@ static int riscv_decode_rvc_ls_insn(u16 insn16, struct riscv_ls_insn *out)
 
 	} else if (op == 0x2) {
 		switch (funct3) {
-		// C.LWSP
+		// C.LWSP, which sign-extends like LW
 		case 0x2:
 			out->rd = (insn16 >> 7) & 0x1F; out->rs2 = 0;
-			out->size = 4;                   out->is_store = false; break;
+			out->size = 4;                   out->is_store = false;
+			out->sign_extend = true;         break;
 		// C.LDSP
 		case 0x3:
 			out->rd = (insn16 >> 7) & 0x1F; out->rs2 = 0;

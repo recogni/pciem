@@ -372,8 +372,13 @@ static int emulate_arm64_fault(struct smptrace_ctx *ctx,
 		sse      = ls.sign_extend;
 		sf       = ls.sf;
 
-		if ((ls.pre_index || ls.post_index) && ls.rn != 31)
-			regs->regs[ls.rn] += ls.wb_delta;
+		/* As a base register, 31 is SP rather than XZR. */
+		if (ls.pre_index || ls.post_index) {
+			if (ls.rn == 31)
+				regs->sp += ls.wb_delta;
+			else
+				regs->regs[ls.rn] += ls.wb_delta;
+		}
 	}
 
 	if (is_store) {

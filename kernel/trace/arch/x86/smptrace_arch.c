@@ -243,6 +243,20 @@ static int plan_pf_instruction(struct pt_regs *regs, struct smptrace_x86_op *op)
 		}
 	}
 
+	/* Without a REX prefix, byte registers 4-7 are AH, CH, DH and BH, not the
+	 * SPL..DIL insn_get_modrm_reg_ptr() resolves them to. */
+	if (op->len == 1 && (op->mmio == INSN_MMIO_READ || op->mmio == INSN_MMIO_WRITE) &&
+	    !op->insn.rex_prefix.nbytes) {
+		static const unsigned short high_byte[] = {
+			offsetof(struct pt_regs, ax), offsetof(struct pt_regs, cx),
+			offsetof(struct pt_regs, dx), offsetof(struct pt_regs, bx),
+		};
+		int reg = X86_MODRM_REG(op->insn.modrm.value);
+
+		if (reg >= 4)
+			op->data = (long *)((u8 *)regs + high_byte[reg - 4] + 1);
+	}
+
 	op->addr = (u64)insn_get_addr_ref(&op->insn, regs);
 	return 0;
 }
@@ -277,7 +291,8 @@ static void execute_pf_instruction(struct smptrace_ctx *ctx,
 		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)op->data);
 		break;
 	case INSN_MMIO_READ_ZERO_EXTEND:
-		memset(op->data, 0, op->insn.opnd_bytes);
+		/* A 32-bit destination zeroes bits 63:32 too, as on hardware. */
+		memset(op->data, 0, op->insn.opnd_bytes == 2 ? 2 : sizeof(*op->data));
 		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)op->data);
 		break;
 	case INSN_MMIO_READ_SIGN_EXTEND: {
