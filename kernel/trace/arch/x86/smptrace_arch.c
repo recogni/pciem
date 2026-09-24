@@ -317,6 +317,19 @@ static int __enter_badarea(struct kprobe *kp, struct pt_regs *regs)
 	return 0;
 }
 
+/*
+ * Deliberately empty. An optimized kprobe (a jump in place of the int3) ignores its
+ * pre_handler's return value and the instruction pointer it sets, so the
+ * pre_handler's redirect would be dropped and the fault would oops.
+ * Kprobes does not optimize a probe that has a post_handler. Probes placed
+ * through ftrace (KPROBES_ON_FTRACE) are never optimized, which is why kernels
+ * with a function tracer did not need this.
+ */
+static void smptrace_badarea_no_optimize(struct kprobe *kp, struct pt_regs *regs,
+                                         unsigned long flags)
+{
+}
+
 int smptrace_arch_activate(struct smptrace_ctx *ctx)
 {
 	ctx->shadow_va = ioremap(ctx->pa, ctx->len);
@@ -328,8 +341,9 @@ int smptrace_arch_activate(struct smptrace_ctx *ctx)
 	readl(ctx->shadow_va);
 
 	ctx->badarea_kp = (struct kprobe){
-		.pre_handler = __enter_badarea,
-		.symbol_name = "bad_area_nosemaphore",
+		.pre_handler  = __enter_badarea,
+		.post_handler = smptrace_badarea_no_optimize,
+		.symbol_name  = "bad_area_nosemaphore",
 	};
 	ctx->iounmap_kp = (struct kprobe){
 		.pre_handler = smptrace_enter_iounmap,
