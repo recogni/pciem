@@ -117,7 +117,7 @@ struct smptrace_ctx {
 
 
 int smptrace_init(struct smptrace_ctx *ctx);
-/* Trap userspace mmap()s of traced BARs made through vfio-pci */
+/* Route userspace vfio-pci accesses (mmap, read, write) of traced BARs */
 int smptrace_vfio_init(void);
 void smptrace_vfio_exit(void);
 
