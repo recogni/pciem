@@ -149,6 +149,7 @@ static int pciem_instance_mmap(struct file *file, struct vm_area_struct *vma)
     struct pciem_userspace_state *us = file->private_data;
     struct pciem_bar_info *bar;
     struct pciem_root_complex *v;
+    phys_addr_t phys_addr;
     unsigned long size = vma->vm_end - vma->vm_start;
     unsigned long bar_index = vma->vm_pgoff & ((1 << 3) - 1);
     unsigned long func_index = vma->vm_pgoff >> 3;
@@ -167,10 +168,20 @@ static int pciem_instance_mmap(struct file *file, struct vm_area_struct *vma)
     if (!v)
         return -ENODEV;
 
-    guard(read_lock)(&v->bars_lock);
-    bar = &v->bars[bar_index];
+    /*
+     * remap_pfn_range() allocates page tables and may sleep, so it must not
+     * run under the bars_lock rwlock. Using the snapshot after dropping the
+     * lock is safe: the instance fd only exists once the device is
+     * registered, BARs can no longer be added past that point, and they are
+     * only freed when the last reference to @us goes away, which this open
+     * file (and afterwards the VMA's reference to it) prevents.
+     */
+    scoped_guard(read_lock, &v->bars_lock) {
+        bar = &v->bars[bar_index];
+        phys_addr = bar->size ? bar->phys_addr : 0;
+    }
 
-    if (bar->size == 0 || bar->phys_addr == 0) {
+    if (phys_addr == 0) {
         pr_err("pciem_instance: func%lu BAR%lu is not active\n",
                func_index, bar_index);
         return -EINVAL;
@@ -179,14 +190,14 @@ static int pciem_instance_mmap(struct file *file, struct vm_area_struct *vma)
     vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
     if (remap_pfn_range(vma, vma->vm_start,
-                        bar->phys_addr >> PAGE_SHIFT,
+                        phys_addr >> PAGE_SHIFT,
                         size, vma->vm_page_prot))
     {
         return -EAGAIN;
     }
 
     pr_debug("pciem_instance: mapped func%lu BAR%lu (phys=0x%llx) to userspace\n",
-             func_index, bar_index, (u64)bar->phys_addr);
+             func_index, bar_index, (u64)phys_addr);
     return 0;
 }
 
@@ -1047,15 +1058,17 @@ static long pciem_ioctl_get_bar_info(struct pciem_userspace_state *us, struct pc
     if (!v)
         return -ENODEV;
 
-    guard(read_lock)(&v->bars_lock);
-    bar = &v->bars[query.bar_index];
+    /* copy_to_user() may fault and sleep, so it runs after the lock is dropped. */
+    scoped_guard(read_lock, &v->bars_lock) {
+        bar = &v->bars[query.bar_index];
 
-    if (bar->size == 0)
-        return -ENOENT;
+        if (bar->size == 0)
+            return -ENOENT;
 
-    query.phys_addr = bar->phys_addr;
-    query.size = bar->size;
-    query.flags = bar->flags;
+        query.phys_addr = bar->phys_addr;
+        query.size = bar->size;
+        query.flags = bar->flags;
+    }
 
     if (copy_to_user(arg, &query, sizeof(query)))
         return -EFAULT;
