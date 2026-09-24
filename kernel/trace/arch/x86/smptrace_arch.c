@@ -260,8 +260,6 @@ static void execute_pf_instruction(struct smptrace_ctx *ctx,
                                    struct pt_regs *regs,
                                    struct smptrace_x86_op *op)
 {
-	u8 sign_byte;
-
 	switch (op->mmio) {
 	case INSN_MMIO_WRITE:
 		smptrace_emulate_write(ctx, map, op->addr, op->len, (u8 *)op->data);
@@ -282,20 +280,21 @@ static void execute_pf_instruction(struct smptrace_ctx *ctx,
 		memset(op->data, 0, op->insn.opnd_bytes);
 		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)op->data);
 		break;
-	case INSN_MMIO_READ_SIGN_EXTEND:
-		/* Sign extend based on operand size */
-		if (op->len == 1) {
-			u8 val;
-			smptrace_emulate_read(ctx, map, op->addr, op->len, &val);
-			sign_byte = (val & 0x80) ? 0xff : 0x00;
-		} else {
-			u16 val;
-			smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)&val);
-			sign_byte = (val & 0x8000) ? 0xff : 0x00;
-		}
-		memset(op->data, sign_byte, op->insn.opnd_bytes);
-		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)op->data);
+	case INSN_MMIO_READ_SIGN_EXTEND: {
+		u16 val = 0;
+		long ext;
+
+		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)&val);
+		ext = op->len == 1 ? (s8)val : (s16)val;
+		if (op->insn.opnd_bytes == 2)
+			*(u16 *)op->data = ext;
+		else if (op->insn.opnd_bytes == 4)
+			/* A 32-bit destination zeroes bits 63:32, as on hardware. */
+			*op->data = (u32)ext;
+		else
+			*op->data = ext;
 		break;
+	}
 	default:
 		/* plan_pf_instruction() admits nothing else */
 		break;
