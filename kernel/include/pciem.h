@@ -121,7 +121,13 @@ struct pciem_root_complex
     struct platform_device *shared_bridge_pdev;
 
     struct pciem_cap_manager *cap_mgr;
-    rwlock_t cap_lock;
+    /*
+     * Raw: the config accessors take it, and the PCI core calls those under
+     * pci_lock, a raw spinlock held with IRQs off. They can also run in hardirq
+     * context (MSI mask writes), so every taker disables IRQs. Nothing that can
+     * sleep, allocation and kfree() included, may run under it.
+     */
+    raw_spinlock_t cap_lock;
 
     resource_size_t total_carved_start;
     resource_size_t total_carved_end;

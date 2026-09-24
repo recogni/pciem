@@ -127,7 +127,6 @@ void pciem_init_cap_manager(struct pciem_root_complex *v)
 {
     struct pciem_cap_manager *mgr;
 
-    /* cap_lock is a spinning lock: allocate before taking it. */
     mgr = kzalloc(sizeof(*mgr), GFP_KERNEL);
     if (!mgr)
     {
@@ -138,7 +137,7 @@ void pciem_init_cap_manager(struct pciem_root_complex *v)
     mgr->next_offset = 0x40;
     mgr->ext_next_offset = PCI_CFG_SPACE_SIZE;
 
-    scoped_guard(write_lock, &v->cap_lock)
+    scoped_guard(raw_spinlock_irqsave, &v->cap_lock)
     {
         if (!v->cap_mgr)
         {
@@ -155,13 +154,16 @@ void pciem_cleanup_cap_manager(struct pciem_root_complex *v)
     struct pciem_cap_manager *mgr;
     int i;
 
-    guard(write_lock)(&v->cap_lock);
+    scoped_guard(raw_spinlock_irqsave, &v->cap_lock)
+    {
+        mgr = v->cap_mgr;
+        v->cap_mgr = NULL;
+    }
 
-    mgr = v->cap_mgr;
     if (!mgr)
         return;
 
-    for (i = 0; i < v->cap_mgr->num_caps; i++)
+    for (i = 0; i < mgr->num_caps; i++)
     {
         if (mgr->caps[i].type == PCIEM_CAP_VSEC && mgr->caps[i].config.vsec.data)
         {
@@ -170,7 +172,6 @@ void pciem_cleanup_cap_manager(struct pciem_root_complex *v)
     }
 
     kfree(mgr);
-    v->cap_mgr = NULL;
 }
 
 int pciem_add_cap_msi(struct pciem_root_complex *v, struct pciem_cap_msi_config *cfg)
@@ -180,7 +181,7 @@ int pciem_add_cap_msi(struct pciem_root_complex *v, struct pciem_cap_msi_config 
     struct pciem_cap_entry *cap;
     int ret;
 
-    guard(write_lock)(&v->cap_lock);
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
 
     mgr = v->cap_mgr;
     if (!mgr || mgr->num_caps >= MAX_PCI_CAPS)
@@ -220,7 +221,7 @@ int pciem_add_cap_msix(struct pciem_root_complex *v, struct pciem_cap_msix_confi
     struct pciem_cap_manager *mgr;
     struct pciem_cap_entry *cap;
 
-    guard(write_lock)(&v->cap_lock);
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
 
     mgr = v->cap_mgr;
     if (!mgr || mgr->num_caps >= MAX_PCI_CAPS)
@@ -246,7 +247,7 @@ int pciem_add_cap_pm(struct pciem_root_complex *v, struct pciem_cap_pm_config *c
     struct pciem_cap_manager *mgr;
     struct pciem_cap_entry *cap;
 
-    guard(write_lock)(&v->cap_lock);
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
 
     mgr = v->cap_mgr;
     if (!mgr || mgr->num_caps >= MAX_PCI_CAPS)
@@ -276,7 +277,7 @@ int pciem_add_cap_pcie(struct pciem_root_complex *v, struct pciem_cap_pcie_confi
     struct pciem_cap_entry *cap;
     int ret;
 
-    guard(write_lock)(&v->cap_lock);
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
 
     mgr = v->cap_mgr;
     if (!mgr || mgr->num_caps >= MAX_PCI_CAPS)
@@ -308,14 +309,12 @@ int pciem_add_cap_vsec(struct pciem_root_complex *v, struct pciem_cap_vsec_confi
 {
     struct pciem_cap_manager *mgr;
     struct pciem_cap_entry *cap;
-    u8 *data_copy __free(kfree) = NULL;
+    u8 *data_copy __free(kfree) = kmemdup(cfg->data, cfg->vsec_length, GFP_KERNEL);
 
-    /* cap_lock is a spinning lock: allocate before taking it. */
-    data_copy = kmemdup(cfg->data, cfg->vsec_length, GFP_KERNEL);
     if (!data_copy)
         return -ENOMEM;
 
-    guard(write_lock)(&v->cap_lock);
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
 
     mgr = v->cap_mgr;
     if (!mgr || mgr->num_caps >= MAX_PCI_CAPS)
@@ -341,7 +340,7 @@ int pciem_add_cap_pasid(struct pciem_root_complex *v, struct pciem_cap_pasid_con
     struct pciem_cap_manager *mgr;
     struct pciem_cap_entry *cap;
 
-    guard(write_lock)(&v->cap_lock);
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
 
     mgr = v->cap_mgr;
     if (!mgr || mgr->num_caps >= MAX_PCI_CAPS)
@@ -676,10 +675,12 @@ static bool handle_pasid_read(struct pciem_cap_entry *cap, u32 offset, u32 size,
 
 bool pciem_handle_cap_read(struct pciem_root_complex *v, int where, int size, u32 *value)
 {
-    struct pciem_cap_manager *mgr = v->cap_mgr;
+    struct pciem_cap_manager *mgr;
     int i;
 
-    guard(read_lock)(&v->cap_lock);
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+
+    mgr = v->cap_mgr;
 
     if (!mgr)
         return false;
@@ -836,12 +837,12 @@ static bool handle_pasid_write(struct pciem_cap_entry *cap, u8 *storage,
 
 bool pciem_handle_cap_write(struct pciem_root_complex *v, int where, int size, u32 value)
 {
-    struct pciem_cap_manager *mgr = v->cap_mgr;
+    struct pciem_cap_manager *mgr;
     int i;
 
-    /* Take a read lock since we are not updating anything in the cap. manager itself,
-     * only the actual capabilities. */
-    guard(read_lock)(&v->cap_lock);
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+
+    mgr = v->cap_mgr;
 
     if (!mgr)
         return false;
