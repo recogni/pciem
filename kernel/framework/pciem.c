@@ -1089,7 +1089,7 @@ int pciem_complete_init(struct pciem_root_complex *v)
 fail_device:
     if (v->pciem_pdev) {
         if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
-            pci_stop_and_remove_bus_device(v->pciem_pdev);
+            pci_stop_and_remove_bus_device_locked(v->pciem_pdev);
         } else {
             pci_dev_put(v->pciem_pdev);
         }
@@ -1098,7 +1098,9 @@ fail_device:
     if (v->bus_mode == PCIEM_BUS_MODE_VIRTUAL_ROOT && v->root_bus) {
         if (v->root_bus->bridge)
             pciem_iommu_stub_unregister_bridge(v->root_bus->bridge);
+        pci_lock_rescan_remove();
         pci_remove_root_bus(v->root_bus);
+        pci_unlock_rescan_remove();
         v->root_bus = NULL;
     } else if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
         if (v->mode_state.hijack.target_bus && v->mode_state.hijack.original_ops) {
@@ -1147,7 +1149,7 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
             v->detaching = true;
         }
 
-        pci_stop_and_remove_bus_device(v->pciem_pdev);
+        pci_stop_and_remove_bus_device_locked(v->pciem_pdev);
         v->pciem_pdev = NULL;
     }
 
@@ -1156,7 +1158,9 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
         if (v->bus_mode == PCIEM_BUS_MODE_VIRTUAL_ROOT) {
             if (v->root_bus->bridge)
                 pciem_iommu_stub_unregister_bridge(v->root_bus->bridge);
+            pci_lock_rescan_remove();
             pci_remove_root_bus(v->root_bus);
+            pci_unlock_rescan_remove();
         } else if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
             if (v->mode_state.hijack.original_ops) {
                 pci_lock_rescan_remove();
