@@ -71,6 +71,9 @@ struct pciem_userspace_state
 
     struct hlist_head pending_requests[256];
     spinlock_t pending_lock;
+    /* Set, under pending_lock, once teardown has failed every pending
+     * request; no request is published after it. */
+    bool closing;
 
     atomic_t registered;
     atomic_t event_pending;
@@ -360,21 +363,23 @@ static void pciem_userspace_destroy(struct kref *refcnt)
     if (!us)
         return;
 
-    pciem_tracing_destroy(us);
-    pciem_irqfds_shutdown(&us->irqfds);
-
-    /* Force-complete any request still blocked waiting on a response
-     * so that path can never deadlock against this teardown. */
+    /* Fail every request still waiting on a response, and refuse new
+     * ones, before destroying the tracers: destroying one waits for any
+     * fault on it that is sleeping on a read. */
+    spin_lock_irqsave(&us->pending_lock, flags);
+    us->closing = true;
     for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++)
     {
-        spin_lock_irqsave(&us->pending_lock, flags);
         hlist_for_each_entry(req, &us->pending_requests[i], node)
         {
             req->response_status = -ENODEV;
             complete(&req->done);
         }
-        spin_unlock_irqrestore(&us->pending_lock, flags);
     }
+    spin_unlock_irqrestore(&us->pending_lock, flags);
+
+    pciem_tracing_destroy(us);
+    pciem_irqfds_shutdown(&us->irqfds);
 
     pciem_shared_ring_destroy(us);
 
@@ -1426,11 +1431,12 @@ static void pciem_notif_read(struct smptrace_ctx *ctx, struct smptrace_io *io)
 /*
  * Synchronous handler-routed read (PCIEM_TRACE_SYNC_READS).
  *
- * Runs in the #PF emulation path: atomic context, so we cannot sleep.
- * Push a request event, then spin (bounded) until the daemon answers
- * through pciem_device_write(), which completes the pending request.
- * The daemon runs on another CPU, so the spin resolves in the time one
- * event round-trip takes (microseconds when the daemon is healthy).
+ * Push a request event, then wait until the device model answers through
+ * pciem_device_write(), which completes the pending request. A kernel
+ * fault may be in atomic context, so it spins, bounded. A user-mode fault
+ * (io->may_sleep) sleeps instead, so the CPU stays available to the device
+ * model, and waits longer: a read that times out may still be performed by
+ * the device model, and for a destructive register that loses the value.
  *
  * Returns 0 with io->data holding the value on success; -ETIMEDOUT if
  * the daemon never answered. The caller (smptrace_emulate_read) treats
@@ -1438,6 +1444,7 @@ static void pciem_notif_read(struct smptrace_ctx *ctx, struct smptrace_io *io)
  * PCIe master-abort sentinel (all-1s).
  */
 #define PCIEM_SYNC_READ_TIMEOUT_MS 100
+#define PCIEM_SYNC_READ_SLEEP_TIMEOUT_MS 10000
 
 static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *io)
 {
@@ -1448,7 +1455,7 @@ static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *i
     unsigned long deadline = jiffies + msecs_to_jiffies(PCIEM_SYNC_READ_TIMEOUT_MS);
     unsigned long flags;
     int hash;
-    bool answered;
+    bool answered = false;
 
     ev.type = PCIEM_EVENT_MMIO_READ;
     ev.bar = ctx->opaque;
@@ -1466,22 +1473,33 @@ static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *i
     /* Publish the request before the event so the response always
      * finds it. */
     spin_lock_irqsave(&us->pending_lock, flags);
+    if (us->closing) {
+        spin_unlock_irqrestore(&us->pending_lock, flags);
+        return -ENODEV;
+    }
     hlist_add_head(&req.node, &us->pending_requests[hash]);
     spin_unlock_irqrestore(&us->pending_lock, flags);
 
     pciem_userspace_queue_event(us, &ev);
 
-    while (!completion_done(&req.done)) {
-        if (time_after(jiffies, deadline))
-            break;
-        cpu_relax();
+    if (io->may_sleep) {
+        /* A successful wait consumes the completion, so completion_done()
+         * below no longer reports it. */
+        answered = wait_for_completion_killable_timeout(&req.done,
+                msecs_to_jiffies(PCIEM_SYNC_READ_SLEEP_TIMEOUT_MS)) > 0;
+    } else {
+        while (!completion_done(&req.done)) {
+            if (time_after(jiffies, deadline))
+                break;
+            cpu_relax();
+        }
     }
 
     /* Unpublish under the lock; the responder also runs under it, so
      * after this either the completion fired or it never will. */
     spin_lock_irqsave(&us->pending_lock, flags);
     hlist_del(&req.node);
-    answered = completion_done(&req.done);
+    answered = answered || completion_done(&req.done);
     spin_unlock_irqrestore(&us->pending_lock, flags);
 
     if (!answered || req.response_status) {

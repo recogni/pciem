@@ -193,6 +193,8 @@ struct smptrace_x86_op {
 	unsigned int len;
 	long *data;
 	u64 addr;
+	/* A user-mode fault, which may sleep while a read is answered */
+	bool may_sleep;
 };
 
 /*
@@ -201,6 +203,8 @@ struct smptrace_x86_op {
  * continuation to perform it; decoding reads only kernel text and pt_regs, so
  * both calls agree.
  */
+static int classify_pf_instruction(struct pt_regs *regs, struct smptrace_x86_op *op);
+
 static int plan_pf_instruction(struct pt_regs *regs, struct smptrace_x86_op *op)
 {
 	int ret;
@@ -214,6 +218,12 @@ static int plan_pf_instruction(struct pt_regs *regs, struct smptrace_x86_op *op)
 		return ret;
 	}
 
+	return classify_pf_instruction(regs, op);
+}
+
+/* Everything after decoding: the access kind, width, register and address. */
+static int classify_pf_instruction(struct pt_regs *regs, struct smptrace_x86_op *op)
+{
 	op->mmio = insn_decode_mmio(&op->insn, &op->len);
 	switch (op->mmio) {
 	case INSN_MMIO_WRITE:
@@ -223,7 +233,7 @@ static int plan_pf_instruction(struct pt_regs *regs, struct smptrace_x86_op *op)
 	case INSN_MMIO_READ_SIGN_EXTEND:
 		break;
 	case INSN_MMIO_DECODE_FAILED:
-		pr_warn("failed to decode MMIO instr ip=0x%lx", regs->ip);
+		pr_warn_ratelimited("failed to decode MMIO instr ip=0x%lx", regs->ip);
 		return -EINVAL;
 	case INSN_MMIO_MOVS:
 		pr_warn_ratelimited("unhandled MOVS instruction ip=0x%lx", regs->ip);
@@ -238,7 +248,7 @@ static int plan_pf_instruction(struct pt_regs *regs, struct smptrace_x86_op *op)
 	if (op->mmio != INSN_MMIO_WRITE_IMM) {
 		op->data = insn_get_modrm_reg_ptr(&op->insn, regs);
 		if (!op->data) {
-			pr_warn("failed to get modrm reg ptr");
+			pr_warn_ratelimited("failed to get modrm reg ptr");
 			return -EINVAL;
 		}
 	}
@@ -258,6 +268,7 @@ static int plan_pf_instruction(struct pt_regs *regs, struct smptrace_x86_op *op)
 	}
 
 	op->addr = (u64)insn_get_addr_ref(&op->insn, regs);
+	op->may_sleep = false;
 	return 0;
 }
 
@@ -288,18 +299,21 @@ static void execute_pf_instruction(struct smptrace_ctx *ctx,
 	case INSN_MMIO_READ:
 		if (op->len == 4)
 			*op->data = 0;
-		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)op->data);
+		smptrace_emulate_read_may_sleep(ctx, map, op->addr, op->len, (u8 *)op->data,
+		                                op->may_sleep);
 		break;
 	case INSN_MMIO_READ_ZERO_EXTEND:
 		/* A 32-bit destination zeroes bits 63:32 too, as on hardware. */
 		memset(op->data, 0, op->insn.opnd_bytes == 2 ? 2 : sizeof(*op->data));
-		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)op->data);
+		smptrace_emulate_read_may_sleep(ctx, map, op->addr, op->len, (u8 *)op->data,
+		                                op->may_sleep);
 		break;
 	case INSN_MMIO_READ_SIGN_EXTEND: {
 		u16 val = 0;
 		long ext;
 
-		smptrace_emulate_read(ctx, map, op->addr, op->len, (u8 *)&val);
+		smptrace_emulate_read_may_sleep(ctx, map, op->addr, op->len, (u8 *)&val,
+		                                op->may_sleep);
 		ext = op->len == 1 ? (s8)val : (s16)val;
 		if (op->insn.opnd_bytes == 2)
 			*(u16 *)op->data = ext;
@@ -316,6 +330,56 @@ static void execute_pf_instruction(struct smptrace_ctx *ctx,
 	}
 
 	regs->ip += op->insn.length;
+}
+
+int smptrace_arch_user_fault(struct pt_regs *regs, unsigned long fault_va,
+                             unsigned long start, unsigned long end, phys_addr_t pa)
+{
+	unsigned char buf[MAX_INSN_SIZE];
+	struct smptrace_map map = {0};
+	struct smptrace_x86_op op;
+	struct smptrace_ctx *ctx;
+	int n, ret, idx;
+
+	if (!user_mode(regs))
+		return -EACCES;
+
+	/* The caller holds mmap_lock, which a fault on the text page would
+	 * take again, so the fetch must not fault. A short fetch that leaves
+	 * the instruction undecodable is retried: re-executing it faults the
+	 * text page in through the normal path. */
+	pagefault_disable();
+	n = insn_fetch_from_user_inatomic(regs, buf);
+	pagefault_enable();
+	if (n <= 0 || !insn_decode_from_regs(&op.insn, regs, buf, n)) {
+		if (n >= 0 && n < MAX_INSN_SIZE)
+			return -EAGAIN;
+		pr_warn_ratelimited("failed to decode user instr ip=0x%lx", regs->ip);
+		return -EINVAL;
+	}
+	ret = classify_pf_instruction(regs, &op);
+	if (ret)
+		return ret;
+
+	/* The decoded access must be the one that faulted, inside this mapping. */
+	if (op.addr < start || op.addr + op.len > end ||
+	    fault_va < op.addr || fault_va >= op.addr + op.len) {
+		pr_warn_ratelimited("user instr ip=0x%lx accesses 0x%llx, fault at 0x%lx",
+		                    regs->ip, op.addr, fault_va);
+		return -EFAULT;
+	}
+
+	map.va = start;
+	map.pa = pa;
+	op.may_sleep = true;
+
+	idx = srcu_read_lock(&smptrace_active_srcu);
+	ctx = smptrace_find_ctx(pa + (op.addr - start), op.len);
+	if (ctx)
+		execute_pf_instruction(ctx, &map, regs, &op);
+	srcu_read_unlock(&smptrace_active_srcu, idx);
+
+	return ctx ? 0 : -ENOENT;
 }
 
 /* The tracer whose kprobe claimed this CPU's current fault, handed from the

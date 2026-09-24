@@ -24,6 +24,8 @@ struct smptrace_io {
 	u64 offset;
 	union smptrace_data data;
 	u32 size;
+	/* The caller may sleep until a read is answered (a user-mode fault) */
+	bool may_sleep;
 };
 
 struct smptrace_ctx;
@@ -101,6 +103,9 @@ struct smptrace_ctx {
 	 * finished with it (riscv) */
 	atomic_t unmaps_pending;
 
+	/* On the list smptrace_find_ctx() searches, while active */
+	struct list_head active_node;
+
 	/* Mappings that could not be poisoned. The ioremap() return handler
 	 * cannot sleep, so reject_work iounmap()s them */
 	struct llist_head rejected;
@@ -112,6 +117,10 @@ struct smptrace_ctx {
 
 
 int smptrace_init(struct smptrace_ctx *ctx);
+/* Trap userspace mmap()s of traced BARs made through vfio-pci */
+int smptrace_vfio_init(void);
+void smptrace_vfio_exit(void);
+
 void smptrace_destroy(struct smptrace_ctx *ctx);
 
 #endif

@@ -27,6 +27,7 @@
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": trace: " fmt
 
+#include <linux/srcu.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -78,8 +79,14 @@ static bool __fill_io_notif(struct smptrace_io *io, const u8 *data, u32 size,
 void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
                          u64 addr, u32 size, u8 *dst)
 {
+	smptrace_emulate_read_may_sleep(ctx, map, addr, size, dst, false);
+}
+
+void smptrace_emulate_read_may_sleep(struct smptrace_ctx *ctx, struct smptrace_map *map,
+                                     u64 addr, u32 size, u8 *dst, bool may_sleep)
+{
 	u64 off;
-	struct smptrace_io io;
+	struct smptrace_io io = { .may_sleep = may_sleep };
 
 	off = (map->pa - ctx->pa) + (addr - map->va);
 	if (off >= ctx->len || off + size > ctx->len) {
@@ -267,6 +274,29 @@ fail_badarea:
 	return ret;
 }
 
+/* Active tracers, searchable by physical address from contexts that are not
+ * one of a tracer's own probes (user mappings of a traced BAR). SRCU, because
+ * a user-mapping fault sleeps while its read is answered. */
+static LIST_HEAD(smptrace_active);
+static DEFINE_SPINLOCK(smptrace_active_lock);
+DEFINE_SRCU(smptrace_active_srcu);
+
+/*
+ * Returns the active tracer whose range contains [pa, pa + len), or NULL.
+ * Caller holds smptrace_active_srcu; the tracer stays valid until it drops it.
+ */
+struct smptrace_ctx *smptrace_find_ctx(phys_addr_t pa, size_t len)
+{
+	struct smptrace_ctx *ctx;
+
+	list_for_each_entry_srcu(ctx, &smptrace_active, active_node,
+	                         srcu_read_lock_held(&smptrace_active_srcu)) {
+		if (pa >= ctx->pa && pa + len <= ctx->pa + ctx->len)
+			return ctx;
+	}
+	return NULL;
+}
+
 int smptrace_init(struct smptrace_ctx *ctx)
 {
 	int ret;
@@ -287,6 +317,10 @@ int smptrace_init(struct smptrace_ctx *ctx)
 		return ret;
 	}
 
+	spin_lock(&smptrace_active_lock);
+	list_add_rcu(&ctx->active_node, &smptrace_active);
+	spin_unlock(&smptrace_active_lock);
+
 	return 0;
 }
 
@@ -295,7 +329,15 @@ static void smptrace_deactivate(struct smptrace_ctx *ctx)
 	struct smptrace_map *map, *tmp;
 	unsigned long flags;
 
-	/* First, stop hooks on ioremap and iounmap so everyone stops adding
+	/* Unpublish first: a user-mapping fault that already found this
+	 * tracer holds smptrace_active_srcu until it has finished with it. The
+	 * owner must first fail any read such a fault is sleeping on. */
+	spin_lock(&smptrace_active_lock);
+	list_del_rcu(&ctx->active_node);
+	spin_unlock(&smptrace_active_lock);
+	synchronize_srcu(&smptrace_active_srcu);
+
+	/* Then stop hooks on ioremap and iounmap so everyone stops adding
 	 * and removing poisoned PTEs */
 	unregister_kretprobe(&ctx->ioremap_krp);
 	unregister_kprobe(&ctx->iounmap_kp);
