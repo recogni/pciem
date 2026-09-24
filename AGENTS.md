@@ -25,7 +25,10 @@ branch names, PR titles and descriptions, and issue text.
 
 ## Branches
 
-- `main` is a pure mirror of upstream. Never commit to it directly.
-- `dev` holds this fork's own changes, including this file.
-- To send a fix upstream, branch from `main` (or `upstream/main`), not
-  `dev`. That keeps fork-only files like this one out of upstream PRs.
+- `main` is a pure mirror of upstream. Only upstream syncs update it.
+  Never commit to it, push to it, or open PRs against it.
+- `dev` holds this fork's own changes, including this file. Fork-only
+  work branches from `dev` and opens PRs against `dev`.
+- To send a fix upstream, branch from `upstream/main` and open the PR
+  against the upstream repository, not this fork. Don't branch from `dev`,
+  or fork-only files like this one will end up in the upstream PR.
