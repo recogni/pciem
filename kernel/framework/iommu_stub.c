@@ -24,45 +24,40 @@
  * the point where iova→userspace-vaddr translations are recorded so the
  * userspace daemon can resolve them.
  *
- * Hookup model — the upstream-clean way:
+ * Hookup model:
  *
- * The iommu core registers a notifier on pci_bus_type at subsys_initcall
- * with default priority (0); on BUS_NOTIFY_ADD_DEVICE it calls
- * iommu_probe_device(dev), which walks dev->iommu->fwspec to find the
- * matching iommu controller. For pciem virtual-root devices we have no
- * firmware-described fwnode chain (no DMAR, no IORT, no OF), so this
- * default path can't reach our stub.
+ * The stub is registered with no fwnode. For a device that has no
+ * iommu_fwspec (no DMAR, IORT, VIOT or OF description — which is every
+ * pciem virtual-root device), iommu_init_device() resolves ops through
+ * iommu_ops_from_fwnode(NULL), i.e. the first registered IOMMU whose
+ * fwnode is NULL, and calls its ->probe_device() with
+ * iommu_probe_device_lock held. That is the core's own path for
+ * firmware-less IOMMUs, reached both from the core's BUS_NOTIFY_ADD_DEVICE
+ * notifier and from iommu_device_register()'s bus scan.
  *
- * Rather than calling iommu_probe_device() ourselves after the device
- * is added (which requires EXPORT_SYMBOL_GPL on a non-exported symbol),
- * we register our own pci_bus_type notifier with priority = 1 — higher
- * than the iommu core's. The notifier chain is sorted by priority
- * descending (kernel/notifier.c::notifier_chain_register), so for any
- * device added on a pciem-owned bus our notifier runs first and installs
- * iommu_fwspec; the iommu core's notifier then runs immediately after
- * on the same BUS_NOTIFY_ADD_DEVICE event, sees the fwspec, and probes
- * us through the standard path. No EXPORT_SYMBOL changes required, no
- * manual reprobe, no kernel patches.
+ * pciem must not install a fwspec itself: iommu_fwspec_init() allocates
+ * dev->iommu, which requires iommu_probe_device_lock (dev_iommu_get()
+ * asserts it), and that lock is not exported. Calling it from a bus
+ * notifier trips lockdep and races concurrent probes.
  *
- * Identifying "a pciem-owned bus": pci_bus->bridge is the &dev of the
- * pci_host_bridge. pciem registers each bridge it allocates here at
- * pci_alloc_host_bridge() time, before pci_scan_root_bus_bridge runs
- * the scan that fires BUS_NOTIFY_ADD_DEVICE on each new pci_dev. The
- * notifier walks pdev->bus->bridge and looks it up in this list. We do
- * NOT use container_of(bus->sysdata, ...) because that's only safe on
- * pciem's own buses and would crash on real PCI buses that get the same
- * notification. Real PCI devices on real buses pass the lookup, find no
- * match, and we return NOTIFY_DONE — leaving them entirely to the
- * platform IOMMU.
+ * So the claim is made in ->probe_device(): it returns the stub only for
+ * a pci_dev whose bus sits under a host bridge pciem registered here, and
+ * -ENODEV for everything else, which the core treats as "no IOMMU".
+ * pci_bus->bridge is the &dev of the pci_host_bridge; pciem registers
+ * each bridge it allocates before pci_scan_root_bus_bridge() adds the
+ * devices. The lookup compares pointers rather than using
+ * container_of(bus->sysdata, ...), which would be unsafe on real buses.
+ *
+ * Limitation: if a built-in firmware-less IOMMU (intel-iommu, amd-iommu)
+ * registered first, the core resolves fwspec-less devices to it and the
+ * stub claims nothing. The stub is for hosts without a real IOMMU.
  */
 
 #include <linux/iommu.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
-#include <linux/notifier.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
-#include <linux/property.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/module.h>
@@ -70,13 +65,6 @@
 #include "iommu_stub.h"
 
 static struct iommu_device pciem_stub_iommu;
-
-/* Synthetic fwnode used as the "iommu controller" identity. The real
- * PCIe devices in the system never reference this fwnode, so there's
- * no collision with intel-iommu / amd-iommu / smmu / etc.            */
-static const struct software_node pciem_stub_iommu_swnode = {
-    .name = "pciem-iommu-stub",
-};
 
 /* ---------------------------------------------------------------- */
 /* domain ops — no-op map/unmap, passthrough iova_to_phys           */
@@ -179,8 +167,12 @@ static bool pciem_stub_capable(struct device *dev, enum iommu_cap cap)
     }
 }
 
+static bool pciem_stub_owns_bus(struct pci_bus *bus);
+
 static struct iommu_device *pciem_stub_probe_device(struct device *dev)
 {
+    if (!dev_is_pci(dev) || !pciem_stub_owns_bus(to_pci_dev(dev)->bus))
+        return ERR_PTR(-ENODEV);
     return &pciem_stub_iommu;
 }
 
@@ -294,51 +286,6 @@ static bool pciem_stub_owns_bus(struct pci_bus *bus)
 }
 
 /* ---------------------------------------------------------------- */
-/* pci_bus_type notifier — installs fwspec before iommu core probes */
-/* ---------------------------------------------------------------- */
-
-static int pciem_stub_pci_notify(struct notifier_block *nb,
-                                 unsigned long action, void *data)
-{
-    struct device *dev = data;
-    struct pci_dev *pdev;
-    struct fwnode_handle *fwnode;
-    int rc;
-
-    if (action != BUS_NOTIFY_ADD_DEVICE)
-        return NOTIFY_DONE;
-    if (!dev_is_pci(dev))
-        return NOTIFY_DONE;
-
-    pdev = to_pci_dev(dev);
-    if (!pciem_stub_owns_bus(pdev->bus))
-        return NOTIFY_DONE;
-
-    fwnode = software_node_fwnode(&pciem_stub_iommu_swnode);
-    if (!fwnode)
-        return NOTIFY_DONE;
-
-    rc = iommu_fwspec_init(dev, fwnode);
-    if (rc && rc != -EALREADY) {
-        pr_warn("pciem-iommu-stub: fwspec_init(%s) failed: %d\n",
-                dev_name(dev), rc);
-        return NOTIFY_DONE;
-    }
-
-    /* The iommu core's notifier (priority 0) will run next on the same
-     * BUS_NOTIFY_ADD_DEVICE event and pick up the fwspec we just
-     * installed. No manual probe call needed. */
-    return NOTIFY_OK;
-}
-
-static struct notifier_block pciem_stub_pci_nb = {
-    .notifier_call = pciem_stub_pci_notify,
-    /* Must be > the iommu core's notifier (priority 0) so we install
-     * fwspec first; the core's iommu_bus_notifier then probes us. */
-    .priority      = 1,
-};
-
-/* ---------------------------------------------------------------- */
 /* module-scoped init / exit                                        */
 /* ---------------------------------------------------------------- */
 
@@ -346,18 +293,10 @@ int pciem_iommu_stub_init(void)
 {
     int rc;
 
-    rc = software_node_register(&pciem_stub_iommu_swnode);
-    if (rc) {
-        pr_err("pciem-iommu-stub: software_node_register failed: %d\n", rc);
-        return rc;
-    }
-
-    pciem_stub_iommu.fwnode = software_node_fwnode(&pciem_stub_iommu_swnode);
-
     rc = iommu_device_sysfs_add(&pciem_stub_iommu, NULL, NULL, "pciem-iommu");
     if (rc) {
         pr_err("pciem-iommu-stub: sysfs_add failed: %d\n", rc);
-        goto err_swnode;
+        return rc;
     }
 
     rc = iommu_device_register(&pciem_stub_iommu, &pciem_stub_iommu_ops, NULL);
@@ -366,21 +305,11 @@ int pciem_iommu_stub_init(void)
         goto err_sysfs;
     }
 
-    rc = bus_register_notifier(&pci_bus_type, &pciem_stub_pci_nb);
-    if (rc) {
-        pr_err("pciem-iommu-stub: bus_register_notifier failed: %d\n", rc);
-        goto err_iommu;
-    }
-
     pr_info("pciem-iommu-stub: registered (no-translation; for vfio binding only)\n");
     return 0;
 
-err_iommu:
-    iommu_device_unregister(&pciem_stub_iommu);
 err_sysfs:
     iommu_device_sysfs_remove(&pciem_stub_iommu);
-err_swnode:
-    software_node_unregister(&pciem_stub_iommu_swnode);
     return rc;
 }
 
@@ -388,10 +317,8 @@ void pciem_iommu_stub_exit(void)
 {
     struct pciem_stub_bridge *entry, *tmp;
 
-    bus_unregister_notifier(&pci_bus_type, &pciem_stub_pci_nb);
     iommu_device_unregister(&pciem_stub_iommu);
     iommu_device_sysfs_remove(&pciem_stub_iommu);
-    software_node_unregister(&pciem_stub_iommu_swnode);
 
     mutex_lock(&pciem_stub_bridges_lock);
     list_for_each_entry_safe(entry, tmp, &pciem_stub_bridges, list) {

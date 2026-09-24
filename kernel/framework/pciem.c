@@ -746,11 +746,10 @@ static void pciem_activation_work_func(struct work_struct *work)
     }
 
     /*
-     * Stub IOMMU hookup is automatic now: pciem_iommu_stub_register_bridge
-     * was called when the host_bridge was allocated, and the high-priority
-     * pci_bus_type notifier installed by the stub fires on every
-     * BUS_NOTIFY_ADD_DEVICE for our bus, installing iommu_fwspec ahead of
-     * the iommu core's notifier. ATTACH_TO_HOST devices live on a real
+     * Stub IOMMU hookup is automatic: pciem_iommu_stub_register_bridge
+     * was called when the host_bridge was allocated, and the iommu core
+     * probes each device added on our bus through the stub's
+     * ->probe_device(), which claims it. ATTACH_TO_HOST devices live on a real
      * bus with a real platform IOMMU and intentionally take no part in
      * this — their iommu_group comes from intel-iommu / amd-iommu / smmu.
      */
@@ -804,8 +803,8 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     /*
      * Mark this bridge as pciem-owned BEFORE the bus is scanned — the
      * scan fires BUS_NOTIFY_ADD_DEVICE for every synthetic pci_dev, and
-     * the stub IOMMU's high-priority notifier looks up pdev->bus->bridge
-     * in its bridge list to decide whether to install fwspec. Doing this
+     * the stub IOMMU's ->probe_device() looks up pdev->bus->bridge in its
+     * bridge list to decide whether to claim the device. Doing this
      * after the scan would leave the very first cohort of devices
      * unbound to the stub.
      */

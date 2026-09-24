@@ -13,17 +13,12 @@ void pciem_iommu_stub_exit(void);
 
 /*
  * Register/unregister a host_bridge device (the &bridge->dev returned by
- * pci_alloc_host_bridge) as pciem-owned. Synthetic pci_devs that appear
- * on a bus under one of these bridges will have a pciem-stub iommu_fwspec
- * installed automatically by a high-priority pci_bus_type notifier
- * registered in pciem_iommu_stub_init(). The iommu core's own (lower
- * priority) notifier then runs iommu_probe_device() on the same
- * BUS_NOTIFY_ADD_DEVICE event, sees the fwspec we just installed, and
- * binds the device to the stub IOMMU — no manual probe call, no kernel
- * EXPORT patches, no fwspec-after-the-fact reprobe.
+ * pci_alloc_host_bridge) as pciem-owned. The stub's ->probe_device()
+ * claims a pci_dev only if its bus is under one of these bridges; the
+ * iommu core calls it when the device is added.
  *
  * Call register_bridge() between pci_alloc_host_bridge() and
- * pci_scan_root_bus_bridge() so the notifier is in place before any
+ * pci_scan_root_bus_bridge() so the bridge is known before any
  * synthetic device is added on the bus.
  */
 int  pciem_iommu_stub_register_bridge(struct device *bridge_dev);
