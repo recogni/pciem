@@ -150,7 +150,7 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct smptrace_map *map;
 	unsigned long flags;
 
-	if (args->pa < ctx->pa || args->pa >= ctx->pa + ctx->len)
+	if (!va || args->pa < ctx->pa || args->pa >= ctx->pa + ctx->len)
 		return 0;
 
 	map = kzalloc(sizeof(*map), GFP_ATOMIC);
@@ -166,13 +166,15 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	        va, args->len, (unsigned long long)ctx->pa, ctx->len);
 
 	if (smptrace_arch_poison_pte(map)) {
-		kfree(map);
-
-		regs_set_return_value(regs, 0);
-		iounmap((void __iomem *)va);
-
 		pr_warn("failed to poison VA=0x%lx:%lx (PA=0x%llx:%lx)",
 		        va, args->len, args->pa, args->len);
+
+		/* The caller sees ioremap() fail. This handler runs with
+		 * preemption disabled and iounmap() may sleep, so the mapping
+		 * is released from process context */
+		regs_set_return_value(regs, 0);
+		llist_add(&map->reject, &ctx->rejected);
+		schedule_work(&ctx->reject_work);
 	} else {
 		spin_lock_irqsave(&ctx->lock, flags);
 		list_add_tail_rcu(&map->list, &ctx->maps);
@@ -180,6 +182,19 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	}
 
 	return 0;
+}
+
+static void smptrace_unmap_rejected(struct work_struct *work)
+{
+	struct smptrace_ctx *ctx = container_of(work, struct smptrace_ctx,
+	                                        reject_work);
+	struct smptrace_map *map, *tmp;
+
+	llist_for_each_entry_safe(map, tmp, llist_del_all(&ctx->rejected),
+	                          reject) {
+		iounmap((void __iomem *)map->va);
+		kfree(map);
+	}
 }
 
 void smptrace_untrace_map(struct smptrace_ctx *ctx, unsigned long va)
@@ -259,6 +274,8 @@ int smptrace_init(struct smptrace_ctx *ctx)
 	INIT_LIST_HEAD(&ctx->maps);
 	spin_lock_init(&ctx->lock);
 	atomic_set(&ctx->unmaps_pending, 0);
+	init_llist_head(&ctx->rejected);
+	INIT_WORK(&ctx->reject_work, smptrace_unmap_rejected);
 
 	ctx->in_pf = alloc_percpu_gfp(bool, GFP_KERNEL_ACCOUNT);
 	if (!ctx->in_pf)
@@ -284,6 +301,9 @@ static void smptrace_deactivate(struct smptrace_ctx *ctx)
 	unregister_kprobe(&ctx->iounmap_kp);
 	wait_var_event(&ctx->unmaps_pending,
 	               !atomic_read(&ctx->unmaps_pending));
+	/* unregister_kretprobe() waited for running return handlers, so
+	 * nothing queues reject_work after this */
+	flush_work(&ctx->reject_work);
 
 	/*
 	 * Now unpoison PTEs so that we stop hitting #PF, and only then forget

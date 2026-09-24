@@ -9,6 +9,8 @@
 #include <linux/kprobes.h>
 #include <linux/compiler.h>
 #include <linux/rcupdate.h>
+#include <linux/llist.h>
+#include <linux/workqueue.h>
 
 union smptrace_data {
 	u8 raw[8];
@@ -63,6 +65,8 @@ struct smptrace_map {
 	/* Un-poisoned PTEs */
 	struct list_head ptes;
 	struct rcu_head rcu;
+	/* On ctx->rejected when poisoning failed */
+	struct llist_node reject;
 };
 
 struct smptrace_ctx {
@@ -96,6 +100,11 @@ struct smptrace_ctx {
 	/* iounmap() continuations that were handed this ctx and have not yet
 	 * finished with it (riscv) */
 	atomic_t unmaps_pending;
+
+	/* Mappings that could not be poisoned. The ioremap() return handler
+	 * cannot sleep, so reject_work iounmap()s them */
+	struct llist_head rejected;
+	struct work_struct reject_work;
 
 	/* Whether this CPU is handling #PF or not */
 	bool __percpu *in_pf;
