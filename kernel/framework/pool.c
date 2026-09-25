@@ -170,7 +170,7 @@ int pciem_pool_init(const char *phys_region)
 err_destroy:
     gen_pool_destroy(pool);
 err_release:
-    release_resource(res);
+    remove_resource(res);
     return ret;
 }
 
@@ -185,7 +185,9 @@ void pciem_pool_exit(void)
     pciem_pool.total_size = 0;
 
     gen_pool_destroy(pool);
-    release_resource(&pciem_pool.res);
+    /* Re-parents the firmware "Reserved" entry the pool nested over, which
+     * release_resource() would drop from the tree with the pool. */
+    remove_resource(&pciem_pool.res);
     pr_info("BAR pool released\n");
 }
 
