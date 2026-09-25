@@ -12,17 +12,14 @@
  *   2. Build a default paging domain for the group
  *   3. Let vfio_register_iommu_group claim DMA ownership cleanly
  *
- * It does NOT provide real address translation. ->iova_to_phys is
- * passthrough (iova == paddr), and map/unmap callbacks are no-ops that
- * report success. This is fine for synthetic devices that don't
- * actually issue DMA — userspace driver code under test that calls
- * dma_map_*() will get a valid IOVA back, write it to the device, and
- * the device just doesn't dereference it (because it's emulated by
- * pciem-mock and doesn't really do DMA).
- *
- * If/when pciem grows real device-side DMA simulation, this stub becomes
- * the point where iova→userspace-vaddr translations are recorded so the
- * userspace daemon can resolve them.
+ * Translation is real: ->map_pages records each 4 KiB page of a mapping
+ * in a per-domain {iova -> paddr} table, ->unmap_pages erases it, and
+ * ->iova_to_phys looks it up, returning 0 for an IOVA nothing mapped.
+ * PCIEM_IOCTL_DMA resolves a device-side access through this table, so
+ * a device model reaches exactly the buffers the driver mapped (for
+ * vfio-pci, with VFIO_IOMMU_MAP_DMA) and faults on anything else. The
+ * table is per page because the iommu core may split one logical map
+ * or unmap into several calls.
  *
  * Hookup model:
  *
@@ -60,14 +57,28 @@
 #include <linux/printk.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/xarray.h>
 #include <linux/module.h>
 
 #include "iommu_stub.h"
 
 static struct iommu_device pciem_stub_iommu;
 
+#define PCIEM_STUB_PAGE_SIZE SZ_4K
+
+struct pciem_stub_domain {
+    struct iommu_domain domain;
+    /* index = iova / PCIEM_STUB_PAGE_SIZE, value = paddr / PCIEM_STUB_PAGE_SIZE */
+    struct xarray pfns;
+};
+
+static struct pciem_stub_domain *to_stub_domain(struct iommu_domain *domain)
+{
+    return container_of(domain, struct pciem_stub_domain, domain);
+}
+
 /* ---------------------------------------------------------------- */
-/* domain ops — no-op map/unmap, passthrough iova_to_phys           */
+/* domain ops — per-page iova->phys bookkeeping                     */
 /* ---------------------------------------------------------------- */
 
 static int pciem_stub_attach_dev(struct iommu_domain *domain, struct device *dev)
@@ -79,13 +90,26 @@ static int pciem_stub_map_pages(struct iommu_domain *domain, unsigned long iova,
                                 phys_addr_t paddr, size_t pgsize, size_t pgcount,
                                 int prot, gfp_t gfp, size_t *mapped)
 {
-    /* Real driver-under-test that does dma_map_single() will pass an
-     * IOVA the user picked (or the dma-iommu glue picked); our stub
-     * accepts any mapping and reports success. iova == paddr at
-     * iova_to_phys time, so the IOVA returned to userspace is just the
-     * physical address — which is fine since our synthetic device
-     * doesn't actually dereference it. */
-    *mapped = pgsize * pgcount;
+    struct pciem_stub_domain *sd = to_stub_domain(domain);
+    size_t size = pgsize * pgcount;
+    size_t cur;
+
+    for (cur = 0; cur < size; cur += PCIEM_STUB_PAGE_SIZE) {
+        void *old = xa_store(&sd->pfns, (iova + cur) / PCIEM_STUB_PAGE_SIZE,
+                             xa_mk_value((paddr + cur) / PCIEM_STUB_PAGE_SIZE), gfp);
+
+        if (xa_is_err(old)) {
+            size_t undo;
+
+            for (undo = 0; undo < cur; undo += PCIEM_STUB_PAGE_SIZE)
+                xa_erase(&sd->pfns, (iova + undo) / PCIEM_STUB_PAGE_SIZE);
+            *mapped = 0;
+            return xa_err(old);
+        }
+        WARN_ON_ONCE(old);
+    }
+
+    *mapped = size;
     return 0;
 }
 
@@ -93,12 +117,26 @@ static size_t pciem_stub_unmap_pages(struct iommu_domain *domain, unsigned long 
                                      size_t pgsize, size_t pgcount,
                                      struct iommu_iotlb_gather *gather)
 {
-    return pgsize * pgcount;
+    struct pciem_stub_domain *sd = to_stub_domain(domain);
+    size_t size = pgsize * pgcount;
+    size_t cur;
+
+    for (cur = 0; cur < size; cur += PCIEM_STUB_PAGE_SIZE) {
+        if (!xa_erase(&sd->pfns, (iova + cur) / PCIEM_STUB_PAGE_SIZE))
+            pr_warn_ratelimited("unmap of an untracked iova 0x%lx\n", iova + cur);
+    }
+
+    return size;
 }
 
 static phys_addr_t pciem_stub_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
 {
-    return (phys_addr_t)iova;   /* passthrough */
+    struct pciem_stub_domain *sd = to_stub_domain(domain);
+    void *ent = xa_load(&sd->pfns, iova / PCIEM_STUB_PAGE_SIZE);
+
+    if (!ent)
+        return 0;
+    return (phys_addr_t)xa_to_value(ent) * PCIEM_STUB_PAGE_SIZE + iova % PCIEM_STUB_PAGE_SIZE;
 }
 
 static void pciem_stub_iotlb_sync(struct iommu_domain *domain,
@@ -114,7 +152,10 @@ static void pciem_stub_flush_iotlb_all(struct iommu_domain *domain)
 
 static void pciem_stub_domain_free(struct iommu_domain *domain)
 {
-    kfree(domain);
+    struct pciem_stub_domain *sd = to_stub_domain(domain);
+
+    xa_destroy(&sd->pfns);
+    kfree(sd);
 }
 
 static const struct iommu_domain_ops pciem_stub_domain_ops = {
@@ -129,9 +170,8 @@ static const struct iommu_domain_ops pciem_stub_domain_ops = {
 
 /* Static "blocked" domain ops — modern iommu drivers expose a
  * single-instance ops->blocked_domain so the core never allocates one
- * via domain_alloc_paging. attach is a no-op (we don't actually
- * translate; for synthetic devices "blocked" and "anything" look the
- * same). free is NULL because the core never tries to free statics. */
+ * via domain_alloc_paging. attach is a no-op: a blocked domain has no
+ * table, and the stub never translates through it. free is NULL because the core never tries to free statics. */
 static int pciem_stub_blocked_attach(struct iommu_domain *domain, struct device *dev)
 {
     return 0;
@@ -154,9 +194,8 @@ static bool pciem_stub_capable(struct device *dev, enum iommu_cap cap)
 {
     /* vfio_register_group_dev() refuses to bind a device whose IOMMU
      * doesn't advertise IOMMU_CAP_CACHE_COHERENCY (vfio_main.c:
-     * "VFIO always sets IOMMU_CACHE..."). For our pass-through stub on
-     * synthetic devices, cache coherency is trivially "true" — there is
-     * no DMA to incoherent memory because there is no real DMA at all.
+     * "VFIO always sets IOMMU_CACHE..."). A synthetic device's DMA is a
+     * CPU copy in PCIEM_IOCTL_DMA, so it is coherent by construction.
      */
     switch (cap) {
     case IOMMU_CAP_CACHE_COHERENCY:
@@ -191,14 +230,20 @@ static struct iommu_group *pciem_stub_device_group(struct device *dev)
 
 static struct iommu_domain *pciem_stub_domain_alloc_paging(struct device *dev)
 {
-    struct iommu_domain *domain = kzalloc(sizeof(*domain), GFP_KERNEL);
-    if (!domain)
+    struct pciem_stub_domain *sd = kzalloc(sizeof(*sd), GFP_KERNEL);
+
+    if (!sd)
         return ERR_PTR(-ENOMEM);
-    /* Pass-through translation, so any page size is acceptable for the
-     * "mapping bookkeeping" we don't actually do. */
-    domain->pgsize_bitmap = SZ_4K | SZ_2M | SZ_1G;
-    domain->ops           = &pciem_stub_domain_ops;
-    return domain;
+    xa_init(&sd->pfns);
+    /* The table is kept per 4 KiB page whatever size the core maps in. */
+    sd->domain.pgsize_bitmap = SZ_4K | SZ_2M | SZ_1G;
+    sd->domain.ops           = &pciem_stub_domain_ops;
+    /* vfio type1 takes its valid IOVA range from the geometry; a zeroed
+     * one reserves everything and VFIO_IOMMU_MAP_DMA fails. */
+    sd->domain.geometry.aperture_start = 0;
+    sd->domain.geometry.aperture_end   = ~(dma_addr_t)0;
+    sd->domain.geometry.force_aperture = true;
+    return &sd->domain;
 }
 
 static const struct iommu_ops pciem_stub_iommu_ops = {
