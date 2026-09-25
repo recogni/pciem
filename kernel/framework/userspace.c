@@ -435,10 +435,32 @@ static void pciem_eventfd_signal(struct pciem_userspace_state *us)
 #endif
 }
 
-static void pciem_userspace_queue_event(struct pciem_userspace_state *us,
-                                        struct pciem_event *event)
+/* Tells userspace there are events to drain. */
+static void pciem_userspace_kick(struct pciem_userspace_state *us)
 {
     unsigned long flags;
+
+    spin_lock_irqsave(&us->eventfd_lock, flags);
+    if (us->eventfd)
+        pciem_eventfd_signal(us);
+    else
+        atomic_set(&us->event_pending, 1);
+    spin_unlock_irqrestore(&us->eventfd_lock, flags);
+}
+
+/* How long a caller that may sleep waits for room in a full ring. */
+#define PCIEM_RING_WAIT_MS 1000
+
+/*
+ * Queues @event for userspace. A full ring means the device model is behind:
+ * a caller that may sleep kicks it and waits for room, so its access is not
+ * lost; any other caller, or one that waits past PCIEM_RING_WAIT_MS, drops it.
+ */
+static void pciem_userspace_queue_event(struct pciem_userspace_state *us,
+                                        struct pciem_event *event, bool may_sleep)
+{
+    unsigned long deadline;
+    bool pushed;
 
     if (!us || !event)
         return;
@@ -447,16 +469,20 @@ static void pciem_userspace_queue_event(struct pciem_userspace_state *us,
     if (!event->seq)
         event->seq = atomic64_inc_return(&us->event_seq);
 
-    if (!pciem_shared_ring_push(us, event))
+    pushed = pciem_shared_ring_push(us, event);
+    if (!pushed && may_sleep) {
+        deadline = jiffies + msecs_to_jiffies(PCIEM_RING_WAIT_MS);
+        do {
+            pciem_userspace_kick(us);
+            usleep_range(10, 50);
+            pushed = pciem_shared_ring_push(us, event);
+        } while (!pushed && !READ_ONCE(us->closing) && time_before(jiffies, deadline));
+    }
+    if (!pushed)
         pr_warn_ratelimited("Shared ring buffer full, dropping event for userspace (seq=%llu)\n",
                             event->seq);
 
-    spin_lock_irqsave(&us->eventfd_lock, flags);
-    if (us->eventfd)
-        pciem_eventfd_signal(us);
-    else
-        atomic_set(&us->event_pending, 1);
-    spin_unlock_irqrestore(&us->eventfd_lock, flags);
+    pciem_userspace_kick(us);
 }
 
 static int pciem_check_unregistered(struct pciem_userspace_state *us)
@@ -1415,7 +1441,7 @@ static void pciem_notif_trace(struct smptrace_ctx *ctx, struct smptrace_io *io,
     default:
         BUG();
     }
-    pciem_userspace_queue_event(tracer->us, &ev);
+    pciem_userspace_queue_event(tracer->us, &ev, io->may_sleep);
 }
 
 static void pciem_notif_write(struct smptrace_ctx *ctx, struct smptrace_io *io)
@@ -1480,7 +1506,7 @@ static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *i
     hlist_add_head(&req.node, &us->pending_requests[hash]);
     spin_unlock_irqrestore(&us->pending_lock, flags);
 
-    pciem_userspace_queue_event(us, &ev);
+    pciem_userspace_queue_event(us, &ev, io->may_sleep);
 
     if (io->may_sleep) {
         /* A successful wait consumes the completion, so completion_done()

@@ -54,6 +54,8 @@ void smptrace_untrace_map(struct smptrace_ctx *ctx, unsigned long va);
 int smptrace_enter_iounmap(struct kprobe *rp, struct pt_regs *regs);
 void smptrace_emulate_write(struct smptrace_ctx *ctx, struct smptrace_map *map,
                             u64 addr, u32 size, const u8 *src);
+void smptrace_emulate_write_may_sleep(struct smptrace_ctx *ctx, struct smptrace_map *map,
+                                      u64 addr, u32 size, const u8 *src, bool may_sleep);
 void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
                            u64 addr, u32 size, u8 *dst);
 void smptrace_emulate_read_may_sleep(struct smptrace_ctx *ctx, struct smptrace_map *map,

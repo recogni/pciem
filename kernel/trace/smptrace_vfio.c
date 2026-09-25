@@ -126,7 +126,7 @@ static int smptrace_vfio_access(struct vfio_pci_core_device *vdev, struct smptra
 		if (!iswrite)
 			memset(val, 0xff, size);
 	} else if (iswrite) {
-		smptrace_emulate_write(ctx, map, pos, size, val);
+		smptrace_emulate_write_may_sleep(ctx, map, pos, size, val, true);
 	} else {
 		smptrace_emulate_read_may_sleep(ctx, map, pos, size, val, true);
 	}

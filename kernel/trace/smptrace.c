@@ -119,8 +119,19 @@ void smptrace_emulate_read_may_sleep(struct smptrace_ctx *ctx, struct smptrace_m
 void smptrace_emulate_write(struct smptrace_ctx *ctx, struct smptrace_map *map,
                           u64 addr, u32 size, const u8 *src)
 {
+	smptrace_emulate_write_may_sleep(ctx, map, addr, size, src, false);
+}
+
+/*
+ * A write the caller may sleep in: when the device model has fallen behind, the
+ * write waits for room to report it rather than being lost, as a PCIe posted
+ * write waits for flow-control credit.
+ */
+void smptrace_emulate_write_may_sleep(struct smptrace_ctx *ctx, struct smptrace_map *map,
+                                      u64 addr, u32 size, const u8 *src, bool may_sleep)
+{
 	u64 off;
-	struct smptrace_io io = {0};
+	struct smptrace_io io = { .may_sleep = may_sleep };
 
 	off = (map->pa - ctx->pa) + (addr - map->va);
 	if (off >= ctx->len || off + size > ctx->len) {
