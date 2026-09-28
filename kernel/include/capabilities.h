@@ -40,6 +40,7 @@ struct pciem_cap_pcie_config
     u8 device_type;
     u8 link_width;
     u8 link_speed;
+    bool flr;           /* advertise and perform Function Level Reset */
 };
 
 struct pciem_cap_vsec_config
@@ -77,6 +78,8 @@ void pciem_build_config_space(struct pciem_root_complex *v);
 void pciem_cleanup_cap_manager(struct pciem_root_complex *v);
 
 bool pciem_handle_cap_read(struct pciem_root_complex *v, int where, int size, u32 *value);
-bool pciem_handle_cap_write(struct pciem_root_complex *v, int where, int size, u32 value);
+bool pciem_handle_cap_write(struct pciem_root_complex *v, int where, int size, u32 value,
+                            u32 *reset);
+void pciem_cap_reset(struct pciem_root_complex *v);
 
 #endif /* PCIEM_CAPABILITIES_H */

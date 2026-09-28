@@ -192,7 +192,7 @@ void smptrace_emulate_read_may_sleep(struct smptrace_ctx *ctx, struct smptrace_m
 			memcpy(dst, &io.data, size);
 			return;
 		}
-		/* Daemon never answered or the ring was full */
+		/* Daemon never answered, the ring was full, or a reset failed it */
 		memset(dst, 0xff, size);
 		return;
 	}

@@ -599,7 +599,8 @@ void pciem_build_config_space(struct pciem_root_complex *v)
             put_unaligned_le16((pcie->device_type << 4) | 2, &cfg[pos]);
             pos += 2;
 
-            put_unaligned_le32(0x00008000, &cfg[pos]);
+            put_unaligned_le32(PCI_EXP_DEVCAP_RBER |
+                               (pcie->flr ? PCI_EXP_DEVCAP_FLR : 0), &cfg[pos]);
             pos += 4;
 
             put_unaligned_le32(0, &cfg[pos]);
@@ -896,19 +897,55 @@ static bool handle_msix_write(struct pciem_cap_entry *cap, u8 *storage,
 }
 
 static bool handle_pm_write(struct pciem_cap_entry *cap, u8 *storage,
-                             u32 offset, u32 size, u32 value)
+                             u32 offset, u32 size, u32 value, u32 *reset)
 {
     struct pciem_pm_state *st = &cap->state.pm_state;
 
     if (offset == PCI_PM_CTRL && size == 2)
     {
+        u16 old_state = st->control & PCI_PM_CTRL_STATE_MASK;
+
         st->control = value & (PCI_PM_CTRL_STATE_MASK | PCI_PM_CTRL_PME_ENABLE | PCI_PM_CTRL_PME_STATUS);
         put_unaligned_le16(st->control, storage + offset);
         pr_info("PM Control written: 0x%04x (Power State: D%d)\n", value, value & 0x3);
+        /*
+         * PCI_PM_CTRL_NO_SOFT_RESET is never set, so D3hot to D0 resets the
+         * function (PCI PM 1.2, 5.4.1; what pci_pm_reset() relies on).
+         */
+        if (old_state == PCI_D3hot && (st->control & PCI_PM_CTRL_STATE_MASK) == PCI_D0)
+            *reset = PCIEM_RESET_PM;
         return true;
     }
 
     return false;
+}
+
+/*
+ * The PCIe capability's registers are read from the rendered bytes, and
+ * only Device Control can be written: all of it but Initiate FLR, which
+ * always reads 0. With FLR advertised, setting that bit resets the function.
+ * The rest of the capability ignores writes, as it always did (the Device
+ * Status error bits, which are write-1-to-clear, are never set).
+ */
+static bool handle_pcie_write(struct pciem_cap_entry *cap, u8 *storage,
+                              u32 offset, u32 size, u32 value, u32 *reset)
+{
+    u32 i;
+
+    for (i = 0; i < size; i++) {
+        u32 off = offset + i;
+        u8 byte = value >> (8 * i);
+
+        if (off == PCI_EXP_DEVCTL) {
+            storage[off] = byte;
+        } else if (off == PCI_EXP_DEVCTL + 1) {
+            storage[off] = byte & ~(PCI_EXP_DEVCTL_BCR_FLR >> 8);
+            if (cap->config.pcie.flr && (byte & (PCI_EXP_DEVCTL_BCR_FLR >> 8)))
+                *reset = PCIEM_RESET_FLR;
+        }
+    }
+
+    return true;
 }
 
 static bool handle_pasid_write(struct pciem_cap_entry *cap, u8 *storage,
@@ -930,7 +967,14 @@ static bool handle_pasid_write(struct pciem_cap_entry *cap, u8 *storage,
     return false;
 }
 
-bool pciem_handle_cap_write(struct pciem_root_complex *v, int where, int size, u32 value)
+/*
+ * Handles a config write that lands in a capability. Returns false if it
+ * lands in none. Sets *@reset to PCIEM_RESET_FLR or PCIEM_RESET_PM if the
+ * write resets the function, which the caller then does, and leaves it
+ * alone otherwise.
+ */
+bool pciem_handle_cap_write(struct pciem_root_complex *v, int where, int size, u32 value,
+                            u32 *reset)
 {
     struct pciem_cap_manager *mgr;
     int i;
@@ -963,7 +1007,9 @@ bool pciem_handle_cap_write(struct pciem_root_complex *v, int where, int size, u
         case PCIEM_CAP_MSIX:
             return handle_msix_write(cap, cap_storage, cap_offset, size, value);
         case PCIEM_CAP_PM:
-            return handle_pm_write(cap, cap_storage, cap_offset, size, value);
+            return handle_pm_write(cap, cap_storage, cap_offset, size, value, reset);
+        case PCIEM_CAP_PCIE:
+            return handle_pcie_write(cap, cap_storage, cap_offset, size, value, reset);
         case PCIEM_CAP_PASID:
             return handle_pasid_write(cap, cap_storage, cap_offset, size, value);
         default:
@@ -972,4 +1018,64 @@ bool pciem_handle_cap_write(struct pciem_root_complex *v, int where, int size, u
     }
 
     return false;
+}
+
+/*
+ * Puts the capabilities' host-writable state back to what a reset leaves,
+ * in the typed state and in the bytes block reads of config space see: MSI
+ * and MSI-X disabled and unmasked, with MSI's address and data cleared;
+ * Device Control cleared but for Max_Payload_Size, which FLR preserves;
+ * PASID disabled. The read-only bits stay. The PM capability is left alone:
+ * a reset only happens in D0, and a PM reset has just written D0.
+ */
+void pciem_cap_reset(struct pciem_root_complex *v)
+{
+    struct pciem_cap_manager *mgr;
+    int i;
+
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+
+    mgr = v->cap_mgr;
+    if (!mgr)
+        return;
+
+    for (i = 0; i < mgr->num_caps; i++) {
+        struct pciem_cap_entry *cap = &mgr->caps[i];
+        u8 *storage = cap->is_extended
+                      ? &v->ext_cfg[cap->ext_offset - PCI_CFG_SPACE_SIZE]
+                      : &v->cfg[cap->offset];
+
+        switch (cap->type) {
+        case PCIEM_CAP_MSI: {
+            struct pciem_msi_state *st = &cap->state.msi_state;
+            const u16 ro = PCI_MSI_FLAGS_QMASK | PCI_MSI_FLAGS_64BIT | PCI_MSI_FLAGS_MASKBIT;
+
+            st->control &= ro;
+            st->address_lo = 0;
+            st->address_hi = 0;
+            st->data = 0;
+            st->mask_bits = 0;
+            put_unaligned_le16(st->control, storage + PCI_MSI_FLAGS);
+            memset(storage + PCI_MSI_ADDRESS_LO, 0, cap->size - PCI_MSI_ADDRESS_LO);
+            break;
+        }
+        case PCIEM_CAP_MSIX: {
+            struct pciem_msix_state *st = &cap->state.msix_state;
+
+            st->control &= PCI_MSIX_FLAGS_QSIZE;
+            put_unaligned_le16(st->control, storage + PCI_MSIX_FLAGS);
+            break;
+        }
+        case PCIEM_CAP_PCIE: {
+            u16 devctl = get_unaligned_le16(storage + PCI_EXP_DEVCTL);
+
+            put_unaligned_le16(devctl & PCI_EXP_DEVCTL_PAYLOAD, storage + PCI_EXP_DEVCTL);
+            break;
+        }
+        case PCIEM_CAP_PASID:
+            cap->state.pasid_state.control = 0;
+            put_unaligned_le16(0, storage + PCI_PASID_CTRL);
+            break;
+        }
+    }
 }
