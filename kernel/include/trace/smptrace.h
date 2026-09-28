@@ -153,6 +153,9 @@ int smptrace_init(struct smptrace_ctx *ctx);
 /* Route userspace vfio-pci accesses (mmap, read, write) of traced BARs */
 void smptrace_vfio_init(void);
 void smptrace_vfio_exit(void);
+/* Route userspace mmap()s of traced BARs through sysfs and procfs */
+void smptrace_sysfs_init(void);
+void smptrace_sysfs_exit(void);
 
 void smptrace_destroy(struct smptrace_ctx *ctx);
 
