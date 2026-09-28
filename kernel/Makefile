@@ -27,6 +27,7 @@ pciem-objs := framework/pciem.o \
               framework/iommu_stub.o
 
 pciem-objs += trace/smptrace.o \
+              trace/smptrace_vfio.o \
               trace/arch/$(ARCH)/smptrace_arch.o
 
 ifeq ($(ARCH),x86)
