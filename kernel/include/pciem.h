@@ -36,6 +36,9 @@ struct pciem_root_complex;
 struct pciem_host_bridge_priv {
     struct pciem_root_complex *funcs[PCIEM_MAX_FUNCTIONS];
 
+    /* The bridge's bus number window: exactly the one bus it has */
+    struct resource busn;
+
 #ifdef CONFIG_X86
     struct pci_sysdata sd;
 #elif defined(PCIEM_ECAM_SYSDATA)

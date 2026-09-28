@@ -77,7 +77,7 @@ graph LR
 
 ## Minimum supported environment
 
-- Linux Kernel Version: `6.6`
+- Linux Kernel Version: `6.8`, built with `CONFIG_KPROBES=y` and `CONFIG_KRETPROBES=y` (the module's Makefile refuses older or kprobe-less kernels)
 - C Compiler: `gcc-12`
 - Architecture: `amd64/i386`, `aarch64`, `riscv`
 
