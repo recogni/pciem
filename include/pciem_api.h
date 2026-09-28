@@ -156,17 +156,71 @@ struct pciem_response
     uint32_t reserved;
 };
 
+/*
+ * Interrupts.
+ *
+ * With MSI-X or MSI enabled by the host, PCIEM_IOCTL_INJECT_IRQ (flags 0)
+ * and a plain irqfd send the given vector.
+ *
+ * Otherwise they use the function's INTx line (INTA). The line is either
+ * asserted or not, as on hardware:
+ *
+ * - PCI_STATUS_INTERRUPT in config space reads the line.
+ * - The host is interrupted when the line becomes asserted while
+ *   PCI_COMMAND_INTX_DISABLE is clear, and again when the host clears
+ *   INTX_DISABLE, or unmasks its irq, while the line is still asserted.
+ *   Nothing reaches the host while INTX_DISABLE is set, nor on INTx while
+ *   MSI or MSI-X is enabled.
+ *
+ * A level interrupt (PCIEM_IRQ_INJECT_FLAG_LEVEL, PCIEM_IRQFD_FLAG_LEVEL)
+ * asserts the line and holds it until the device model deasserts it
+ * (PCIEM_IRQ_INJECT_FLAG_DEASSERT, PCIEM_IRQFD_FLAG_DEASSERT). The vector is
+ * ignored. This is what vfio-pci expects: its INTx handler sets INTX_DISABLE
+ * and signals its user, and VFIO_IRQ_SET_ACTION_UNMASK, while
+ * PCI_STATUS_INTERRUPT is still set, signals the user again and stays
+ * masked instead of unmasking. So deassert when the host has serviced the
+ * cause, e.g. on its write to the device's interrupt status register, and
+ * before it unmasks, or it sees the interrupt once more.
+ *
+ * Without a flag, an INTx interrupt is a pulse: the line is asserted for one
+ * run of the host's interrupt handler, then deasserted by pciem. A pulse
+ * raised while INTX_DISABLE is set is held, without showing in
+ * PCI_STATUS_INTERRUPT, and delivered once INTX_DISABLE is cleared; pulses
+ * held together are delivered as one. This is how PCIEM_IOCTL_INJECT_IRQ with
+ * zeroed flags always behaved when MSI was off, except that it used to reach
+ * the host even with INTX_DISABLE set.
+ *
+ * A pulse or MSI with nowhere to go (no driver has bound yet, so the INTx
+ * line is not routed, and no MSI) fails with -EINVAL, or, from an irqfd, is
+ * dropped with a warning. A level assertion always succeeds: it sets the
+ * line, and on a VIRTUAL bus the host is interrupted once it requests or
+ * unmasks its irq.
+ *
+ * The rest of PCI_STATUS is read-only, except the error bits (parity,
+ * target/master abort, system error), which are write-1-to-clear.
+ */
+
+/** Assert INTx and hold it (see "Interrupts" above). */
+#define PCIEM_IRQ_INJECT_FLAG_LEVEL    (1 << 0)
+/** Deassert INTx. Takes precedence over PCIEM_IRQ_INJECT_FLAG_LEVEL. */
+#define PCIEM_IRQ_INJECT_FLAG_DEASSERT (1 << 1)
+
 /**
  * Parameters for PCIEM_IOCTL_INJECT_IRQ.
  *
- * @param vector    MSI/MSI-X vector number to inject into the guest.
- * @param reserved  Must be zero.
+ * @param vector    MSI/MSI-X vector number to inject into the guest. Ignored
+ *                  by PCIEM_IRQ_INJECT_FLAG_LEVEL and _DEASSERT.
+ * @param func      Function index (0–PCIEM_MAX_FUNCTIONS-1).
+ * @param flags     0 (vector or INTx pulse), or PCIEM_IRQ_INJECT_FLAG_*.
+ *                  Unknown flags fail with -EINVAL.
+ * @param reserved  Must be zero, or the ioctl fails with -EINVAL.
  */
 struct pciem_irq_inject
 {
     uint32_t vector;
     uint8_t func;
-    uint8_t reserved[3];
+    uint8_t flags;
+    uint8_t reserved[2];
 };
 
 struct pciem_dma_op
@@ -245,6 +299,15 @@ struct pciem_irqfd_config
     uint8_t reserved[3];
 };
 
+/*
+ * PCIEM_IOCTL_SET_IRQFD flags. Without either, each signal of the eventfd
+ * injects @vector as PCIEM_IOCTL_INJECT_IRQ with flags 0 does; signals that
+ * arrive before the previous one was injected are injected once.
+ * PCIEM_IRQFD_FLAG_LEVEL makes each signal assert the function's INTx line
+ * and hold it, and PCIEM_IRQFD_FLAG_DEASSERT (with or without _LEVEL) makes
+ * each signal deassert it, in the order they are signalled; see "Interrupts"
+ * above. Unknown flags fail with -EINVAL.
+ */
 #define PCIEM_IRQFD_FLAG_LEVEL    (1 << 0)
 #define PCIEM_IRQFD_FLAG_DEASSERT (1 << 1)
 
@@ -290,7 +353,12 @@ struct pciem_dma_indirect
  * run on another CPU: on a single CPU, or from an interrupt taken on the
  * device model's own CPU, it times out. The kernel reads an MSI-X table with
  * interrupts disabled when it masks a vector, so a range traced with this
- * flag must not share a page with the MSI-X table or PBA.
+ * flag must not share a page with the MSI-X table or PBA: PCIEM_IOCTL_TRACE_BAR
+ * and PCIEM_IOCTL_TRACE_BAR_RANGES fail with EINVAL for such a trace (each
+ * range is checked), and PCIEM_IOCTL_ADD_CAPABILITY fails with EINVAL for an
+ * MSI-X capability whose table or PBA lies in a range already traced this
+ * way. Leave the table's and PBA's pages out of the traced ranges, trace the
+ * table's BAR with PCIEM_TRACE_WRITES alone, or leave it untraced.
  *
  * On timeout or a full ring the read returns all-1s, the value of a PCIe
  * master abort. For a destructive register, the value the device model
