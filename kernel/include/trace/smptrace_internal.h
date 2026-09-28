@@ -15,6 +15,17 @@ struct ioremap_args {
 
 static void __used smptrace_ret_gadget(void) {}
 
+/* The end of the leaf the last entry poisoned in map covers, or 0 */
+static inline unsigned long smptrace_poisoned_end(struct smptrace_map *map)
+{
+	struct smptrace_pte *last;
+
+	if (list_empty(&map->ptes))
+		return 0;
+	last = list_last_entry(&map->ptes, struct smptrace_pte, list);
+	return last->va + last->size;
+}
+
 static inline bool smptrace_find_map_rcu(struct smptrace_ctx *ctx,
 					  unsigned long va, struct smptrace_map *dst)
 {
@@ -47,6 +58,7 @@ DEFINE_LOCK_GUARD_1(smptrace_active, struct srcu_struct,
 		    srcu_read_unlock_nmisafe(_T->lock, _T->idx),
 		    int idx)
 struct smptrace_ctx *smptrace_find_ctx(phys_addr_t pa, size_t len);
+bool smptrace_pa_traced(phys_addr_t pa, size_t len);
 int smptrace_enter_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs);
 int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs);
 void smptrace_untrace_map(struct smptrace_ctx *ctx, unsigned long va);
@@ -64,7 +76,14 @@ void smptrace_emulate_read_may_sleep(struct smptrace_ctx *ctx, struct smptrace_m
  * to be supported by smptrace */
 
 int smptrace_arch_activate(struct smptrace_ctx *ctx);
-int smptrace_arch_poison_pte(struct smptrace_map *map);
+/*
+ * Poisons the kernel page table entries that map [va, va + len), a page-aligned
+ * part of map, and saves each entry on map->ptes. The parts of one map are
+ * poisoned in ascending order; an entry the previous part already poisoned (a
+ * huge leaf both parts share) is skipped. On failure frees every saved entry
+ * of map, without restoring them.
+ */
+int smptrace_arch_poison_pte(struct smptrace_map *map, unsigned long va, unsigned long len);
 void smptrace_arch_restore_pte(struct smptrace_map *map);
 
 /*
