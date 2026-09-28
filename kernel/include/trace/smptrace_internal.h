@@ -14,18 +14,6 @@ struct ioremap_args {
 
 static void __used smptrace_ret_gadget(void) {}
 
-static inline struct smptrace_pte *
-smptrace_find_pte(struct smptrace_map *map, unsigned long va)
-{
-	struct smptrace_pte *tmp;
-
-	list_for_each_entry(tmp, &map->ptes, list) {
-		if (tmp->va == va)
-			return tmp;
-	}
-	return NULL;
-}
-
 static inline bool smptrace_find_map_rcu(struct smptrace_ctx *ctx,
 					  unsigned long va, struct smptrace_map *dst)
 {
@@ -47,6 +35,7 @@ static inline bool smptrace_find_map_rcu(struct smptrace_ctx *ctx,
 int smptrace_register_probes(struct smptrace_ctx *ctx);
 int smptrace_enter_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs);
 int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs);
+void smptrace_untrace_map(struct smptrace_ctx *ctx, unsigned long va);
 int smptrace_enter_iounmap(struct kprobe *rp, struct pt_regs *regs);
 void smptrace_emulate_write(struct smptrace_ctx *ctx, struct smptrace_map *map,
                             u64 addr, u32 size, const u8 *src);
