@@ -482,11 +482,13 @@ static int pciem_write_bar_address(struct pciem_root_complex *v, u32 idx, u32 va
 
     if (prev && (prev->flags & PCI_BASE_ADDRESS_MEM_TYPE_64))
     {
+        /*
+         * Every address bit of the upper half is writable unless the BAR
+         * is 4 GiB or more, when its low bits are size bits.
+         */
         u32 mask_high = 0xffffffff;
 
-        if (prev->size < (1ULL << 32))
-            mask_high = 0;
-        else
+        if (prev->size >= (1ULL << 32))
             mask_high = (u32)(~(prev->size - 1) >> 32);
 
         bar->base_addr_val = value & mask_high;
@@ -1430,7 +1432,7 @@ struct pciem_root_complex *pciem_alloc_root_complex(void)
         return ERR_PTR(-ENOMEM);
 
     rwlock_init(&v->bars_lock);
-    rwlock_init(&v->cap_lock);
+    raw_spin_lock_init(&v->cap_lock);
 
     /* Essential initialization that must happen */
     init_irq_work(&v->msi_irq_work, pciem_msi_irq_work_func);
