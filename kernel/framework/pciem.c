@@ -14,6 +14,7 @@
 #include "pool.h"
 #include "userspace.h"
 #include "iommu_stub.h"
+#include "msi_domain.h"
 
 #include <linux/pci.h>
 #include <linux/pci_ids.h>
@@ -60,7 +61,6 @@ MODULE_PARM_DESC(p2p_regions,
 static struct miscdevice pciem_dev;
 static const struct file_operations pciem_fops;
 static struct pci_ops vph_pci_ops;
-static struct irq_domain *pciem_virtual_root_nomsi_domain;
 
 static struct pciem_host_bridge_priv *pciem_bus_bridge_priv(struct pci_bus *bus)
 {
@@ -103,32 +103,25 @@ static void pciem_fixup_bridge_domain(struct pci_host_bridge *bridge,
 
 static void pciem_intx_noop(struct irq_data *d) {}
 
+/*
+ * A level-triggered line that is still asserted fires again when the
+ * interrupt controller unmasks it, as it does when the host requests the
+ * irq or enables it again after disable_irq(). Only INTA's virq has the
+ * root complex as chip data; the others never carry an interrupt.
+ */
+static void pciem_intx_unmask(struct irq_data *d)
+{
+    struct pciem_root_complex *v = irq_data_get_irq_chip_data(d);
+
+    if (v && READ_ONCE(v->intx_level))
+        irq_work_queue(&v->intx_irq_work);
+}
+
 static struct irq_chip pciem_intx_chip = {
     .name        = "pciem-INTx",
     .irq_mask    = pciem_intx_noop,
-    .irq_unmask  = pciem_intx_noop,
+    .irq_unmask  = pciem_intx_unmask,
 };
-
-static int pciem_init_virtual_root_nomsi_domain(void)
-{
-    if (pciem_virtual_root_nomsi_domain)
-        return 0;
-
-    pciem_virtual_root_nomsi_domain =
-        irq_domain_add_linear(NULL, 1, &irq_domain_simple_ops, NULL);
-    if (!pciem_virtual_root_nomsi_domain)
-        return -ENOMEM;
-
-    return 0;
-}
-
-static void pciem_cleanup_virtual_root_nomsi_domain(void)
-{
-    if (pciem_virtual_root_nomsi_domain) {
-        irq_domain_remove(pciem_virtual_root_nomsi_domain);
-        pciem_virtual_root_nomsi_domain = NULL;
-    }
-}
 
 static int pciem_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 {
@@ -149,6 +142,114 @@ static int pciem_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
         return v->intx_virq[pin - 1];
 
     return 0;
+}
+
+/* The pciem_root_complex behind a virtual-root device, or NULL. */
+struct pciem_root_complex *pciem_rc_from_pdev(struct pci_dev *pdev)
+{
+    unsigned int func = PCI_FUNC(pdev->devfn);
+    struct pciem_host_bridge_priv *priv;
+
+    if (pdev->bus->ops != &vph_pci_ops || func >= PCIEM_MAX_FUNCTIONS)
+        return NULL;
+
+    priv = pci_host_bridge_priv(pci_find_host_bridge(pdev->bus));
+    return priv->funcs[func];
+}
+
+/*
+ * INTx and the command/status registers.
+ *
+ * Config space is otherwise a byte store, but the host must see INTx as it
+ * would on hardware: vfio-pci, for one, probes whether PCI_COMMAND_INTX_DISABLE
+ * masks the device's interrupt and, finding that it sticks, masks and
+ * unmasks with it and claims an interrupt only while PCI_STATUS_INTERRUPT is
+ * set. So the line state lives in intx_*, PCI_STATUS_INTERRUPT reflects it,
+ * INTX_DISABLE gates delivery, and the rest of PCI_STATUS is read-only apart
+ * from the error bits, which are write-1-to-clear. All of it is under
+ * intx_lock. Bytes are addressed individually, as config space is
+ * little-endian whatever the CPU.
+ */
+#define PCIEM_STATUS_W1C (PCI_STATUS_PARITY | PCI_STATUS_SIG_TARGET_ABORT | \
+                          PCI_STATUS_REC_TARGET_ABORT | PCI_STATUS_REC_MASTER_ABORT | \
+                          PCI_STATUS_SIG_SYSTEM_ERROR | PCI_STATUS_DETECTED_PARITY)
+
+static bool pciem_intx_disabled(struct pciem_root_complex *v)
+{
+    return v->cfg[PCI_COMMAND + 1] & (PCI_COMMAND_INTX_DISABLE >> 8);
+}
+
+static bool pciem_intx_asserted(struct pciem_root_complex *v)
+{
+    lockdep_assert_held(&v->intx_lock);
+    return v->intx_level || v->intx_pulse_active;
+}
+
+/*
+ * A pulse is held until it can be delivered, then asserted for one run of
+ * the host's handler. Pulses held while INTX_DISABLE is set coalesce, as
+ * edges do. While held, a pulse does not show in PCI_STATUS_INTERRUPT: if
+ * it did, vfio-pci's unmask would see an interrupt pending, re-signal its
+ * user and stay masked, every time, since only the handler consumes it.
+ */
+static int pciem_intx_pulse(struct pciem_root_complex *v)
+{
+    scoped_guard(raw_spinlock_irqsave, &v->intx_lock) {
+        v->intx_pulse_pending = true;
+        if (pciem_intx_disabled(v))
+            return 0;
+    }
+
+    irq_work_queue(&v->intx_irq_work);
+    return 0;
+}
+
+/* Overlays the live PCI_STATUS_INTERRUPT on a read covering PCI_STATUS. */
+static u32 pciem_read_status_intx(struct pciem_root_complex *v, int where, int size, u32 val)
+{
+    u32 bit;
+
+    if (where > PCI_STATUS || where + size <= PCI_STATUS)
+        return val;
+
+    bit = (u32)PCI_STATUS_INTERRUPT << (8 * (PCI_STATUS - where));
+
+    guard(raw_spinlock_irqsave)(&v->intx_lock);
+    return pciem_intx_asserted(v) ? val | bit : val & ~bit;
+}
+
+/* A write that covers any byte of PCI_COMMAND or PCI_STATUS. */
+static int pciem_write_command_status(struct pciem_root_complex *v, int where, int size, u32 value)
+{
+    bool was_disabled, raise;
+    int i;
+
+    guard(raw_spinlock_irqsave)(&v->intx_lock);
+
+    was_disabled = pciem_intx_disabled(v);
+
+    for (i = 0; i < size; i++) {
+        int off = where + i;
+        u8 byte = value >> (8 * i);
+
+        if (off == PCI_STATUS)
+            v->cfg[off] &= ~(byte & (PCIEM_STATUS_W1C & 0xff));
+        else if (off == PCI_STATUS + 1)
+            v->cfg[off] &= ~(byte & (PCIEM_STATUS_W1C >> 8));
+        else
+            v->cfg[off] = byte;
+    }
+
+    raise = was_disabled && !pciem_intx_disabled(v) &&
+            (v->intx_level || v->intx_pulse_pending);
+    /*
+     * Called under pci_lock, which the host's INTx handler takes to read
+     * PCI_STATUS, so the interrupt is raised from the irq_work.
+     */
+    if (raise)
+        irq_work_queue(&v->intx_irq_work);
+
+    return PCIBIOS_SUCCESSFUL;
 }
 
 int pciem_register_bar(struct pciem_root_complex *v, u32 bar_num, resource_size_t size, u32 flags)
@@ -192,17 +293,21 @@ EXPORT_SYMBOL(pciem_register_bar);
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
 {
     struct pci_dev *dev = v->pciem_pdev;
-    int irq;
+    int irq, ret;
 
     if (!dev) {
-        pr_warn("Cannot trigger interrupt: no PCI device\n");
+        pr_warn_ratelimited("Cannot trigger interrupt: no PCI device\n");
         return -ENODEV;
     }
+
+    ret = pciem_msi_deliver(v, vector);
+    if (ret != -ENOENT)
+        return ret;
 
     if (dev->msix_enabled) {
         int max_vec = pci_msix_vec_count(dev);
         if (vector < 0 || vector >= max_vec) {
-            pr_debug("pciem: vector %d out of range (max %d), using 0\n", vector, max_vec - 1);
+            pr_warn_ratelimited("pciem: vector %d out of range (max %d), using 0\n", vector, max_vec - 1);
             vector = 0;
         }
         irq = pci_irq_vector(dev, vector);
@@ -216,11 +321,75 @@ int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
         return -EINVAL;
     }
 
+    if (!dev->msix_enabled && !dev->msi_enabled)
+        return pciem_intx_pulse(v);
+
     atomic_set(&v->pending_msi_irq, irq);
     irq_work_queue(&v->msi_irq_work);
     return 0;
 }
 EXPORT_SYMBOL(pciem_trigger_msi);
+
+/**
+ * pciem_set_intx() - assert or deassert a function's INTx line and hold it
+ * @v: the function
+ * @asserted: the new line state
+ *
+ * The host is interrupted when the line becomes asserted while
+ * PCI_COMMAND_INTX_DISABLE is clear, and later when that bit is cleared, or
+ * the host irq unmasked, with the line still asserted. PCI_STATUS_INTERRUPT
+ * reads the line meanwhile. Any context.
+ */
+void pciem_set_intx(struct pciem_root_complex *v, bool asserted)
+{
+    bool raise;
+
+    scoped_guard(raw_spinlock_irqsave, &v->intx_lock) {
+        raise = asserted && !v->intx_level && !pciem_intx_disabled(v);
+        WRITE_ONCE(v->intx_level, asserted);
+    }
+
+    if (raise)
+        irq_work_queue(&v->intx_irq_work);
+}
+EXPORT_SYMBOL(pciem_set_intx);
+
+/*
+ * Raises the host's INTx irq for whatever the line holds, in hardirq
+ * context as a physical interrupt would. A held pulse is asserted only for
+ * the duration of the handler, so a handler that checks
+ * PCI_STATUS_INTERRUPT (vfio-pci's, through pci_check_and_mask_intx()) sees
+ * it, and the next check does not. The irq is raised without intx_lock
+ * held: the handler reads config space, which takes it.
+ */
+static void pciem_intx_irq_work_func(struct irq_work *work)
+{
+    struct pciem_root_complex *v = container_of(work, struct pciem_root_complex, intx_irq_work);
+    struct pci_dev *dev = READ_ONCE(v->pciem_pdev);
+    bool pulse = false, raise;
+
+    if (!dev || dev->irq <= 0 || dev->msi_enabled || dev->msix_enabled)
+        return;
+
+    scoped_guard(raw_spinlock_irqsave, &v->intx_lock) {
+        if (pciem_intx_disabled(v))
+            return;
+        if (v->intx_pulse_pending) {
+            v->intx_pulse_pending = false;
+            v->intx_pulse_active++;
+            pulse = true;
+        }
+        raise = pulse || v->intx_level;
+    }
+
+    if (raise)
+        generic_handle_irq(dev->irq);
+
+    if (pulse) {
+        guard(raw_spinlock_irqsave)(&v->intx_lock);
+        v->intx_pulse_active--;
+    }
+}
 
 static void pciem_msi_irq_work_func(struct irq_work *work)
 {
@@ -456,6 +625,7 @@ static int pciem_conf_read_impl(struct pciem_root_complex *v, int where, int siz
         default:
             val = ~0U;
         }
+        val = pciem_read_status_intx(v, where, size, val);
     }
     *value = val;
     return PCIBIOS_SUCCESSFUL;
@@ -548,6 +718,10 @@ static int pciem_conf_write_impl(struct pciem_root_complex *v, int where, int si
 
     if (where == PCI_ROM_ADDRESS)
         return PCIBIOS_SUCCESSFUL;
+
+    if (where < PCI_STATUS + 2 && where + size > PCI_COMMAND &&
+        (size == 1 || size == 2 || size == 4))
+        return pciem_write_command_status(v, where, size, value);
 
     switch (size)
     {
@@ -804,10 +978,12 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     (void)pciem_iommu_stub_register_bridge(&bridge->dev);
     /*
      * Virtual-root instances are synthetic and have no firmware-described
-     * MSI routing. Install a private no-MSI domain before bridge
-     * registration so the PCI core does not walk the ACPI/IORT MSI path.
+     * MSI routing. Give the bridge pciem's own MSI domain before
+     * registration: the root bus takes its MSI domain from the bridge's, so
+     * the PCI core does not walk the ACPI/IORT MSI path, and on x86
+     * pcibios_device_add() hands the bus's domain to each device.
      */
-    dev_set_msi_domain(&bridge->dev, pciem_virtual_root_nomsi_domain);
+    dev_set_msi_domain(&bridge->dev, pciem_msi_domain());
 
     v->intx_domain = irq_domain_add_linear(NULL, 4, &irq_domain_simple_ops, v);
     if (!v->intx_domain) {
@@ -823,6 +999,7 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
         irq_set_chip_and_handler(v->intx_virq[i], &pciem_intx_chip,
                                  handle_simple_irq);
     }
+    irq_set_chip_data(v->intx_virq[0], v);
  
     bridge->map_irq     = pciem_map_irq;
     bridge->swizzle_irq = pci_common_swizzle;
@@ -892,8 +1069,6 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     }
     put_device(&bridge->dev);
 
-    dev_set_msi_domain(&bridge->dev, NULL);
-
     v->root_bus = bridge->bus;
     if (!v->root_bus) {
         pci_unlock_rescan_remove();
@@ -902,11 +1077,17 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     }
 
     /*
-     * Keep MSI disabled after registration. The temporary bridge MSI domain
-     * only exists to bypass firmware MSI discovery during setup.
+     * Other architectures look a device's MSI domain up per device first
+     * (pci_msi_get_device_domain(): IORT, OF msi-map), so a synthetic RID
+     * could be given the platform's. Set pciem's on every scanned device
+     * before any driver can bind.
      */
-    v->root_bus->bus_flags |= PCI_BUS_FLAGS_NO_MSI;
-    dev_set_msi_domain(&v->root_bus->dev, NULL);
+    {
+        struct pci_dev *pdev;
+
+        list_for_each_entry(pdev, &v->root_bus->devices, bus_list)
+            dev_set_msi_domain(&pdev->dev, pciem_msi_domain());
+    }
 
     pciem_bus_init_resources(v);
     pci_bus_assign_resources(v->root_bus);
@@ -1213,8 +1394,11 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
         }
 
         pci_stop_and_remove_bus_device_locked(v->pciem_pdev);
-        v->pciem_pdev = NULL;
+        WRITE_ONCE(v->pciem_pdev, NULL);
     }
+
+    /* Config writes during the removal may have queued an INTx. */
+    irq_work_sync(&v->intx_irq_work);
 
     if (v->root_bus)
     {
@@ -1270,6 +1454,7 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
 
     pciem_cleanup_cap_manager(v);
     pciem_p2p_cleanup(v);
+    pciem_msi_rc_destroy(v);
 }
 
 static int __init pciem_init(void)
@@ -1280,9 +1465,9 @@ static int __init pciem_init(void)
     ret = pciem_pool_init(pciem_phys_region);
     if (ret) return ret;
 
-    ret = pciem_init_virtual_root_nomsi_domain();
+    ret = pciem_msi_domain_init();
     if (ret)
-        goto fail_nomsi_domain;
+        goto fail_msi_domain;
 
     ret = pciem_userspace_init();
     if (ret) {
@@ -1318,8 +1503,8 @@ static int __init pciem_init(void)
 fail_misc:
     pciem_userspace_cleanup();
 fail_userspace:
-    pciem_cleanup_virtual_root_nomsi_domain();
-fail_nomsi_domain:
+    pciem_msi_domain_exit();
+fail_msi_domain:
     pciem_pool_exit();
     return ret;
 }
@@ -1333,7 +1518,7 @@ static void __exit pciem_exit(void)
     pciem_iommu_stub_exit();
     misc_deregister(&pciem_dev);
     pciem_userspace_cleanup();
-    pciem_cleanup_virtual_root_nomsi_domain();
+    pciem_msi_domain_exit();
     pciem_pool_exit();
     pr_info("exit: Unregistered /dev/pciem\n");
     pr_info("exit: pciem framework done");
@@ -1441,6 +1626,9 @@ struct pciem_root_complex *pciem_alloc_root_complex(void)
 
     /* Essential initialization that must happen */
     init_irq_work(&v->msi_irq_work, pciem_msi_irq_work_func);
+    pciem_msi_rc_init(v);
+    raw_spin_lock_init(&v->intx_lock);
+    init_irq_work(&v->intx_irq_work, pciem_intx_irq_work_func);
     INIT_WORK(&v->activation_work, pciem_activation_work_func);
     atomic_set(&v->pending_msi_irq, 0);
     memset(v->bars, 0, sizeof(v->bars));

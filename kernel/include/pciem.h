@@ -21,6 +21,7 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 
 #include "pciem_api.h"
 
@@ -100,6 +101,13 @@ struct pciem_root_complex
     unsigned int msi_irq;
     struct irq_work msi_irq_work;
     atomic_t pending_msi_irq;
+    /*
+     * MSI/MSI-X vector -> Linux irq, for vectors allocated in pciem's MSI
+     * domain (msi_domain.c). msi_lock also keeps a vector's irq allocated
+     * while pciem_msi_deliver() runs its handler.
+     */
+    struct mutex msi_lock;
+    struct xarray msi_virqs;
     struct pci_dev *pciem_pdev;
     struct pci_bus *root_bus;
     u8 cfg[256];
@@ -141,6 +149,19 @@ struct pciem_root_complex
     unsigned int        intx_virq[4]; // INTA-INTD
     struct irq_domain  *intx_domain;
 
+    /*
+     * The function's INTx line (pin A) as the device model drives it, and
+     * the host-side view of it: PCI_STATUS_INTERRUPT reads it, and it is
+     * delivered to pci_dev->irq from intx_irq_work while
+     * PCI_COMMAND_INTX_DISABLE is clear. Raw, because the config accessors
+     * take it under pci_lock; every taker disables IRQs.
+     */
+    raw_spinlock_t intx_lock;
+    bool intx_level;                /* asserted and held (PCIEM_*_FLAG_LEVEL) */
+    bool intx_pulse_pending;        /* a pulse not delivered yet */
+    unsigned int intx_pulse_active; /* pulses in the host's handler now */
+    struct irq_work intx_irq_work;
+
     struct work_struct activation_work;
     bool activated;
 
@@ -148,6 +169,8 @@ struct pciem_root_complex
 };
 
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector);
+struct pciem_root_complex *pciem_rc_from_pdev(struct pci_dev *pdev);
+void pciem_set_intx(struct pciem_root_complex *v, bool asserted);
 int pciem_complete_init(struct pciem_root_complex *v);
 int pciem_start_device(struct pciem_root_complex *v);
 void pciem_set_multifunction(struct pciem_root_complex *func0,
