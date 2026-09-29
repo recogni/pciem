@@ -88,6 +88,9 @@ struct pciem_userspace_state
 
     /* BAR read/write trackers */
     struct pciem_tracer tracers[PCIEM_MAX_FUNCTIONS][PCI_STD_NUM_BARS];
+    /* Serialises starting a tracer, from the "already tracing" check to
+     * publishing tracer->us; taken with no other lock held */
+    struct mutex trace_lock;
 
     /* Monotonic event sequence numbers; sync-read requests are matched
      * to responses by seq, so every ring event gets a real one. */
@@ -348,6 +351,7 @@ struct pciem_userspace_state *pciem_userspace_create(void)
 
     spin_lock_init(&us->slot.slot_lock);
     spin_lock_init(&us->eventfd_lock);
+    mutex_init(&us->trace_lock);
 
 
     return us;
@@ -379,6 +383,7 @@ static void pciem_userspace_destroy(struct kref *refcnt)
     spin_unlock_irqrestore(&us->pending_lock, flags);
 
     pciem_tracing_destroy(us);
+    mutex_destroy(&us->trace_lock);
     pciem_irqfds_shutdown(&us->irqfds);
 
     pciem_shared_ring_destroy(us);
@@ -1556,10 +1561,13 @@ static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *i
     return 0;
 }
 
-static int pciem_ioctl_trace_bar(struct pciem_userspace_state *us,
-                                 struct pciem_trace_bar __user *arg)
+/*
+ * Starts tracing func's BAR bar_index, only the given ranges of it, or all of
+ * it when nr is 0.
+ */
+static int pciem_trace_bar(struct pciem_userspace_state *us, u32 bar_index, u32 flags,
+                           u8 func, const struct smptrace_range *ranges, unsigned int nr)
 {
-    struct pciem_trace_bar req;
     struct pciem_bar_info *bar;
     struct pciem_tracer *tracer;
     struct pciem_root_complex *v;
@@ -1567,14 +1575,19 @@ static int pciem_ioctl_trace_bar(struct pciem_userspace_state *us,
     unsigned long len;
     int ret;
 
-    if (copy_from_user(&req, arg, sizeof(req)))
-        return -EFAULT;
-
-    if (req.func >= PCIEM_MAX_FUNCTIONS)
+    if (func >= PCIEM_MAX_FUNCTIONS)
         return -EINVAL;
 
-    if (req.bar_index >= PCI_STD_NUM_BARS)
+    if (bar_index >= PCI_STD_NUM_BARS)
         return -EINVAL;
+
+    /*
+     * tracer->us is set only once smptrace_init() has succeeded, so without
+     * this a second call for the same BAR could pass the check below while
+     * the first is still setting the tracer up, and reinitialise the ctx
+     * (and leak its ranges) under it.
+     */
+    guard(mutex)(&us->trace_lock);
 
     /*
      * Due to how register_kprobe() works on aarch64 (And surely on other ISAs other
@@ -1587,20 +1600,20 @@ static int pciem_ioctl_trace_bar(struct pciem_userspace_state *us,
     {
         guard(write_lock)(&us->slot.funcs[0]->bars_lock);
 
-        v = us_get_rc(us, req.func);
+        v = us_get_rc(us, func);
         if (!v)
             return -ENODEV;
 
-        tracer = &us->tracers[req.func][req.bar_index];
+        tracer = &us->tracers[func][bar_index];
         if (tracer->us) {
-            pr_err("Already tracing func%u BAR%u\n", req.func, req.bar_index);
-            return -EINVAL;
+            pr_err("Already tracing func%u BAR%u\n", func, bar_index);
+            return -EBUSY;
         }
 
-        bar = &v->bars[req.bar_index];
+        bar = &v->bars[bar_index];
         if (!bar->carved_start || !bar->size) {
             pr_warn("cannot trace func%u BAR%u: not registered\n",
-                    req.func, req.bar_index);
+                    func, bar_index);
             return -ENXIO;
         }
 
@@ -1608,17 +1621,22 @@ static int pciem_ioctl_trace_bar(struct pciem_userspace_state *us,
         len = bar->size;
 
         memset(tracer, 0, sizeof(*tracer));
-        tracer->ctx.opaque = req.bar_index;
+        tracer->ctx.opaque = bar_index;
         tracer->ctx.pa = pa;
         tracer->ctx.len = len;
-        if (req.flags & PCIEM_TRACE_WRITES)
+        if (flags & PCIEM_TRACE_WRITES)
             tracer->ctx.notif.write = pciem_notif_write;
-        if (req.flags & PCIEM_TRACE_READS)
+        if (flags & PCIEM_TRACE_READS)
             tracer->ctx.notif.read  = pciem_notif_read;
-        if (req.flags & PCIEM_TRACE_SYNC_READS)
+        if (flags & PCIEM_TRACE_SYNC_READS)
             tracer->ctx.notif.read_sync = pciem_notif_read_sync;
-        tracer->ctx.stop_writes = req.flags & PCIEM_TRACE_STOP_WRITES;
+        tracer->ctx.stop_writes = flags & PCIEM_TRACE_STOP_WRITES;
     }
+
+    /* Sorted and merged in tracer->ctx.ranges from here on */
+    ret = smptrace_set_ranges(&tracer->ctx, ranges, nr);
+    if (ret)
+        return ret;
 
     ret = smptrace_init(&tracer->ctx);
     if (ret)
@@ -1633,10 +1651,61 @@ static int pciem_ioctl_trace_bar(struct pciem_userspace_state *us,
         tracer->us = us;
     }
 
-    pr_info("Beginning tracing on func%u BAR%u (PA = 0x%llx)",
-            req.func, req.bar_index, (u64)pa);
+    if (nr)
+        pr_info("Beginning tracing on func%u BAR%u (PA = 0x%llx), %u range(s)",
+                func, bar_index, (u64)pa, tracer->ctx.nr_ranges);
+    else
+        pr_info("Beginning tracing on func%u BAR%u (PA = 0x%llx)",
+                func, bar_index, (u64)pa);
 
     return 0;
+}
+
+static int pciem_ioctl_trace_bar(struct pciem_userspace_state *us,
+                                 struct pciem_trace_bar __user *arg)
+{
+    struct pciem_trace_bar req;
+
+    if (copy_from_user(&req, arg, sizeof(req)))
+        return -EFAULT;
+
+    return pciem_trace_bar(us, req.bar_index, req.flags, req.func, NULL, 0);
+}
+
+static int pciem_ioctl_trace_bar_ranges(struct pciem_userspace_state *us,
+                                        struct pciem_trace_bar_ranges __user *arg)
+{
+    struct smptrace_range *ranges __free(kfree) = NULL;
+    struct pciem_trace_bar_ranges req;
+    unsigned int i;
+
+    if (copy_from_user(&req, arg, sizeof(req)))
+        return -EFAULT;
+
+    if (req.reserved[0] || req.reserved[1] || req.reserved[2] ||
+        req.nr_ranges > PCIEM_TRACE_MAX_RANGES)
+        return -EINVAL;
+
+    if (req.nr_ranges) {
+        struct pciem_trace_range __user *uranges = u64_to_user_ptr(req.ranges);
+
+        ranges = kcalloc(req.nr_ranges, sizeof(*ranges), GFP_KERNEL);
+        if (!ranges)
+            return -ENOMEM;
+
+        for (i = 0; i < req.nr_ranges; i++) {
+            struct pciem_trace_range r;
+
+            if (copy_from_user(&r, &uranges[i], sizeof(r)))
+                return -EFAULT;
+            if (!r.length || r.offset + r.length < r.offset)
+                return -EINVAL;
+            ranges[i].start = r.offset;
+            ranges[i].end = r.offset + r.length;
+        }
+    }
+
+    return pciem_trace_bar(us, req.bar_index, req.flags, req.func, ranges, req.nr_ranges);
 }
 
 static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -1689,6 +1758,9 @@ static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned lon
 
     case PCIEM_IOCTL_TRACE_BAR:
         return pciem_ioctl_trace_bar(us, (struct pciem_trace_bar __user*)arg);
+
+    case PCIEM_IOCTL_TRACE_BAR_RANGES:
+        return pciem_ioctl_trace_bar_ranges(us, (struct pciem_trace_bar_ranges __user *)arg);
 
     default:
         return -ENOTTY;

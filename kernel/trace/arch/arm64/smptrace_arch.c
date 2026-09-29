@@ -143,14 +143,15 @@ static pte_t *arm64_entry_at(unsigned long va, unsigned int level)
  * This also overcomes the limitation of certain unexported functions (That
  * would probably make this much more cleaner...) erroring out on modpost.
  */
-int smptrace_arch_poison_pte(struct smptrace_map *map)
+int smptrace_arch_poison_pte(struct smptrace_map *map, unsigned long start,
+                             unsigned long len)
 {
-	unsigned long va = map->va;
-	int64_t remain = map->len;
+	unsigned long va = max(start, smptrace_poisoned_end(map));
+	unsigned long end = start + len;
 	struct smptrace_pte *orig, *tmp;
 	int ret;
 
-	while (remain > 0) {
+	while (va < end) {
 		unsigned int level;
 		pte_t *ptep = arm64_walk_pte(va, &level);
 
@@ -185,14 +186,13 @@ int smptrace_arch_poison_pte(struct smptrace_map *map)
 			break;
 		}
 
-		pr_debug("poisoned PTE for VA=%lx (level=%u)", va, level);
+		pr_debug("poisoned PTE for VA=%lx (level=%u)", orig->va, level);
 
-		remain -= arm64_level2size(level);
-		va     += arm64_level2size(level);
+		va = orig->va + orig->size;
 		list_add_tail(&orig->list, &map->ptes);
 	}
 
-	flush_tlb_kernel_range(map->va, va);
+	flush_tlb_kernel_range(start, va);
 	return 0;
 
 fail:
@@ -200,7 +200,7 @@ fail:
 		list_del(&orig->list);
 		kfree(orig);
 	}
-	flush_tlb_kernel_range(va - (map->len - remain), va);
+	flush_tlb_kernel_range(start, va);
 	return ret;
 }
 
