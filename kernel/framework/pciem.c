@@ -746,11 +746,10 @@ static void pciem_activation_work_func(struct work_struct *work)
     }
 
     /*
-     * Stub IOMMU hookup is automatic now: pciem_iommu_stub_register_bridge
-     * was called when the host_bridge was allocated, and the high-priority
-     * pci_bus_type notifier installed by the stub fires on every
-     * BUS_NOTIFY_ADD_DEVICE for our bus, installing iommu_fwspec ahead of
-     * the iommu core's notifier. ATTACH_TO_HOST devices live on a real
+     * Stub IOMMU hookup is automatic: pciem_iommu_stub_register_bridge
+     * was called when the host_bridge was allocated, and the iommu core
+     * probes each device added on our bus through the stub's
+     * ->probe_device(), which claims it. ATTACH_TO_HOST devices live on a real
      * bus with a real platform IOMMU and intentionally take no part in
      * this — their iommu_group comes from intel-iommu / amd-iommu / smmu.
      */
@@ -776,14 +775,6 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     struct pci_host_bridge *bridge;
     struct pciem_host_bridge_priv *priv;
 
-    while (pci_find_bus(domain, busnr)) {
-        busnr++;
-        if (busnr > 255) {
-            pr_err("init: No free bus number available\n");
-            return -EBUSY;
-        }
-    }
-
     bridge = pci_alloc_host_bridge(sizeof(*priv));
     if (!bridge)
         return -ENOMEM;
@@ -797,15 +788,14 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     pciem_fixup_bridge_domain(bridge, priv, domain);
 
     bridge->dev.parent = &v->shared_bridge_pdev->dev;
-    bridge->busnr = busnr;
     bridge->ops = &vph_pci_ops;
     list_splice_init(resources, &bridge->windows);
 
     /*
      * Mark this bridge as pciem-owned BEFORE the bus is scanned — the
      * scan fires BUS_NOTIFY_ADD_DEVICE for every synthetic pci_dev, and
-     * the stub IOMMU's high-priority notifier looks up pdev->bus->bridge
-     * in its bridge list to decide whether to install fwspec. Doing this
+     * the stub IOMMU's ->probe_device() looks up pdev->bus->bridge in its
+     * bridge list to decide whether to claim the device. Doing this
      * after the scan would leave the very first cohort of devices
      * unbound to the stub.
      */
@@ -835,19 +825,76 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     bridge->map_irq     = pciem_map_irq;
     bridge->swizzle_irq = pci_common_swizzle;
 
+    /*
+     * The bus number is only taken once pci_register_host_bridge() puts the
+     * new bus on pci_root_buses, so a free number found here stays free only
+     * if nothing else can register a root bus in between. Another REGISTER
+     * would pick the same number and then fail, or worse, part way through
+     * pci_register_host_bridge(). Hold the rescan/remove lock, as
+     * pci_host_probe() does for its scan, from the search until the device is
+     * set up; pciem's teardown removes the bus under the same lock.
+     */
+    pci_lock_rescan_remove();
+    while (pci_find_bus(domain, busnr)) {
+        busnr++;
+        if (busnr > 255) {
+            pci_unlock_rescan_remove();
+            pr_err("init: No free bus number available\n");
+            dev_set_msi_domain(&bridge->dev, NULL);
+            pciem_iommu_stub_unregister_bridge(&bridge->dev);
+            pci_free_host_bridge(bridge);
+            return -EBUSY;
+        }
+    }
+    bridge->busnr = busnr;
+
+    /*
+     * The root bus has this one number and no children, so say so with a
+     * bus window. Without one, pci_scan_root_bus_bridge() gives the bus
+     * [busnr-ff], then shrinks it to [busnr] after the scan, and tries to
+     * claim both in the domain's bus number space. A host root bus that
+     * claims the domain's whole range (bus 00 is [bus 00-ff] on x86 ACPI
+     * hosts) makes each claim fail with a "busn_res: can not insert" line;
+     * with the window there is one claim, of the right range. The window
+     * lives in the bridge's private data, as long as the bridge's list
+     * entry for it.
+     */
+    priv->busn = (struct resource)DEFINE_RES_NAMED(busnr, 1, "pciem bus",
+                                                   IORESOURCE_BUS);
+    pci_add_resource(&bridge->windows, &priv->busn);
+
+    /*
+     * pci_scan_root_bus_bridge() fails only in pci_register_host_bridge(),
+     * and what a failure leaves of the bridge depends on where. Up to and
+     * including device_add(&bridge->dev), the reference from
+     * pci_alloc_host_bridge() is still ours to drop. Once the bridge is
+     * added, the bus takes a reference of its own (bus->bridge); if the
+     * bus's device_register() then fails, the core puts that reference
+     * explicitly and again when it drops the bus (release_pcibus_dev()), so
+     * ours is gone too and the bridge is freed. The error code does not
+     * tell the two apart. Hold a reference across the call so the bridge
+     * outlives either case, then drop the one from the allocation only if
+     * the core has not.
+     */
+    get_device(&bridge->dev);
     rc = pci_scan_root_bus_bridge(bridge);
     if (rc < 0) {
+        pci_unlock_rescan_remove();
         pr_err("init: pci_scan_root_bus_bridge failed: %d\n", rc);
         dev_set_msi_domain(&bridge->dev, NULL);
         pciem_iommu_stub_unregister_bridge(&bridge->dev);
-        pci_free_host_bridge(bridge);
+        if (kref_read(&bridge->dev.kobj.kref) > 1)
+            pci_free_host_bridge(bridge);
+        put_device(&bridge->dev);
         return -ENODEV;
     }
+    put_device(&bridge->dev);
 
     dev_set_msi_domain(&bridge->dev, NULL);
 
     v->root_bus = bridge->bus;
     if (!v->root_bus) {
+        pci_unlock_rescan_remove();
         pr_err("init: Failed to create root bus\n");
         return -ENODEV;
     }
@@ -863,6 +910,7 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     pci_bus_assign_resources(v->root_bus);
 
     v->pciem_pdev = pci_get_domain_bus_and_slot(domain, v->root_bus->number, PCI_DEVFN(0, v->func_index));
+    pci_unlock_rescan_remove();
     if (!v->pciem_pdev) {
         pr_err("init: Failed to find emulated device (func %u)\n", v->func_index);
         return -ENODEV;
@@ -882,8 +930,18 @@ static int pciem_init_attach_to_host_mode(struct pciem_root_complex *v)
     struct pci_dev *dev;
     int slot, i;
 
+    /*
+     * A slot found free here stays free only until something scans a
+     * device into it: another ATTACH_TO_HOST REGISTER, or a rescan or
+     * hotplug of the host bus. Hold the rescan/remove lock, as the
+     * virtual-root path does for its bus number, from the search until the
+     * device is on the bus.
+     */
+    pci_lock_rescan_remove();
+
     target_bus = pciem_find_suitable_root_bus();
     if (!target_bus) {
+        pci_unlock_rescan_remove();
         pr_err("init: No suitable root bus found (paravirt environment?)\n");
         pr_err("init: Try using PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL instead\n");
         return -ENODEV;
@@ -895,6 +953,7 @@ static int pciem_init_attach_to_host_mode(struct pciem_root_complex *v)
     if (v->func_index == 0) {
         slot = pciem_find_free_slot(target_bus);
         if (slot < 0) {
+            pci_unlock_rescan_remove();
             pr_err("init: No free slots on target bus\n");
             return -ENOSPC;
         }
@@ -912,6 +971,7 @@ static int pciem_init_attach_to_host_mode(struct pciem_root_complex *v)
  
         v->sibling_funcs[0] = v;
     } else {
+        pci_unlock_rescan_remove();
         pr_err("init: attach_to_host called for func %u; use pciem_attach_function instead\n",
                v->func_index);
         return -EINVAL;
@@ -930,16 +990,16 @@ static int pciem_init_attach_to_host_mode(struct pciem_root_complex *v)
     }
 
     /* FIXME: How usual would be for config space changes after system is booted? */
-    pci_lock_rescan_remove();
     WRITE_ONCE(target_bus->ops, &v->mode_state.hijack.proxy_ops);
     /* FIXME: Are memory barriers needed here? */
     smp_mb();
     dev = pci_scan_single_device(target_bus, PCI_DEVFN(slot, 0));
+    if (!dev)
+        WRITE_ONCE(target_bus->ops, v->mode_state.hijack.original_ops);
     pci_unlock_rescan_remove();
 
     if (!dev) {
         pr_err("init: Scan failed to create device\n");
-        WRITE_ONCE(target_bus->ops, v->mode_state.hijack.original_ops);
         return -ENODEV;
     }
 
@@ -1089,7 +1149,7 @@ int pciem_complete_init(struct pciem_root_complex *v)
 fail_device:
     if (v->pciem_pdev) {
         if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
-            pci_stop_and_remove_bus_device(v->pciem_pdev);
+            pci_stop_and_remove_bus_device_locked(v->pciem_pdev);
         } else {
             pci_dev_put(v->pciem_pdev);
         }
@@ -1098,7 +1158,10 @@ fail_device:
     if (v->bus_mode == PCIEM_BUS_MODE_VIRTUAL_ROOT && v->root_bus) {
         if (v->root_bus->bridge)
             pciem_iommu_stub_unregister_bridge(v->root_bus->bridge);
+        pci_lock_rescan_remove();
+        pci_stop_root_bus(v->root_bus);
         pci_remove_root_bus(v->root_bus);
+        pci_unlock_rescan_remove();
         v->root_bus = NULL;
     } else if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
         if (v->mode_state.hijack.target_bus && v->mode_state.hijack.original_ops) {
@@ -1147,7 +1210,7 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
             v->detaching = true;
         }
 
-        pci_stop_and_remove_bus_device(v->pciem_pdev);
+        pci_stop_and_remove_bus_device_locked(v->pciem_pdev);
         v->pciem_pdev = NULL;
     }
 
@@ -1156,7 +1219,19 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
         if (v->bus_mode == PCIEM_BUS_MODE_VIRTUAL_ROOT) {
             if (v->root_bus->bridge)
                 pciem_iommu_stub_unregister_bridge(v->root_bus->bridge);
+            /*
+             * Stop before remove, as every host bridge driver does:
+             * pci_stop_root_bus() is what reverts the host bridge's
+             * dynamic OF node (of_pci_remove_host_bridge_node(), with
+             * PCI_DYNAMIC_OF_NODES) and releases the bridge's driver.
+             * pci_remove_root_bus() alone leaves the pci@D,B node in
+             * the live tree, and the next load's node is renamed
+             * "pci@D,B#N" with a duplicate-sysfs-name splat.
+             */
+            pci_lock_rescan_remove();
+            pci_stop_root_bus(v->root_bus);
             pci_remove_root_bus(v->root_bus);
+            pci_unlock_rescan_remove();
         } else if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
             if (v->mode_state.hijack.original_ops) {
                 pci_lock_rescan_remove();
