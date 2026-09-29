@@ -43,6 +43,7 @@
 #include <linux/ptrace.h>
 #include <linux/version.h>
 #include <linux/rculist.h>
+#include <linux/wait_bit.h>
 #include <asm/io.h>
 #include <asm/tlbflush.h>
 #include "trace/smptrace.h"
@@ -97,7 +98,9 @@ void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
 			memcpy(dst, &io.data, size);
 			return;
 		}
-		/* Timeout or ring-full: fall through to the shadow. */
+		/* Daemon never answered or the ring was full */
+		memset(dst, 0xff, size);
+		return;
 	}
 
 	memcpy_fromio(dst, ctx->shadow_va + off, size);
@@ -147,7 +150,7 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct smptrace_map *map;
 	unsigned long flags;
 
-	if (args->pa < ctx->pa || args->pa >= ctx->pa + ctx->len)
+	if (!va || args->pa < ctx->pa || args->pa >= ctx->pa + ctx->len)
 		return 0;
 
 	map = kzalloc(sizeof(*map), GFP_ATOMIC);
@@ -159,18 +162,21 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	map->pa  = args->pa;
 	INIT_LIST_HEAD(&map->ptes);
 
-	pr_info("poisoning VA=0x%lx:%lx (PA=0x%llx:%lx)",
-	        va, args->len, (unsigned long long)ctx->pa, ctx->len);
-
 	if (smptrace_arch_poison_pte(map)) {
-		kfree(map);
-
-		regs_set_return_value(regs, 0);
-		iounmap((void __iomem *)va);
-
 		pr_warn("failed to poison VA=0x%lx:%lx (PA=0x%llx:%lx)",
 		        va, args->len, args->pa, args->len);
+
+		/* The caller sees ioremap() fail. This handler runs with
+		 * preemption disabled and iounmap() may sleep, so the mapping
+		 * is released from process context */
+		regs_set_return_value(regs, 0);
+		llist_add(&map->reject, &ctx->rejected);
+		schedule_work(&ctx->reject_work);
 	} else {
+		/* One line per map; the per-entry ones are pr_debug() */
+		pr_info("poisoned VA=0x%lx:%lx (PA=0x%llx:%lx): %zu entries",
+		        va, args->len, (unsigned long long)args->pa, args->len,
+		        list_count_nodes(&map->ptes));
 		spin_lock_irqsave(&ctx->lock, flags);
 		list_add_tail_rcu(&map->list, &ctx->maps);
 		spin_unlock_irqrestore(&ctx->lock, flags);
@@ -179,14 +185,47 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-int smptrace_enter_iounmap(struct kprobe *kp, struct pt_regs *regs)
+static void smptrace_unmap_rejected(struct work_struct *work)
 {
-	struct smptrace_ctx *ctx = container_of(kp, struct smptrace_ctx,
-	                                        iounmap_kp);
-	unsigned long va = regs_get_kernel_argument(regs, 0);
+	struct smptrace_ctx *ctx = container_of(work, struct smptrace_ctx,
+	                                        reject_work);
+	struct smptrace_map *map, *tmp;
+
+	llist_for_each_entry_safe(map, tmp, llist_del_all(&ctx->rejected),
+	                          reject) {
+		iounmap((void __iomem *)map->va);
+		kfree(map);
+	}
+}
+
+/*
+ * Writes map's saved entries back, unless that was done already: the arch
+ * restore empties map->ptes. The iounmap() probe and smptrace_deactivate() can
+ * both come for the same map, and each calls this under ctx->restore_lock, so
+ * the second one to get there finds nothing to do.
+ */
+static void smptrace_restore_map(struct smptrace_ctx *ctx, struct smptrace_map *map)
+{
+	lockdep_assert_held(&ctx->restore_lock);
+
+	if (list_empty(&map->ptes))
+		return;
+	pr_info("restoring VA=0x%lx (PA=0x%llx): %zu entries", map->va,
+	        (unsigned long long)map->pa, list_count_nodes(&map->ptes));
+	smptrace_arch_restore_pte(map);
+}
+
+/*
+ * Stops tracing the map at va, which is about to be iounmap()ed: restores its
+ * entries while the mapping still exists. Returns once they are back, so the
+ * caller's vunmap() only ever clears live entries.
+ */
+void smptrace_untrace_map(struct smptrace_ctx *ctx, unsigned long va)
+{
 	struct smptrace_map *map, *found = NULL;
 	unsigned long flags;
 
+	spin_lock(&ctx->restore_lock);
 	spin_lock_irqsave(&ctx->lock, flags);
 	list_for_each_entry(map, &ctx->maps, list) {
 		if (map->va == va) {
@@ -197,13 +236,21 @@ int smptrace_enter_iounmap(struct kprobe *kp, struct pt_regs *regs)
 	}
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
-	if (!found)
-		return 0;
+	/* Deactivation may have restored it already, and waits for this */
+	if (found)
+		smptrace_restore_map(ctx, found);
+	spin_unlock(&ctx->restore_lock);
 
-	pr_info("restoring VA=0x%lx (PA=0x%llx)", found->va,
-	        (unsigned long long)found->pa);
-	smptrace_arch_restore_pte(found);
-	kfree_rcu(found, rcu);
+	if (found)
+		kfree_rcu(found, rcu);
+}
+
+int smptrace_enter_iounmap(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct smptrace_ctx *ctx = container_of(kp, struct smptrace_ctx,
+	                                        iounmap_kp);
+
+	smptrace_untrace_map(ctx, regs_get_kernel_argument(regs, 0));
 	return 0;
 }
 
@@ -250,6 +297,10 @@ int smptrace_init(struct smptrace_ctx *ctx)
 
 	INIT_LIST_HEAD(&ctx->maps);
 	spin_lock_init(&ctx->lock);
+	spin_lock_init(&ctx->restore_lock);
+	atomic_set(&ctx->unmaps_pending, 0);
+	init_llist_head(&ctx->rejected);
+	INIT_WORK(&ctx->reject_work, smptrace_unmap_rejected);
 
 	ctx->in_pf = alloc_percpu_gfp(bool, GFP_KERNEL_ACCOUNT);
 	if (!ctx->in_pf)
@@ -269,21 +320,50 @@ static void smptrace_deactivate(struct smptrace_ctx *ctx)
 	struct smptrace_map *map, *tmp;
 	unsigned long flags;
 
-	/* First, stop hooks on ioremap and iounmap so everyone stops adding
-	 * and removing poisoned PTEs */
+	/* First, stop the ioremap() hook, so that no map is added */
 	unregister_kretprobe(&ctx->ioremap_krp);
-	unregister_kprobe(&ctx->iounmap_kp);
+	/* unregister_kretprobe() waited for running return handlers, so
+	 * nothing queues reject_work after this */
+	flush_work(&ctx->reject_work);
 
-	/* Now unpoison PTEs so that we stop hitting #PF */
+	/*
+	 * Now unpoison PTEs so that we stop hitting #PF, while the iounmap()
+	 * hook is still registered: a map that its owner iounmap()s at the
+	 * same time is restored by whichever of the two gets restore_lock
+	 * first, and iounmap() waits for it. Were the hook gone, that
+	 * iounmap() would free the mapping first and the entries would be
+	 * written back into a range that is no longer mapped, where the next
+	 * vmap() of it finds them. Only the hook removes maps, under
+	 * restore_lock, so holding it keeps the list still. Restoring a PTE
+	 * may flush the TLB with IPIs (riscv), so interrupts stay enabled.
+	 */
+	spin_lock(&ctx->restore_lock);
+	list_for_each_entry(map, &ctx->maps, list)
+		smptrace_restore_map(ctx, map);
+	spin_unlock(&ctx->restore_lock);
+
+	/*
+	 * Every map is restored, so the iounmap() hook has nothing left to do
+	 * but unlist. After it is gone (unregister_kprobe() waits for running
+	 * handlers) and riscv's continuations are done with ctx, nothing else
+	 * removes maps.
+	 */
+	unregister_kprobe(&ctx->iounmap_kp);
+	wait_var_event(&ctx->unmaps_pending,
+	               !atomic_read(&ctx->unmaps_pending));
+
+	/*
+	 * Only then forget the maps. A fault already taken on a poisoned PTE
+	 * runs with interrupts disabled until the kprobe has looked its map
+	 * up, so after a grace period none is left that could miss it and go
+	 * unclaimed.
+	 */
+	synchronize_rcu();
+
 	spin_lock_irqsave(&ctx->lock, flags);
 	list_for_each_entry_safe(map, tmp, &ctx->maps, list) {
 		list_del_rcu(&map->list);
-		spin_unlock_irqrestore(&ctx->lock, flags);
-
-		smptrace_arch_restore_pte(map);
 		kfree_rcu(map, rcu);
-
-		spin_lock_irqsave(&ctx->lock, flags);
 	}
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
