@@ -5,7 +5,9 @@
  */
 #ifndef _PCIEM_SMPTRACE_INTERNAL
 #define _PCIEM_SMPTRACE_INTERNAL
+#include <linux/mm_types.h>
 #include <linux/srcu.h>
+#include <linux/version.h>
 #include "trace/smptrace.h"
 
 struct ioremap_args {
@@ -71,6 +73,15 @@ void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
                            u64 addr, u32 size, u8 *dst);
 void smptrace_emulate_read_may_sleep(struct smptrace_ctx *ctx, struct smptrace_map *map,
                                      u64 addr, u32 size, u8 *dst, bool may_sleep);
+
+/* Huge PFN mappings, with the pfn (not pfn_t) interface of 6.17 on */
+#if defined(CONFIG_ARCH_SUPPORTS_HUGE_PFNMAP) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+#define SMPTRACE_USER_HUGE_FAULT
+#endif
+
+struct vm_fault;
+/* The fault handler core of a user mapping of a BAR whose start maps pa */
+vm_fault_t smptrace_user_huge_fault(struct vm_fault *vmf, unsigned int order, phys_addr_t pa);
 
 /* Arch-specific functionality. Architectures must implement these in order
  * to be supported by smptrace */
