@@ -252,6 +252,63 @@ static int pciem_write_command_status(struct pciem_root_complex *v, int where, i
     return PCIBIOS_SUCCESSFUL;
 }
 
+/**
+ * pciem_set_reset_notify() - set or clear the function's reset notifier
+ * @v: the function
+ * @fn: called for each reset, see pciem_root_complex::reset_notify; NULL
+ *      stops the calls
+ * @data: passed to @fn
+ *
+ * Once this returns with @fn NULL, no call is running or will be made.
+ */
+void pciem_set_reset_notify(struct pciem_root_complex *v,
+                            void (*fn)(void *data, u32 kind), void *data)
+{
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+    v->reset_notify = fn;
+    v->reset_notify_data = data;
+}
+EXPORT_SYMBOL(pciem_set_reset_notify);
+
+/*
+ * Resets the function as the host sees it, for an FLR or a PM reset
+ * (@kind): PCI_COMMAND (memory decode, bus mastering, INTX_DISABLE: all of
+ * it, as the reset does) and the PCI_STATUS error bits clear, the INTx line
+ * deasserted and any held pulse dropped, the BAR addresses cleared, and the
+ * capabilities' state reset (pciem_cap_reset()). Read-only bits, the
+ * Interrupt Line and the other scratch registers stay. Then the reset
+ * notifier is told, so what it tells the device model comes after all this.
+ *
+ * Called from the config write that requested the reset, under pci_lock.
+ * Nothing waits for the device afterwards: it is ready at once, so
+ * pci_dev_wait() finds PCI_COMMAND readable on its first try.
+ */
+static void pciem_function_reset(struct pciem_root_complex *v, u32 kind)
+{
+    int i;
+
+    pr_info("func%u: %s reset\n", v->func_index,
+            kind == PCIEM_RESET_FLR ? "function level" : "PM");
+
+    scoped_guard(raw_spinlock_irqsave, &v->intx_lock) {
+        v->cfg[PCI_COMMAND] = 0;
+        v->cfg[PCI_COMMAND + 1] = 0;
+        v->cfg[PCI_STATUS] &= ~(PCIEM_STATUS_W1C & 0xff);
+        v->cfg[PCI_STATUS + 1] &= ~(PCIEM_STATUS_W1C >> 8);
+        WRITE_ONCE(v->intx_level, false);
+        v->intx_pulse_pending = false;
+    }
+
+    for (i = 0; i < PCI_STD_NUM_BARS; i++)
+        v->bars[i].base_addr_val = 0;
+
+    pciem_cap_reset(v);
+
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+    if (v->reset_notify)
+        v->reset_notify(v->reset_notify_data, kind);
+}
+
 int pciem_register_bar(struct pciem_root_complex *v, u32 bar_num, resource_size_t size, u32 flags)
 {
     phys_addr_t phys;
@@ -670,6 +727,8 @@ static int pciem_write_bar_address(struct pciem_root_complex *v, u32 idx, u32 va
 
 static int pciem_conf_write_impl(struct pciem_root_complex *v, int where, int size, u32 value)
 {
+    u32 reset = 0;
+
     if (!v)
     {
         return PCIBIOS_DEVICE_NOT_FOUND;
@@ -684,8 +743,11 @@ static int pciem_conf_write_impl(struct pciem_root_complex *v, int where, int si
 
         if ((where + size) > PCI_CFG_SPACE_EXP_SIZE)
             return PCIBIOS_DEVICE_NOT_FOUND;
-        if (pciem_handle_cap_write(v, where, size, value))
+        if (pciem_handle_cap_write(v, where, size, value, &reset)) {
+            if (reset)
+                pciem_function_reset(v, reset);
             return PCIBIOS_SUCCESSFUL;
+        }
         switch (size)
         {
         case 1:
@@ -705,8 +767,11 @@ static int pciem_conf_write_impl(struct pciem_root_complex *v, int where, int si
 
     if (where < 0 || (where + size) > PCI_CFG_SPACE_SIZE)
         return PCIBIOS_DEVICE_NOT_FOUND;
-    if (pciem_handle_cap_write(v, where, size, value))
+    if (pciem_handle_cap_write(v, where, size, value, &reset)) {
+        if (reset)
+            pciem_function_reset(v, reset);
         return PCIBIOS_SUCCESSFUL;
+    }
     if (where >= PCI_BASE_ADDRESS_0 &&
         where < PCI_BASE_ADDRESS_0 + (4 * PCI_STD_NUM_BARS) &&
         (where % 4 == 0) &&
