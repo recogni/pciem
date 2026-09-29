@@ -1345,6 +1345,12 @@ int pciem_complete_init(struct pciem_root_complex *v)
         mem_res->start = bar->carved_start;
         mem_res->end = bar->carved_end;
         mem_res->flags = IORESOURCE_MEM;
+        /* The root bus's windows are these resources, and the PCI core claims a
+         * prefetchable BAR only from a prefetchable window. */
+        if (bar->flags & PCI_BASE_ADDRESS_MEM_PREFETCH)
+            mem_res->flags |= IORESOURCE_PREFETCH;
+        if (bar->flags & PCI_BASE_ADDRESS_MEM_TYPE_64)
+            mem_res->flags |= IORESOURCE_MEM_64;
 
         if (pciem_pool_insert(mem_res)) {
             kfree(mem_res->name);
