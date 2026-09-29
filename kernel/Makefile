@@ -24,7 +24,8 @@ pciem-objs := framework/pciem.o \
               framework/dma.o \
               framework/userspace.o \
               framework/pool.o \
-              framework/iommu_stub.o
+              framework/iommu_stub.o \
+              framework/msi_domain.o
 
 pciem-objs += trace/smptrace.o \
               trace/smptrace_user.o \

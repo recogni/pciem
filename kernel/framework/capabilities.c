@@ -181,6 +181,12 @@ int pciem_add_cap_msi(struct pciem_root_complex *v, struct pciem_cap_msi_config 
     struct pciem_cap_entry *cap;
     int ret;
 
+    /* Multiple Message Capable encodes 1 to 32 vectors. */
+    if (cfg->num_vectors_log2 > 5) {
+        pr_err("MSI: num_vectors_log2 %u is more than 32 vectors\n", cfg->num_vectors_log2);
+        return -EINVAL;
+    }
+
     guard(raw_spinlock_irqsave)(&v->cap_lock);
 
     mgr = v->cap_mgr;
@@ -205,7 +211,18 @@ int pciem_add_cap_msi(struct pciem_root_complex *v, struct pciem_cap_msi_config 
     cap->config.msi = *cfg;
 
     memset(&cap->state.msi_state, 0, sizeof(cap->state.msi_state));
-    cap->state.msi_state.control = 0;
+    /*
+     * Message Control's read-only fields describe the capability, and the
+     * word handler answers every PCI_MSI_FLAGS read from here, not from the
+     * rendered bytes. Starting at 0 told the kernel and vfio-pci that the
+     * device takes one vector, 32-bit addresses and no per-vector masking,
+     * whatever it declared.
+     */
+    cap->state.msi_state.control = (cfg->num_vectors_log2 << 1) & PCI_MSI_FLAGS_QMASK;
+    if (cfg->has_64bit)
+        cap->state.msi_state.control |= PCI_MSI_FLAGS_64BIT;
+    if (cfg->has_per_vector_masking)
+        cap->state.msi_state.control |= PCI_MSI_FLAGS_MASKBIT;
 
     mgr->next_offset += cap->size;
     mgr->num_caps++;
@@ -216,10 +233,84 @@ int pciem_add_cap_msi(struct pciem_root_complex *v, struct pciem_cap_msi_config 
 }
 EXPORT_SYMBOL(pciem_add_cap_msi);
 
+/* Bytes the MSI-X table and PBA of @cfg take up in their BAR. */
+static u64 msix_table_bytes(const struct pciem_cap_msix_config *cfg)
+{
+    return (u64)cfg->table_size * PCI_MSIX_ENTRY_SIZE;
+}
+
+static u64 msix_pba_bytes(const struct pciem_cap_msix_config *cfg)
+{
+    return DIV_ROUND_UP((u64)cfg->table_size, 64) * 8;
+}
+
+static bool pages_overlap(u64 a, u64 alen, u64 b, u64 blen)
+{
+    return round_down(a, PAGE_SIZE) < round_up(b + blen, PAGE_SIZE) &&
+           round_down(b, PAGE_SIZE) < round_up(a + alen, PAGE_SIZE);
+}
+
+/*
+ * A synchronous read (PCIEM_TRACE_SYNC_READS) can only be answered from a
+ * context that may sleep or spin until the device model runs, but the PCI
+ * core reads the MSI-X table with interrupts disabled: pci_msix_mask() reads
+ * the vector control word back from irq_chip callbacks. So a sync-read
+ * traced range of a BAR must not share a page with the table or the PBA
+ * (smptrace traps whole pages).
+ *
+ * Returns true, and says why, if [@start, @start + @len) of BAR @bar of
+ * function @func is such a range for the MSI-X capability @cfg. Callers pass
+ * each traced range; a trace of a whole BAR is the range [0, BAR size).
+ */
+bool pciem_msix_sync_read_conflict(const struct pciem_cap_msix_config *cfg,
+                                   u8 func, u32 bar, u64 start, u64 len)
+{
+    u64 tbl = cfg->table_offset, pba = cfg->pba_offset;
+
+    if (cfg->bar_index != bar || !len)
+        return false;
+    if (!pages_overlap(start, len, tbl, msix_table_bytes(cfg)) &&
+        !pages_overlap(start, len, pba, msix_pba_bytes(cfg)))
+        return false;
+
+    pr_err("func%u BAR%u: PCIEM_TRACE_SYNC_READS range [0x%llx, 0x%llx) shares a page with the MSI-X table [0x%llx, 0x%llx) or PBA [0x%llx, 0x%llx). The kernel reads the table with interrupts disabled, where a synchronous read cannot be answered: trace this range without PCIEM_TRACE_SYNC_READS, or leave the table's and PBA's pages out of it.\n",
+           func, bar, start, start + len, tbl, tbl + msix_table_bytes(cfg),
+           pba, pba + msix_pba_bytes(cfg));
+    return true;
+}
+
+/* pciem_msix_sync_read_conflict() for @v's MSI-X capability, if it has one. */
+bool pciem_cap_msix_sync_read_conflict(struct pciem_root_complex *v, u32 bar,
+                                       u64 start, u64 len)
+{
+    struct pciem_cap_msix_config cfg;
+    struct pciem_cap_entry *cap;
+
+    scoped_guard(raw_spinlock_irqsave, &v->cap_lock) {
+        if (!v->cap_mgr)
+            return false;
+        cap = pciem_cap_manager_find(v->cap_mgr, PCIEM_CAP_MSIX);
+        if (!cap)
+            return false;
+        cfg = cap->config.msix;
+    }
+
+    return pciem_msix_sync_read_conflict(&cfg, v->func_index, bar, start, len);
+}
+
 int pciem_add_cap_msix(struct pciem_root_complex *v, struct pciem_cap_msix_config *cfg)
 {
     struct pciem_cap_manager *mgr;
     struct pciem_cap_entry *cap;
+
+    /* The table and PBA offsets share a dword with the 3-bit BIR. */
+    if (cfg->bar_index >= PCI_STD_NUM_BARS || !cfg->table_size ||
+        cfg->table_size > PCI_MSIX_FLAGS_QSIZE + 1 ||
+        (cfg->table_offset & PCI_MSIX_TABLE_BIR) || (cfg->pba_offset & PCI_MSIX_PBA_BIR)) {
+        pr_err("MSI-X: invalid table: BAR %u, %u entries, table offset 0x%x, PBA offset 0x%x\n",
+               cfg->bar_index, cfg->table_size, cfg->table_offset, cfg->pba_offset);
+        return -EINVAL;
+    }
 
     guard(raw_spinlock_irqsave)(&v->cap_lock);
 
@@ -728,9 +819,13 @@ static bool handle_msi_write(struct pciem_cap_entry *cap, u8 *storage,
     struct pciem_msi_state *st = &cap->state.msi_state;
 
     if (offset == PCI_MSI_FLAGS && size == 2) {
-        st->control = value & 0xffff;
+        /* Multiple Message Capable, 64-bit and Per-Vector Masking are read-only. */
+        const u16 ro = PCI_MSI_FLAGS_QMASK | PCI_MSI_FLAGS_64BIT | PCI_MSI_FLAGS_MASKBIT;
+
+        st->control = (st->control & ro) | (value & ~ro & 0xffff);
         put_unaligned_le16(st->control, storage + offset);
-        pr_info("MSI Control written: 0x%04x (Enable: %d)\n", value, !!(value & PCI_MSI_FLAGS_ENABLE));
+        pr_info("MSI Control written: 0x%04x (Enable: %d)\n", st->control,
+                !!(st->control & PCI_MSI_FLAGS_ENABLE));
         return true;
     }
     if (offset == PCI_MSI_ADDRESS_LO && size == 4)
