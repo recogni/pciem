@@ -35,9 +35,7 @@
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/rwsem.h>
-#include <linux/sched/task_stack.h>
 #include <linux/uaccess.h>
-#include <linux/version.h>
 #include <linux/vfio_pci_core.h>
 #include "trace/smptrace_internal.h"
 
@@ -80,84 +78,22 @@ static void smptrace_vfio_vma_close(struct vm_area_struct *vma)
 	module_put(THIS_MODULE);
 }
 
-#if defined(CONFIG_ARCH_SUPPORTS_HUGE_PFNMAP) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
-#define SMPTRACE_VFIO_HUGE_FAULT
-#endif
-
 /*
- * vfio_pci_mmap_huge_fault() for untraced memory: maps order pages at pfn, or
- * asks for a smaller order. Caller holds memory_lock and has checked that
- * memory is usable.
- */
-static vm_fault_t smptrace_vfio_insert(struct vm_fault *vmf, unsigned long pfn,
-                                       unsigned int order)
-{
-	switch (order) {
-	case 0:
-		return vmf_insert_pfn(vmf->vma, vmf->address, pfn);
-#ifdef SMPTRACE_VFIO_HUGE_FAULT
-#ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
-	case PMD_ORDER:
-		return vmf_insert_pfn_pmd(vmf, pfn, false);
-#endif
-#ifdef CONFIG_ARCH_SUPPORTS_PUD_PFNMAP
-	case PUD_ORDER:
-		return vmf_insert_pfn_pud(vmf, pfn, false);
-#endif
-#endif
-	default:
-		return VM_FAULT_FALLBACK;
-	}
-}
-
-/*
- * Pages no traced range covers are mapped as vfio-pci maps them, at the orders
- * it would, so that part of the BAR behaves like an ordinary vfio-pci mmap().
- * An access to a traced page is emulated and never maps it. The ranges are
- * fixed while a tracer lives, so what is traced can only change to nothing,
- * when the tracer goes away, and a page mapped stays correctly mapped.
+ * Untraced pages are mapped as vfio-pci maps them, at the orders it would, so
+ * that part of the BAR behaves like an ordinary vfio-pci mmap(); traced pages
+ * are emulated (smptrace_user_huge_fault()).
  */
 static vm_fault_t smptrace_vfio_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
-	struct vm_area_struct *vma = vmf->vma;
-	struct vfio_pci_core_device *vdev = vma->vm_private_data;
-	phys_addr_t pa = vma_phys(vma);
-	unsigned long addr = vmf->address & ~((PAGE_SIZE << order) - 1);
-	unsigned long pfn = PHYS_PFN(pa) + ((addr - vma->vm_start) >> PAGE_SHIFT);
+	struct vfio_pci_core_device *vdev = vmf->vma->vm_private_data;
 	vm_fault_t ret = VM_FAULT_SIGBUS;
-	bool traced;
-	int err;
-
-	if (order && (addr < vma->vm_start || addr + (PAGE_SIZE << order) > vma->vm_end ||
-	              pfn & ((1UL << order) - 1)))
-		return VM_FAULT_FALLBACK;
-
-	scoped_guard(smptrace_active, &smptrace_active_srcu)
-		traced = smptrace_pa_traced(PFN_PHYS(pfn), PAGE_SIZE << order);
-	/* A huge page with a traced part is faulted page by page */
-	if (traced && order)
-		return VM_FAULT_FALLBACK;
-
-	/* Only a user-mode load or store has an instruction to emulate. A
-	 * kernel access (uaccess) gets -EFAULT, an instruction fetch SIGBUS. */
-	if (traced && (!(vmf->flags & FAULT_FLAG_USER) || (vmf->flags & FAULT_FLAG_INSTRUCTION)))
-		return VM_FAULT_SIGBUS;
 
 	/* The rules of vfio-pci's own fault handler: no access while device
 	 * memory is disabled or the device is runtime-suspended, and none
 	 * concurrent with a reset, which holds memory_lock for write. */
 	down_read(&vdev->memory_lock);
-	if (!smptrace_vfio_mem_usable(vdev))
-		goto out;
-
-	err = traced ? smptrace_arch_user_fault(task_pt_regs(current), vmf->real_address,
-	                                        vma->vm_start, vma->vm_end, pa) : -ENOENT;
-	if (!err || err == -EAGAIN)
-		ret = VM_FAULT_NOPAGE;
-	else if (err == -ENOENT)
-		/* Not traced, or no longer (the device model is gone) */
-		ret = smptrace_vfio_insert(vmf, pfn, order);
-out:
+	if (smptrace_vfio_mem_usable(vdev))
+		ret = smptrace_user_huge_fault(vmf, order, vma_phys(vmf->vma));
 	up_read(&vdev->memory_lock);
 	return ret;
 }
@@ -171,7 +107,7 @@ static const struct vm_operations_struct smptrace_vfio_vm_ops = {
 	.open  = smptrace_vfio_vma_open,
 	.close = smptrace_vfio_vma_close,
 	.fault = smptrace_vfio_fault,
-#ifdef SMPTRACE_VFIO_HUGE_FAULT
+#ifdef SMPTRACE_USER_HUGE_FAULT
 	.huge_fault = smptrace_vfio_huge_fault,
 #endif
 };

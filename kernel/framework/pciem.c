@@ -1308,8 +1308,9 @@ static int __init pciem_init(void)
     if (ret)
         pr_warn("init: stub IOMMU registration failed: %d (vfio-pci bind will need noiommu)\n", ret);
 
-    /* Non-fatal like the stub IOMMU; reports its own failures. */
+    /* Non-fatal like the stub IOMMU; each reports its own failures. */
     smptrace_vfio_init();
+    smptrace_sysfs_init();
 
     pr_info("init: Created /dev/pciem for userspace device creation\n");
     pr_info("init: pciem framework loaded\n");
@@ -1328,6 +1329,7 @@ static void __exit pciem_exit(void)
 {
     pr_info("exit: unloading pciem framework\n");
 
+    smptrace_sysfs_exit();
     smptrace_vfio_exit();
     pciem_iommu_stub_exit();
     misc_deregister(&pciem_dev);
