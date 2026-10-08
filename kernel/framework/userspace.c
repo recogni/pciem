@@ -150,6 +150,25 @@ static inline struct pciem_root_complex *us_get_rc(struct pciem_userspace_state 
     return us->slot.funcs[func];
 }
 
+/*
+ * pciem_msix_sync_read_conflict() for each range a tracer traces, or for the
+ * whole BAR when it traces all of it.
+ */
+static bool pciem_tracer_msix_conflict(const struct pciem_tracer *tracer,
+                                       const struct pciem_cap_msix_config *cfg, u8 func, u32 bar)
+{
+    const struct smptrace_ctx *ctx = &tracer->ctx;
+    unsigned int i;
+
+    if (!ctx->ranges)
+        return pciem_msix_sync_read_conflict(cfg, func, bar, 0, ctx->len);
+    for (i = 0; i < ctx->nr_ranges; i++)
+        if (pciem_msix_sync_read_conflict(cfg, func, bar, ctx->ranges[i].start,
+                                          ctx->ranges[i].end - ctx->ranges[i].start))
+            return true;
+    return false;
+}
+
 static int pciem_instance_mmap(struct file *file, struct vm_area_struct *vma)
 {
     struct pciem_userspace_state *us = file->private_data;
@@ -754,6 +773,20 @@ static long pciem_ioctl_add_capability(struct pciem_userspace_state *us, struct 
         msix.pba_offset = msix_cfg->pba_offset;
         msix.table_size = msix_cfg->table_size;
 
+        /* The same rule as PCIEM_IOCTL_TRACE_BAR, for a BAR traced first. */
+        if (msix.bar_index < PCI_STD_NUM_BARS) {
+            struct pciem_tracer *tracer = &us->tracers[cfg.func][msix.bar_index];
+            bool conflict = false;
+
+            scoped_guard(read_lock, &v->bars_lock) {
+                if (tracer->us && tracer->ctx.notif.read_sync)
+                    conflict = pciem_tracer_msix_conflict(tracer, &msix, cfg.func,
+                                                          msix.bar_index);
+            }
+            if (conflict)
+                return -EINVAL;
+        }
+
         ret = pciem_add_cap_msix(v, &msix);
         break;
     }
@@ -913,21 +946,33 @@ static long pciem_ioctl_inject_irq(struct pciem_userspace_state *us, struct pcie
     if (copy_from_user(&inject, arg, sizeof(inject)))
         return -EFAULT;
 
+    if (inject.flags & ~(PCIEM_IRQ_INJECT_FLAG_LEVEL | PCIEM_IRQ_INJECT_FLAG_DEASSERT) ||
+        memchr_inv(inject.reserved, 0, sizeof(inject.reserved)))
+        return -EINVAL;
+
     v = us_get_rc(us, inject.func);
     if (!v) {
         pr_err("pciem_ioctl_inject_irq: invalid function %u\n", inject.func);
         return -ENODEV;
     }
 
-    pr_debug("Injecting MSI vector %d to func %u\n", inject.vector, inject.func);
-
-    if (pciem_trigger_msi(v, inject.vector) != 0)
-    {
-        pr_err("pciem_ioctl_inject_irq: Failed to trigger MSI for func %u, vector %d\n", inject.func, inject.vector);
-        return -EFAULT;
+    if (inject.flags & PCIEM_IRQ_INJECT_FLAG_DEASSERT) {
+        pciem_set_intx(v, false);
+        return 0;
+    }
+    if (inject.flags & PCIEM_IRQ_INJECT_FLAG_LEVEL) {
+        pciem_set_intx(v, true);
+        return 0;
     }
 
-    return 0;
+    pr_debug("Injecting MSI vector %d to func %u\n", inject.vector, inject.func);
+
+    ret = pciem_trigger_msi(v, inject.vector);
+    if (ret)
+        pr_err_ratelimited("pciem_ioctl_inject_irq: Failed to trigger MSI for func %u, vector %d\n",
+                           inject.func, inject.vector);
+
+    return ret;
 }
 
 static long pciem_ioctl_dma(struct pciem_userspace_state *us, struct pciem_dma_op __user *arg)
@@ -1160,18 +1205,46 @@ static long pciem_ioctl_set_eventfd(struct pciem_userspace_state *us, struct pci
     return 0;
 }
 
+/*
+ * The device model can signal an irqfd at any time, including when the
+ * interrupt has nowhere to go: before a driver has bound (no INTx route yet),
+ * with neither INTx routed nor MSI enabled, or while the device is going
+ * away. A device that raises an interrupt nobody can receive loses it, so
+ * drop it and say so.
+ */
 static void pciem_irqfd_work(struct work_struct *work)
 {
     struct pciem_irqfd *irqfd = container_of(work, struct pciem_irqfd, inject_work);
-    struct pciem_userspace_state *us = irqfd->us;
+    struct pciem_root_complex *v = us_get_rc(irqfd->us, irqfd->func);
+    int ret;
 
-    if (us) {
-        struct pciem_root_complex *v = us_get_rc(us, irqfd->func);
-        if (v && pciem_trigger_msi(v, irqfd->vector) != 0) {
-            pr_err("pciem_irqfd_work: Failed to trigger MSI!\n");
-            BUG();
-        }
+    if (!v)
+        return;
+
+    ret = pciem_trigger_msi(v, irqfd->vector);
+    if (ret)
+        pr_warn_ratelimited("irqfd: func%u vector %u: interrupt dropped (%d)\n",
+                            irqfd->func, irqfd->vector, ret);
+}
+
+/*
+ * A level irqfd sets the line right here, so that an assert and a deassert
+ * signalled in that order take effect in that order, which two work items
+ * would not guarantee. pciem_set_intx() only takes a raw spinlock and queues
+ * an irq_work, so it is fine under the eventfd's wait queue lock.
+ */
+static void pciem_irqfd_inject(struct pciem_irqfd *irqfd)
+{
+    struct pciem_root_complex *v;
+
+    if (!(irqfd->flags & (PCIEM_IRQFD_FLAG_LEVEL | PCIEM_IRQFD_FLAG_DEASSERT))) {
+        schedule_work(&irqfd->inject_work);
+        return;
     }
+
+    v = us_get_rc(irqfd->us, irqfd->func);
+    if (v)
+        pciem_set_intx(v, !(irqfd->flags & PCIEM_IRQFD_FLAG_DEASSERT));
 }
 
 static int pciem_irqfd_wakeup(wait_queue_entry_t *wait, unsigned mode, int sync, void *key)
@@ -1183,7 +1256,7 @@ static int pciem_irqfd_wakeup(wait_queue_entry_t *wait, unsigned mode, int sync,
 
     if (flags & EPOLLIN) {
         eventfd_ctx_do_read(irqfd->trigger, &count);
-        schedule_work(&irqfd->inject_work);
+        pciem_irqfd_inject(irqfd);
     }
 
     if (flags & EPOLLHUP) {
@@ -1206,10 +1279,17 @@ static void pciem_irqfd_ptable_queue_proc(struct file *file, wait_queue_head_t *
     struct pciem_irqfd *irqfd = helper->irqfd;
     struct pciem_irqfds *irqfds = &irqfd->us->irqfds;
 
-    guard(spinlock_irqsave)(&irqfds->lock);
+    scoped_guard(spinlock_irqsave, &irqfds->lock)
+        list_add_tail(&irqfd->list, &irqfds->items);
 
+    /*
+     * Not under irqfds->lock: pciem_irqfd_wakeup() takes that lock with the
+     * eventfd's wait-queue lock held, so taking them in the other order here
+     * is an ABBA. Nothing can shut the irqfd down in between: that happens
+     * on EPOLLHUP, which cannot come while this ioctl holds the eventfd's
+     * file, or when the last reference to @us goes, which this ioctl holds.
+     */
     add_wait_queue(wqh, &irqfd->wait);
-    list_add_tail(&irqfd->list, &irqfds->items);
 }
 
 static long pciem_ioctl_set_irqfd(struct pciem_userspace_state *us,
@@ -1229,6 +1309,9 @@ static long pciem_ioctl_set_irqfd(struct pciem_userspace_state *us,
 
     if (copy_from_user(&cfg, arg, sizeof(cfg)))
         return -EFAULT;
+
+    if (cfg.flags & ~(PCIEM_IRQFD_FLAG_LEVEL | PCIEM_IRQFD_FLAG_DEASSERT))
+        return -EINVAL;
 
     irqfd = kzalloc(sizeof(*irqfd), GFP_KERNEL_ACCOUNT);
     if (!irqfd)
@@ -1261,7 +1344,7 @@ static long pciem_ioctl_set_irqfd(struct pciem_userspace_state *us,
 
     events = vfs_poll(fd_file(f), &pt_helper.pt);
     if (events & EPOLLIN)
-        schedule_work(&irqfd->inject_work);
+        pciem_irqfd_inject(irqfd);
 
     fdput(f);
 
@@ -1637,6 +1720,21 @@ static int pciem_trace_bar(struct pciem_userspace_state *us, u32 bar_index, u32 
     ret = smptrace_set_ranges(&tracer->ctx, ranges, nr);
     if (ret)
         return ret;
+
+    /* A synchronously read range must keep off the MSI-X table's pages */
+    if (flags & PCIEM_TRACE_SYNC_READS) {
+        const struct smptrace_range whole = { 0, len };
+        const struct smptrace_range *r = tracer->ctx.ranges ?: &whole;
+        unsigned int i, n = tracer->ctx.ranges ? tracer->ctx.nr_ranges : 1;
+
+        for (i = 0; i < n; i++) {
+            if (pciem_cap_msix_sync_read_conflict(v, bar_index, r[i].start,
+                                                  r[i].end - r[i].start)) {
+                smptrace_free_ranges(&tracer->ctx);
+                return -EINVAL;
+            }
+        }
+    }
 
     ret = smptrace_init(&tracer->ctx);
     if (ret)

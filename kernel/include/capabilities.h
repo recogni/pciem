@@ -67,6 +67,11 @@ int pciem_add_cap_pcie(struct pciem_root_complex *v, struct pciem_cap_pcie_confi
 int pciem_add_cap_vsec(struct pciem_root_complex *v, struct pciem_cap_vsec_config *cfg);
 int pciem_add_cap_pasid(struct pciem_root_complex *v, struct pciem_cap_pasid_config *cfg);
 
+bool pciem_msix_sync_read_conflict(const struct pciem_cap_msix_config *cfg,
+                                   u8 func, u32 bar, u64 start, u64 len);
+bool pciem_cap_msix_sync_read_conflict(struct pciem_root_complex *v, u32 bar,
+                                       u64 start, u64 len);
+
 void pciem_init_cap_manager(struct pciem_root_complex *v);
 void pciem_build_config_space(struct pciem_root_complex *v);
 void pciem_cleanup_cap_manager(struct pciem_root_complex *v);
