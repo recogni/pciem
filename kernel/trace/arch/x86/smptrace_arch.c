@@ -8,6 +8,7 @@
 #include <asm/traps.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
+#include <linux/mm.h>
 #include <linux/version.h>
 #include "insn.h"
 #include "insn-eval.h"
@@ -56,20 +57,95 @@ static u64 level2size(unsigned int level)
 	}
 }
 
-int smptrace_arch_poison_pte(struct smptrace_map *map)
+/*
+ * Replaces the 2 MiB leaf at pmdp with a table of 4 KiB entries that map the
+ * same memory with the same attributes, so that only part of it need be
+ * poisoned. Called from the ioremap() return handler, before the caller has the
+ * mapping, so nothing else is using it; preemption is disabled, so the table is
+ * allocated atomically, as the kernel's own kernel PTE tables are constructed.
+ *
+ * The table stays after the PTEs are restored. From then on it is an ordinary
+ * kernel PTE table: vunmap() clears its entries, and a later huge mapping of the
+ * range frees it through pmd_free_pte_page(), which flushes first.
+ */
+static int smptrace_split_pmd(pmd_t *pmdp, unsigned long va)
 {
-	int64_t remain = map->len;
-	unsigned long va = map->va;
+	pmd_t pmd = pmdp_get(pmdp);
+	unsigned long pfn = pmd_pfn(pmd);
+	/* The PAT bit of a 4 KiB entry is where a 2 MiB one keeps PSE */
+	pgprot_t prot = pgprot_large_2_4k(pmd_pgprot(pmd));
+	pte_t *table;
+	int i;
+
+	/* A Xen PV guest must be told of a new page table, through
+	 * paravirt_alloc_pte(), which takes init_mm: not exported. */
+	if (cpu_feature_enabled(X86_FEATURE_XENPV))
+		return -EOPNOTSUPP;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+	/* Since 6.15 kernel PTE tables are constructed, and pte_free_kernel()
+	 * destructs them. pagetable_pte_ctor() for init_mm, which is only
+	 * __pagetable_ctor(), since init_mm is not exported. */
+	struct ptdesc *ptdesc = pagetable_alloc(GFP_ATOMIC | __GFP_ZERO, 0);
+
+	if (!ptdesc)
+		return -ENOMEM;
+	__pagetable_ctor(ptdesc);
+	table = ptdesc_address(ptdesc);
+#else
+	table = (pte_t *)__get_free_page(GFP_ATOMIC | __GFP_ZERO);
+	if (!table)
+		return -ENOMEM;
+#endif
+	for (i = 0; i < PTRS_PER_PTE; i++)
+		set_pte(&table[i], pfn_pte(pfn + i, prot));
+
+	/* pmd_populate_kernel(&init_mm, ...) without the paravirt hook */
+	set_pmd(pmdp, __pmd(__pa(table) | _PAGE_TABLE));
+
+	/* Another CPU may hold the 2 MiB translation speculatively; a TLB must
+	 * not keep it next to 4 KiB ones that are about to differ from it, as
+	 * the kernel's own __split_large_page() flushes before changing any. */
+	smptrace_flush_tlb_all();
+	pr_debug("split huge PMD for VA=%lx", va & PMD_MASK);
+	return 0;
+}
+
+int smptrace_arch_poison_pte(struct smptrace_map *map, unsigned long start,
+                             unsigned long len)
+{
+	unsigned long va = max(start, smptrace_poisoned_end(map));
+	unsigned long end = start + len;
 	unsigned int level;
 	struct smptrace_pte *orig, *tmp;
 	int ret;
 
-	while (remain > 0) {
+	while (va < end) {
 		pte_t *ptep = lookup_address(va, &level);
 
 		if (!ptep) {
 			ret = -ENOENT;
 			goto fail;
+		}
+
+		/* Nothing to poison, and saving it would make the restore
+		 * write back a poisoned entry */
+		if (!(pte_flags(*ptep) & _PAGE_PRESENT)) {
+			va = ALIGN_DOWN(va, level2size(level)) + level2size(level);
+			continue;
+		}
+
+		/* A 2 MiB leaf the range covers only partly is split, so the
+		 * rest of it stays mapped. If that fails the whole leaf is
+		 * poisoned, and faults outside the range are served from the
+		 * backing memory. */
+		if (level == PG_LEVEL_2M &&
+		    ((va & PMD_MASK) < start || (va & PMD_MASK) + PMD_SIZE > end)) {
+			if (!smptrace_split_pmd((pmd_t *)ptep, va)) {
+				map->nr_split++;
+				continue;
+			}
+			pr_warn_once("cannot split huge PMD for VA=%lx, poisoning all of it", va);
 		}
 
 		orig = kzalloc(sizeof(*orig), GFP_ATOMIC);
@@ -112,10 +188,9 @@ int smptrace_arch_poison_pte(struct smptrace_map *map)
 
 		orig->size = level2size(level);
 		orig->va   = va & ~(orig->size - 1);
-		pr_debug("poisoned PTE for VA=%lx (level=%u)", va, level);
+		pr_debug("poisoned PTE for VA=%lx (level=%u)", orig->va, level);
 
-		remain -= level2size(level);
-		va     += level2size(level);
+		va = orig->va + orig->size;
 		list_add_tail(&orig->list, &map->ptes);
 	}
 

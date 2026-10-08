@@ -135,15 +135,16 @@ static pte_t *riscv_entry_at(unsigned long va, unsigned int level,
 	}
 }
 
-int smptrace_arch_poison_pte(struct smptrace_map *map)
+int smptrace_arch_poison_pte(struct smptrace_map *map, unsigned long start,
+                             unsigned long len)
 {
 	unsigned long satp = csr_read(CSR_SATP);
-	unsigned long va = map->va;
-	int64_t remain = map->len;
+	unsigned long va = max(start, smptrace_poisoned_end(map));
+	unsigned long end = start + len;
 	struct smptrace_pte *orig, *tmp;
 	int ret;
 
-	while (remain > 0) {
+	while (va < end) {
 		unsigned int level;
 		pte_t *ptep = riscv_walk_pte(va, &level, satp);
 
@@ -178,10 +179,9 @@ int smptrace_arch_poison_pte(struct smptrace_map *map)
 			break;
 		}
 
-		pr_debug("poisoned PTE for VA=%lx (level=%u)", va, level);
+		pr_debug("poisoned PTE for VA=%lx (level=%u)", orig->va, level);
 
-		remain -= riscv_level2size(level);
-		va     += riscv_level2size(level);
+		va = orig->va + orig->size;
 		list_add_tail(&orig->list, &map->ptes);
 	}
 

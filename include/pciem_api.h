@@ -289,8 +289,8 @@ struct pciem_dma_indirect
  * that took it may sleep, so it is answered only while the device model can
  * run on another CPU: on a single CPU, or from an interrupt taken on the
  * device model's own CPU, it times out. The kernel reads an MSI-X table with
- * interrupts disabled when it masks a vector, so do not set this flag on a
- * BAR that holds one.
+ * interrupts disabled when it masks a vector, so a range traced with this
+ * flag must not share a page with the MSI-X table or PBA.
  *
  * On timeout or a full ring the read returns all-1s, the value of a PCIe
  * master abort. For a destructive register, the value the device model
@@ -311,6 +311,68 @@ struct pciem_trace_bar
     uint8_t  reserved[3];
 };
 
+/**
+ * One traced part of a BAR, for PCIEM_IOCTL_TRACE_BAR_RANGES.
+ *
+ * @param offset  Start, from the start of the BAR. A multiple of the host
+ *                page size (sysconf(_SC_PAGESIZE)).
+ * @param length  Bytes. Nonzero, and a multiple of the host page size unless
+ *                the range ends at the end of the BAR.
+ */
+struct pciem_trace_range
+{
+    uint64_t offset;
+    uint64_t length;
+};
+
+#define PCIEM_TRACE_MAX_RANGES 64
+
+/**
+ * Parameters for PCIEM_IOCTL_TRACE_BAR_RANGES: trace only some parts of a BAR.
+ *
+ * Inside a range an access behaves exactly as in a BAR traced whole with
+ * PCIEM_IOCTL_TRACE_BAR and the same @flags: the device model is notified, the
+ * shadow is updated unless PCIEM_TRACE_STOP_WRITES, and PCIEM_TRACE_SYNC_READS
+ * reads are answered by the device model. Event offsets are from the start of
+ * the BAR, as always.
+ *
+ * Outside every range an access goes straight to the BAR's backing memory, as
+ * for a BAR that is not traced, and the device model sees nothing: a vfio-pci
+ * mmap() maps those pages (so memcpy() through it runs at memory speed, with
+ * no faults after the first touch of each page), read()/write() on the vfio
+ * device fd take vfio-pci's own path, and kernel ioremap() mappings are not
+ * poisoned there. Poisoning works on whole page table leaves: where a range
+ * shares a huge kernel mapping with untraced memory, x86 splits a 2 MiB leaf
+ * into 4 KiB entries, but a 1 GiB leaf, and any huge leaf on arm64 and riscv,
+ * is poisoned whole, so its untraced part still faults. Such a fault is served
+ * from the backing memory without notifying the device model, as long as the
+ * faulting instruction can be emulated.
+ *
+ * The ranges are fixed for as long as the BAR is traced: pass all of them in
+ * one call. They are sorted by the kernel; adjacent ones are merged and
+ * overlapping ones are rejected. A BAR is traced at most once, by either
+ * ioctl: a call for a BAR already traced, or being set up by a concurrent
+ * call, fails with EBUSY. With @nr_ranges 0 the whole BAR is traced, as by
+ * PCIEM_IOCTL_TRACE_BAR.
+ *
+ * @param bar_index  BAR to trace.
+ * @param flags      PCIEM_TRACE_*, as for PCIEM_IOCTL_TRACE_BAR.
+ * @param func       Function index whose BAR should be traced.
+ * @param reserved   Must be zero.
+ * @param nr_ranges  Number of entries at @ranges, at most
+ *                   PCIEM_TRACE_MAX_RANGES.
+ * @param ranges     Userspace address of an array of struct pciem_trace_range.
+ */
+struct pciem_trace_bar_ranges
+{
+    uint32_t bar_index;
+    uint32_t flags;
+    uint8_t  func;
+    uint8_t  reserved[3];
+    uint32_t nr_ranges;
+    uint64_t ranges;
+};
+
 #define PCIEM_IOCTL_MAGIC 0xAF
 
 #define PCIEM_IOCTL_CREATE_DEVICE _IOWR(PCIEM_IOCTL_MAGIC, 10, struct pciem_create_device)
@@ -328,6 +390,7 @@ struct pciem_trace_bar
 #define PCIEM_IOCTL_DMA_INDIRECT _IOWR(PCIEM_IOCTL_MAGIC, 24, struct pciem_dma_indirect)
 #define PCIEM_IOCTL_TRACE_BAR _IOWR(PCIEM_IOCTL_MAGIC, 25, struct pciem_trace_bar)
 #define PCIEM_IOCTL_START _IO(PCIEM_IOCTL_MAGIC, 26)
+#define PCIEM_IOCTL_TRACE_BAR_RANGES _IOW(PCIEM_IOCTL_MAGIC, 27, struct pciem_trace_bar_ranges)
 
 #define PCIEM_RING_SIZE 256
 #define PCIEM_MAX_IRQFDS 32

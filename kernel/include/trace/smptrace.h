@@ -30,6 +30,12 @@ struct smptrace_io {
 
 struct smptrace_ctx;
 
+/* A traced part of a tracer's range, [start, end), as offsets into it */
+struct smptrace_range {
+	u64 start;
+	u64 end;
+};
+
 typedef void (*smptrace_handler_t)(struct smptrace_ctx *ctx, struct smptrace_io *);
 
 /* User defined hooks */
@@ -68,6 +74,8 @@ struct smptrace_map {
 	resource_size_t pa;
 	/* Un-poisoned PTEs */
 	struct list_head ptes;
+	/* Huge leaves split to poison part of them, for the log */
+	unsigned int nr_split;
 	struct rcu_head rcu;
 	/* On ctx->rejected when poisoning failed */
 	struct llist_node reject;
@@ -84,6 +92,15 @@ struct smptrace_ctx {
 	unsigned long len;
 	/* Whether to emulate writes into the BAR */
 	bool stop_writes;
+	/*
+	 * The parts of [pa, pa + len) that are traced: sorted, disjoint, not
+	 * adjacent, page aligned. NULL traces all of it. Accesses elsewhere go
+	 * to the backing memory as if nothing traced it. Set with
+	 * smptrace_set_ranges() before smptrace_init(), and fixed until
+	 * smptrace_destroy(), which frees it.
+	 */
+	struct smptrace_range *ranges;
+	unsigned int nr_ranges;
 
 	/*** Do not touch below here ***/
 
@@ -128,6 +145,10 @@ struct smptrace_ctx {
 };
 
 
+int smptrace_set_ranges(struct smptrace_ctx *ctx, const struct smptrace_range *ranges,
+                        unsigned int nr);
+void smptrace_free_ranges(struct smptrace_ctx *ctx);
+bool smptrace_traced(const struct smptrace_ctx *ctx, u64 off, u64 len);
 int smptrace_init(struct smptrace_ctx *ctx);
 /* Route userspace vfio-pci accesses (mmap, read, write) of traced BARs */
 void smptrace_vfio_init(void);

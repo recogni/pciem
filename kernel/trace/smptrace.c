@@ -45,6 +45,7 @@
 #include <linux/version.h>
 #include <linux/rculist.h>
 #include <linux/wait_bit.h>
+#include <linux/sort.h>
 #include <asm/io.h>
 #include <asm/tlbflush.h>
 #include "trace/smptrace.h"
@@ -76,6 +77,84 @@ static bool __fill_io_notif(struct smptrace_io *io, const u8 *data, u32 size,
 	return true;
 }
 
+static int smptrace_range_cmp(const void *a, const void *b)
+{
+	const struct smptrace_range *x = a, *y = b;
+
+	return x->start < y->start ? -1 : x->start > y->start;
+}
+
+/*
+ * Traces only the given parts of the tracer's range, as offsets into it. Each
+ * must be page aligned (its end may instead be the end of the range) and none
+ * may overlap; adjacent ones are merged. Called before smptrace_init(). With
+ * nr == 0 the whole range is traced, as when this is never called.
+ */
+int smptrace_set_ranges(struct smptrace_ctx *ctx, const struct smptrace_range *ranges,
+                        unsigned int nr)
+{
+	struct smptrace_range *r;
+	unsigned int i, n = 0;
+
+	if (!nr)
+		return 0;
+
+	r = kmemdup(ranges, array_size(nr, sizeof(*r)), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	sort(r, nr, sizeof(*r), smptrace_range_cmp, NULL);
+
+	for (i = 0; i < nr; i++) {
+		if (r[i].start >= r[i].end || r[i].end > ctx->len ||
+		    !PAGE_ALIGNED(r[i].start) ||
+		    (!PAGE_ALIGNED(r[i].end) && r[i].end != ctx->len) ||
+		    (n && r[i].start < r[n - 1].end)) {
+			kfree(r);
+			return -EINVAL;
+		}
+		if (n && r[i].start == r[n - 1].end)
+			r[n - 1].end = r[i].end;
+		else
+			r[n++] = r[i];
+	}
+
+	ctx->ranges = r;
+	ctx->nr_ranges = n;
+	return 0;
+}
+
+/* Undoes smptrace_set_ranges() before smptrace_init(); later, destroy does it */
+void smptrace_free_ranges(struct smptrace_ctx *ctx)
+{
+	kfree(ctx->ranges);
+	ctx->ranges = NULL;
+	ctx->nr_ranges = 0;
+}
+
+/*
+ * Whether any byte of [off, off + len), offsets into the tracer's range, is
+ * traced. A binary search of an array that is fixed while the tracer is
+ * active, so it takes no lock: the caller only needs ctx to stay alive.
+ */
+bool smptrace_traced(const struct smptrace_ctx *ctx, u64 off, u64 len)
+{
+	unsigned int lo = 0, hi = ctx->nr_ranges;
+
+	if (!ctx->ranges)
+		return off < ctx->len;
+
+	/* The first range that ends after off */
+	while (lo < hi) {
+		unsigned int mid = lo + (hi - lo) / 2;
+
+		if (ctx->ranges[mid].end <= off)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo < ctx->nr_ranges && ctx->ranges[lo].start < off + len;
+}
+
 void smptrace_emulate_read(struct smptrace_ctx *ctx, struct smptrace_map *map,
                          u64 addr, u32 size, u8 *dst)
 {
@@ -93,6 +172,14 @@ void smptrace_emulate_read_may_sleep(struct smptrace_ctx *ctx, struct smptrace_m
 		pr_warn_once("read off 0x%llx size %u outside region len 0x%llx\n",
 		             off, size, (u64)ctx->len);
 		memset(dst, 0, size);
+		return;
+	}
+
+	/* Outside every traced range: the backing memory, unseen. Reached
+	 * through a huge page that a traced range shares, or by a vfio-pci
+	 * read() or write() that crosses a range's edge. */
+	if (!smptrace_traced(ctx, off, size)) {
+		memcpy_fromio(dst, ctx->shadow_va + off, size);
 		return;
 	}
 
@@ -140,6 +227,11 @@ void smptrace_emulate_write_may_sleep(struct smptrace_ctx *ctx, struct smptrace_
 		return;
 	}
 
+	if (!smptrace_traced(ctx, off, size)) {
+		memcpy_toio(ctx->shadow_va + off, src, size);
+		return;
+	}
+
 	if (!ctx->stop_writes)
 		memcpy_toio(ctx->shadow_va + off, src, size);
 
@@ -158,6 +250,35 @@ int smptrace_enter_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
+/*
+ * Poisons the pages of map that a traced range covers, one call to the arch
+ * per range. Returns how many ranges map reaches, or a negative errno.
+ */
+static int smptrace_poison_map(struct smptrace_ctx *ctx, struct smptrace_map *map)
+{
+	const struct smptrace_range whole = { 0, PAGE_ALIGN(ctx->len) };
+	const struct smptrace_range *r = ctx->ranges ?: &whole;
+	unsigned int i, nr = ctx->ranges ? ctx->nr_ranges : 1;
+	/* The pages of map, as offsets into the tracer's range */
+	u64 first = ALIGN_DOWN(map->pa, PAGE_SIZE) - ctx->pa;
+	u64 last = min_t(u64, PAGE_ALIGN(map->pa + map->len) - ctx->pa, PAGE_ALIGN(ctx->len));
+	unsigned long va = ALIGN_DOWN(map->va, PAGE_SIZE);
+	int ret, reached = 0;
+
+	for (i = 0; i < nr; i++) {
+		u64 start = max(r[i].start, first);
+		u64 end = min(PAGE_ALIGN(r[i].end), last);
+
+		if (start >= end)
+			continue;
+		ret = smptrace_arch_poison_pte(map, va + (start - first), end - start);
+		if (ret)
+			return ret;
+		reached++;
+	}
+	return reached;
+}
+
 int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct kretprobe *rp = get_kretprobe(ri);
@@ -167,6 +288,7 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	unsigned long va = regs_return_value(regs);
 	struct smptrace_map *map;
 	unsigned long flags;
+	int ret;
 
 	if (!va || args->pa < ctx->pa || args->pa >= ctx->pa + ctx->len)
 		return 0;
@@ -180,7 +302,11 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 	map->pa  = args->pa;
 	INIT_LIST_HEAD(&map->ptes);
 
-	if (smptrace_arch_poison_pte(map)) {
+	ret = smptrace_poison_map(ctx, map);
+	if (!ret) {
+		/* No traced range in it: an ordinary mapping */
+		kfree(map);
+	} else if (ret < 0) {
 		pr_warn("failed to poison VA=0x%lx:%lx (PA=0x%llx:%lx)",
 		        va, args->len, args->pa, args->len);
 
@@ -192,9 +318,9 @@ int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs)
 		schedule_work(&ctx->reject_work);
 	} else {
 		/* One line per map; the per-entry ones are pr_debug() */
-		pr_info("poisoned VA=0x%lx:%lx (PA=0x%llx:%lx): %zu entries",
-		        va, args->len, (unsigned long long)args->pa, args->len,
-		        list_count_nodes(&map->ptes));
+		pr_info("poisoned VA=0x%lx:%lx (PA=0x%llx:%lx) in %d traced range(s): %zu entries, %u huge PMD(s) split",
+		        va, args->len, (unsigned long long)args->pa, args->len, ret,
+		        list_count_nodes(&map->ptes), map->nr_split);
 		spin_lock_irqsave(&ctx->lock, flags);
 		list_add_tail_rcu(&map->list, &ctx->maps);
 		spin_unlock_irqrestore(&ctx->lock, flags);
@@ -332,6 +458,18 @@ struct smptrace_ctx *smptrace_find_ctx(phys_addr_t pa, size_t len)
 	return NULL;
 }
 
+/*
+ * Whether [pa, pa + len) is inside an active tracer's range and any byte of it
+ * is traced. Caller holds smptrace_active_srcu.
+ */
+bool smptrace_pa_traced(phys_addr_t pa, size_t len)
+{
+	struct smptrace_ctx *ctx = smptrace_find_ctx(pa, len);
+
+	return ctx && smptrace_traced(ctx, pa - ctx->pa, len);
+}
+
+/* Starts tracing. On failure the ranges smptrace_set_ranges() set are freed. */
 int smptrace_init(struct smptrace_ctx *ctx)
 {
 	int ret;
@@ -344,13 +482,15 @@ int smptrace_init(struct smptrace_ctx *ctx)
 	INIT_WORK(&ctx->reject_work, smptrace_unmap_rejected);
 
 	ctx->in_pf = alloc_percpu_gfp(bool, GFP_KERNEL_ACCOUNT);
-	if (!ctx->in_pf)
-		return -ENOMEM;
+	if (!ctx->in_pf) {
+		ret = -ENOMEM;
+		goto fail;
+	}
 
 	ret = smptrace_arch_activate(ctx);
 	if (ret) {
 		free_percpu(ctx->in_pf);
-		return ret;
+		goto fail;
 	}
 
 	spin_lock(&smptrace_active_lock);
@@ -358,6 +498,10 @@ int smptrace_init(struct smptrace_ctx *ctx)
 	spin_unlock(&smptrace_active_lock);
 
 	return 0;
+
+fail:
+	smptrace_free_ranges(ctx);
+	return ret;
 }
 
 static void smptrace_deactivate(struct smptrace_ctx *ctx)
@@ -433,4 +577,7 @@ void smptrace_destroy(struct smptrace_ctx *ctx)
 {
 	smptrace_deactivate(ctx);
 	free_percpu(ctx->in_pf);
+	/* Nothing can look at the ranges after deactivation: every probe is
+	 * unregistered and no SRCU reader can still find ctx */
+	smptrace_free_ranges(ctx);
 }
