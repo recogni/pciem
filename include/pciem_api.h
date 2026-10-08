@@ -283,11 +283,12 @@ struct pciem_dma_indirect
  * becomes the value the read returns. Required for destructive-read
  * registers (FIFO data ports).
  *
- * The read spins while it waits, because it is trapped as a kernel fault,
- * which cannot tell whether the code that took it may sleep, so it is
- * answered only while the device model can run on another CPU: on a single
- * CPU, or from an interrupt taken on the device model's own CPU, it times
- * out. The kernel reads an MSI-X table with
+ * A read that vfio-pci makes for userspace (read() or write() on the device
+ * fd, or an access through an mmap() of the BAR) sleeps while it waits. A
+ * read from kernel code spins, because a fault cannot tell whether the code
+ * that took it may sleep, so it is answered only while the device model can
+ * run on another CPU: on a single CPU, or from an interrupt taken on the
+ * device model's own CPU, it times out. The kernel reads an MSI-X table with
  * interrupts disabled when it masks a vector, so do not set this flag on a
  * BAR that holds one.
  *
