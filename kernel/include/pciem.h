@@ -162,6 +162,16 @@ struct pciem_root_complex
     unsigned int intx_pulse_active; /* pulses in the host's handler now */
     struct irq_work intx_irq_work;
 
+    /*
+     * Told of each reset of the function, with @kind
+     * PCIEM_RESET_*, once pciem_function_reset() has reset the emulated
+     * state. Called under pci_lock and cap_lock with IRQs off, so it must not
+     * sleep or take a sleeping or non-raw lock. Set and cleared under
+     * cap_lock by pciem_set_reset_notify().
+     */
+    void (*reset_notify)(void *data, u32 kind);
+    void *reset_notify_data;
+
     struct work_struct activation_work;
     bool activated;
 
@@ -171,6 +181,8 @@ struct pciem_root_complex
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector);
 struct pciem_root_complex *pciem_rc_from_pdev(struct pci_dev *pdev);
 void pciem_set_intx(struct pciem_root_complex *v, bool asserted);
+void pciem_set_reset_notify(struct pciem_root_complex *v,
+                            void (*fn)(void *data, u32 kind), void *data);
 int pciem_complete_init(struct pciem_root_complex *v);
 int pciem_start_device(struct pciem_root_complex *v);
 void pciem_set_multifunction(struct pciem_root_complex *func0,

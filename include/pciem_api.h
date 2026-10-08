@@ -92,6 +92,30 @@ struct pciem_cap_pasid_userspace
 };
 
 /**
+ * Options of a PCIEM_CAP_PCIE capability.
+ *
+ * @param flags     PCIEM_CAP_PCIE_FLAG_*. Zero gives the capability pciem
+ *                  always rendered: no Function Level Reset, so a function
+ *                  with no PM capability has no reset method at all (it sits
+ *                  alone on a root bus, so there is no bus reset either), and
+ *                  vfio-pci does not offer VFIO_DEVICE_RESET. Unknown flags
+ *                  fail with EINVAL.
+ * @param reserved  Must be zero, or PCIEM_IOCTL_ADD_CAPABILITY fails with
+ *                  EINVAL.
+ */
+struct pciem_cap_pcie_userspace
+{
+    uint8_t flags;
+    uint8_t reserved[3];
+};
+
+/*
+ * Advertise Function Level Reset (PCI_EXP_DEVCAP_FLR) and perform it when
+ * the host sets PCI_EXP_DEVCTL_BCR_FLR; see "Reset" below.
+ */
+#define PCIEM_CAP_PCIE_FLAG_FLR (1 << 0)
+
+/**
  * Parameters for PCIEM_IOCTL_ADD_CAPABILITY.
  *
  * @param func  Function index this capability belongs to (0–PCIEM_MAX_FUNCTIONS-1).
@@ -106,6 +130,7 @@ struct pciem_cap_config
         struct pciem_cap_msi_userspace msi;
         struct pciem_cap_msix_userspace msix;
         struct pciem_cap_pasid_userspace pasid;
+        struct pciem_cap_pcie_userspace pcie;
     };
 };
 
@@ -147,6 +172,76 @@ struct pciem_event
 #define PCIEM_EVENT_CONFIG_WRITE 4
 #define PCIEM_EVENT_MSI_ACK 5
 #define PCIEM_EVENT_RESET 6
+
+/*
+ * Reset.
+ *
+ * A function is reset by a Function Level Reset, if its PCIe capability has
+ * PCIEM_CAP_PCIE_FLAG_FLR (the host sets PCI_EXP_DEVCTL_BCR_FLR), or by a PM
+ * reset, if it has a PM capability (the host moves it from D3hot to D0, and
+ * PCI_PM_CTRL_NO_SOFT_RESET, which pciem never sets, is clear). Linux resets
+ * a function this way from pci_reset_function(): VFIO_DEVICE_RESET, a write
+ * to /sys/bus/pci/devices/<bdf>/reset, and vfio-pci itself each time a user
+ * opens the device and after the last user closes it. FLR comes first when
+ * the function has both. A function with a PM capability is also reset
+ * whenever it is woken from D3hot, which vfio-pci puts a device it has bound
+ * in while nobody has it open (unless loaded with disable_idle_d3=1). pciem
+ * does not model the power states otherwise: the BARs keep decoding in
+ * D3hot.
+ *
+ * Before the device model hears of it, pciem has reset what it emulates, as
+ * the reset does on hardware:
+ *
+ * - PCI_COMMAND reads 0 (no memory decode, no bus mastering, INTx enabled),
+ *   and the error bits of PCI_STATUS are clear.
+ * - The function's INTx line is deasserted, whether held by a level
+ *   interrupt or by a pulse not delivered yet. The device model has to
+ *   assert it again if it still wants to interrupt.
+ * - The BAR registers read 0 (the address bits; the size and type bits stay).
+ * - MSI: Message Control reads its read-only bits only (enable and Multiple
+ *   Message Enable clear); address, data and mask bits read 0.
+ * - MSI-X: Message Control reads the table size only (enable and function
+ *   mask clear). The table and PBA are in BAR memory, which pciem leaves
+ *   alone.
+ * - PCIe: Device Control reads 0 apart from Max_Payload_Size, which FLR
+ *   keeps. PASID Control reads 0.
+ * - Synchronous reads (PCIEM_TRACE_SYNC_READS) waiting for an answer from
+ *   the device model fail: the access returns all-ones, and an answer the
+ *   device model writes for one afterwards fails with EINVAL.
+ *
+ * Linux then restores what it saved from config space before the reset,
+ * MSI and MSI-X included, so the interrupts the host had set up keep working
+ * without the device model doing anything.
+ *
+ * The device model gets one PCIEM_EVENT_RESET per reset, with @offset the
+ * function index, @data PCIEM_RESET_FLR or PCIEM_RESET_PM, and @bar and
+ * @size 0. It has to reset its own state: registers, queues, FIFOs,
+ * anything in flight, and the BAR contents if it wants them reset (pciem
+ * does not touch BAR memory, including the MSI-X table). A reset does not
+ * stop MMIO: accesses to the BARs keep being delivered afterwards, the host
+ * restoring the MSI-X table among them.
+ *
+ * Order: the event is queued once the reset of config state above is done.
+ * It comes after the events of every access to the function made before
+ * the reset, and before those of every access made after it; an access made
+ * while the function is being reset may come on either side. Like every
+ * event, it has a larger @seq than the events ahead of it on the ring. With
+ * the ring full, pciem waits up to a second for the device model to make
+ * room; failing that, the event goes out ahead of the function's next event
+ * instead, and the kernel log says so. A synchronous read ahead of the event
+ * on the ring fails, and an answer to it fails with EINVAL, which must not be
+ * taken as an error of the device model; one after the event is answered as
+ * usual. No acknowledgement is expected.
+ *
+ * VFIO_DEVICE_RESET waits for a read or write the vfio-pci user has in
+ * progress on the device (vfio-pci takes its memory_lock for the reset), so
+ * a synchronous read made through vfio-pci is never pending when that reset
+ * happens: the reset waits for the answer, or for the read to time out.
+ */
+
+/* Kinds of reset. */
+#define PCIEM_RESET_FLR 1
+#define PCIEM_RESET_PM  2
 
 struct pciem_response
 {
@@ -468,7 +563,8 @@ struct pciem_trace_bar_ranges
  * kernel and userspace.
  *
  * The kernel writes events by advancing @tail; userspace consumes them by
- * advancing @head. Each counter is cache-line padded.
+ * advancing @head. Each counter is cache-line padded. The @seq of the
+ * events increases along the ring.
  * The ring is mapped read-only into userspace via mmap on the PCIem fd.
  *
  * @param head    Read index, owned by userspace. Incremented after each event

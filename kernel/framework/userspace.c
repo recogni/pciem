@@ -56,6 +56,26 @@ struct pciem_irqfds {
 struct pciem_tracer {
     struct pciem_userspace_state *us;
     struct smptrace_ctx ctx;
+    u8 func;
+};
+
+/*
+ * Resets of one function that the device model has not been told of yet
+ * (PCIEM_EVENT_RESET). pciem_reset_notify() counts them, from the config
+ * write that reset the function, and each one is queued on the ring by
+ * pciem_shared_ring_push(), under shared_ring_lock and before any other event
+ * of the function, or from @work, which may wait for room in a full ring.
+ */
+struct pciem_reset_state {
+    struct pciem_userspace_state *us;
+    struct work_struct work;
+    u8 func;
+    atomic_t pending[2];        /* PCIEM_RESET_FLR, PCIEM_RESET_PM */
+    /* Synchronous reads of the function with a seq below @fail_seq, that
+     * of its last reset event, are on the ring ahead of the reset, and fail
+     * once @fail_needed is seen. */
+    atomic_t fail_needed;
+    atomic64_t fail_seq;
 };
 
 struct pciem_slot_state {
@@ -92,8 +112,11 @@ struct pciem_userspace_state
      * publishing tracer->us; taken with no other lock held */
     struct mutex trace_lock;
 
-    /* Monotonic event sequence numbers; sync-read requests are matched
-     * to responses by seq, so every ring event gets a real one. */
+    struct pciem_reset_state resets[PCIEM_MAX_FUNCTIONS];
+
+    /* Event sequence numbers, given out under shared_ring_lock as each
+     * event goes on the ring, so they increase in ring order. Sync-read
+     * requests are matched to responses by seq, so every event gets one. */
     atomic64_t event_seq;
 
     struct kref refcnt;
@@ -103,6 +126,7 @@ struct pciem_pending_request
 {
     struct hlist_node node;
     uint64_t seq;
+    u8 func;
     struct completion done;
     uint64_t response_data;
     int response_status;
@@ -128,6 +152,7 @@ static bool fd_empty(struct fd fd)
 #endif
 
 static int pciem_device_release(struct inode *inode, struct file *file);
+static void pciem_reset_work(struct work_struct *work);
 static ssize_t pciem_device_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos);
 static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static int pciem_device_mmap(struct file *file, struct vm_area_struct *vma);
@@ -372,6 +397,14 @@ struct pciem_userspace_state *pciem_userspace_create(void)
     spin_lock_init(&us->eventfd_lock);
     mutex_init(&us->trace_lock);
 
+    for (i = 0; i < PCIEM_MAX_FUNCTIONS; i++) {
+        struct pciem_reset_state *rs = &us->resets[i];
+
+        rs->us = us;
+        rs->func = i;
+        INIT_WORK(&rs->work, pciem_reset_work);
+    }
+
 
     return us;
 }
@@ -400,6 +433,15 @@ static void pciem_userspace_destroy(struct kref *refcnt)
         }
     }
     spin_unlock_irqrestore(&us->pending_lock, flags);
+
+    /* No reset may queue work, nor the work touch the ring, from here on.
+     * The device stays until its root complex is freed, below, and resets
+     * of it until then are not reported. */
+    for (f = 0; f < PCIEM_MAX_FUNCTIONS; f++)
+        if (us->slot.funcs[f])
+            pciem_set_reset_notify(us->slot.funcs[f], NULL, NULL);
+    for (f = 0; f < PCIEM_MAX_FUNCTIONS; f++)
+        cancel_work_sync(&us->resets[f].work);
 
     pciem_tracing_destroy(us);
     mutex_destroy(&us->trace_lock);
@@ -430,24 +472,99 @@ static int pciem_instance_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-static bool pciem_shared_ring_push(struct pciem_userspace_state *us,
-                                   struct pciem_event *event)
+/* Caller holds shared_ring_lock. */
+static bool pciem_shared_ring_has_room(struct pciem_userspace_state *us)
 {
-    int tail, next_tail, head;
+    int tail = atomic_read(&us->shared_ring->tail);
+
+    lockdep_assert_held(&us->shared_ring_lock);
+
+    return (tail + 1) % PCIEM_RING_SIZE != atomic_read(&us->shared_ring->head);
+}
+
+/* Caller holds shared_ring_lock. Gives @event the next seq and the current
+ * time and puts it on the ring, or returns false, leaving @event alone, if
+ * the ring is full. */
+static bool pciem_shared_ring_put(struct pciem_userspace_state *us,
+                                  struct pciem_event *event)
+{
+    int tail = atomic_read(&us->shared_ring->tail);
+
+    if (!pciem_shared_ring_has_room(us))
+        return false;
+
+    event->seq = atomic64_inc_return(&us->event_seq);
+    event->timestamp = ktime_get_ns();
+    memcpy(&us->shared_ring->events[tail], event, sizeof(*event));
+    atomic_set_release(&us->shared_ring->tail, (tail + 1) % PCIEM_RING_SIZE);
+
+    return true;
+}
+
+/* Queues a PCIEM_EVENT_RESET for each reset of @rs's function not reported
+ * yet. Caller holds shared_ring_lock. False if the ring fills up first. */
+static bool pciem_shared_ring_put_resets(struct pciem_userspace_state *us,
+                                         struct pciem_reset_state *rs)
+{
+    static const u32 kinds[] = { PCIEM_RESET_FLR, PCIEM_RESET_PM };
+    int k;
+
+    for (k = 0; k < ARRAY_SIZE(kinds); k++) {
+        while (atomic_read(&rs->pending[k]) > 0) {
+            struct pciem_event ev = {
+                .type = PCIEM_EVENT_RESET,
+                .offset = rs->func,
+                .data = kinds[k],
+            };
+
+            if (!pciem_shared_ring_put(us, &ev))
+                return false;
+            atomic_dec(&rs->pending[k]);
+            atomic64_set(&rs->fail_seq, ev.seq);
+            atomic_set_release(&rs->fail_needed, 1);
+        }
+    }
+
+    return true;
+}
+
+/*
+ * Queues @event, if there is one, for function @func, or for none if @func
+ * is negative. The function's unreported resets go first, in the same
+ * critical section, and @event gets its seq only as it goes on the ring, so
+ * the device model hears of a reset before any access queued after it, and
+ * seq order is ring order. @req, if not NULL, is the synchronous read @event
+ * asks for: it is published under @event's seq, holding pending_lock from
+ * before the event goes on the ring, so the answer always finds it.
+ *
+ * -ENOSPC if the ring is full, with @req not published; -ENODEV if @req
+ * cannot be, the device going away.
+ */
+static int pciem_shared_ring_push(struct pciem_userspace_state *us,
+                                  struct pciem_event *event,
+                                  struct pciem_pending_request *req, int func)
+{
+    int hash;
 
     guard(spinlock_irqsave)(&us->shared_ring_lock);
 
-    tail = atomic_read(&us->shared_ring->tail);
-    next_tail = (tail + 1) % PCIEM_RING_SIZE;
-    head = atomic_read(&us->shared_ring->head);
+    if (func >= 0 && !pciem_shared_ring_put_resets(us, &us->resets[func]))
+        return -ENOSPC;
+    if (!event)
+        return 0;
+    if (!req)
+        return pciem_shared_ring_put(us, event) ? 0 : -ENOSPC;
+    if (!pciem_shared_ring_has_room(us))
+        return -ENOSPC;
 
-    if (next_tail == head)
-        return false;
-
-    memcpy(&us->shared_ring->events[tail], event, sizeof(*event));
-    atomic_set_release(&us->shared_ring->tail, next_tail);
-
-    return true;
+    guard(spinlock)(&us->pending_lock);
+    if (us->closing)
+        return -ENODEV;
+    pciem_shared_ring_put(us, event);
+    req->seq = event->seq;
+    hash = (int)(req->seq % ARRAY_SIZE(us->pending_requests));
+    hlist_add_head(&req->node, &us->pending_requests[hash]);
+    return 0;
 }
 
 static void pciem_eventfd_signal(struct pciem_userspace_state *us)
@@ -476,37 +593,107 @@ static void pciem_userspace_kick(struct pciem_userspace_state *us)
 #define PCIEM_RING_WAIT_MS 1000
 
 /*
- * Queues @event for userspace. A full ring means the device model is behind:
- * a caller that may sleep kicks it and waits for room, so its access is not
- * lost; any other caller, or one that waits past PCIEM_RING_WAIT_MS, drops it.
+ * Fails the synchronous reads of @rs's function that are on the ring ahead
+ * of its last reset event, once that is queued. Each is unpublished before
+ * it completes, so a late answer finds nothing and pciem_device_write()
+ * refuses it.
  */
-static void pciem_userspace_queue_event(struct pciem_userspace_state *us,
-                                        struct pciem_event *event, bool may_sleep)
+static void pciem_reset_fail_reads(struct pciem_userspace_state *us,
+                                   struct pciem_reset_state *rs)
+{
+    struct pciem_pending_request *req;
+    struct hlist_node *tmp;
+    u64 seq;
+    int i;
+
+    if (!atomic_xchg(&rs->fail_needed, 0))
+        return;
+    seq = atomic64_read(&rs->fail_seq);
+
+    guard(spinlock_irqsave)(&us->pending_lock);
+    for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++) {
+        hlist_for_each_entry_safe(req, tmp, &us->pending_requests[i], node) {
+            if (req->func != rs->func || req->seq > seq)
+                continue;
+            hlist_del_init(&req->node);
+            req->response_status = -ECONNRESET;
+            complete(&req->done);
+        }
+    }
+}
+
+/*
+ * Queues @event (if not NULL) for userspace, as an event of function @func
+ * (or of none, if negative), after the function's unreported resets, and
+ * publishes @req with it (see pciem_shared_ring_push()). A full ring means
+ * the device model is behind: a caller that may sleep kicks it and waits for
+ * room, so its access is not lost; any other caller, or one that waits past
+ * PCIEM_RING_WAIT_MS, drops the event. Resets that do not fit stay counted
+ * and go out ahead of the function's next event.
+ *
+ * 0 once queued, -ENOSPC if dropped, -ENODEV if the device is going away.
+ */
+static int pciem_userspace_queue_event(struct pciem_userspace_state *us,
+                                       struct pciem_event *event,
+                                       struct pciem_pending_request *req,
+                                       bool may_sleep, int func)
 {
     unsigned long deadline;
-    bool pushed;
+    int ret;
 
-    if (!us || !event)
-        return;
+    if (!us)
+        return -ENODEV;
 
-    event->timestamp = ktime_get_ns();
-    if (!event->seq)
-        event->seq = atomic64_inc_return(&us->event_seq);
-
-    pushed = pciem_shared_ring_push(us, event);
-    if (!pushed && may_sleep) {
+    ret = pciem_shared_ring_push(us, event, req, func);
+    if (func >= 0)
+        pciem_reset_fail_reads(us, &us->resets[func]);
+    if (ret == -ENOSPC && may_sleep) {
         deadline = jiffies + msecs_to_jiffies(PCIEM_RING_WAIT_MS);
         do {
             pciem_userspace_kick(us);
             usleep_range(10, 50);
-            pushed = pciem_shared_ring_push(us, event);
-        } while (!pushed && !READ_ONCE(us->closing) && time_before(jiffies, deadline));
+            ret = pciem_shared_ring_push(us, event, req, func);
+            if (func >= 0)
+                pciem_reset_fail_reads(us, &us->resets[func]);
+        } while (ret == -ENOSPC && !READ_ONCE(us->closing) &&
+                 time_before(jiffies, deadline));
     }
-    if (!pushed)
-        pr_warn_ratelimited("Shared ring buffer full, dropping event for userspace (seq=%llu)\n",
-                            event->seq);
+    if (ret == -ENOSPC && event)
+        pr_warn_ratelimited("Shared ring buffer full, dropping func%d event type %u for userspace (bar=%u off=0x%llx)\n",
+                            func, event->type, event->bar,
+                            (unsigned long long)event->offset);
+    else if (ret == -ENOSPC)
+        pr_warn_ratelimited("Shared ring buffer full, func%d reset event delayed until its next event\n",
+                            func);
 
     pciem_userspace_kick(us);
+    return ret;
+}
+
+/*
+ * The reset notifier of every function (pciem_set_reset_notify()), called
+ * from the config write that reset it, under pci_lock and the function's
+ * cap_lock with IRQs off: count the reset, and leave the rest to
+ * pciem_reset_work().
+ */
+static void pciem_reset_notify(void *data, u32 kind)
+{
+    struct pciem_reset_state *rs = data;
+
+    if (WARN_ON_ONCE(kind != PCIEM_RESET_FLR && kind != PCIEM_RESET_PM))
+        return;
+
+    atomic_inc(&rs->pending[kind - 1]);
+    queue_work(system_wq, &rs->work);
+}
+
+/* Queues the reset's event, waiting for room in the ring if need be, and
+ * fails the reads ahead of it. */
+static void pciem_reset_work(struct work_struct *work)
+{
+    struct pciem_reset_state *rs = container_of(work, struct pciem_reset_state, work);
+
+    pciem_userspace_queue_event(rs->us, NULL, NULL, true, rs->func);
 }
 
 static int pciem_check_unregistered(struct pciem_userspace_state *us)
@@ -684,6 +871,8 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
     v->bus_mode = mode;
     pciem_init_cap_manager(v);
 
+    pciem_set_reset_notify(v, pciem_reset_notify, &us->resets[func]);
+
     spin_lock_irqsave(&us->slot.slot_lock, flags);
     us->slot.funcs[func] = v;
     us->slot.num_funcs++;
@@ -793,6 +982,11 @@ static long pciem_ioctl_add_capability(struct pciem_userspace_state *us, struct 
 
     case PCIEM_CAP_PCIE: {
         struct pciem_cap_pcie_config pcie = {0};
+
+        if ((cfg.pcie.flags & ~PCIEM_CAP_PCIE_FLAG_FLR) ||
+            memchr_inv(cfg.pcie.reserved, 0, sizeof(cfg.pcie.reserved)))
+            return -EINVAL;
+        pcie.flr = cfg.pcie.flags & PCIEM_CAP_PCIE_FLAG_FLR;
         ret = pciem_add_cap_pcie(v, &pcie);
         break;
     }
@@ -1529,7 +1723,7 @@ static void pciem_notif_trace(struct smptrace_ctx *ctx, struct smptrace_io *io,
     default:
         BUG();
     }
-    pciem_userspace_queue_event(tracer->us, &ev, io->may_sleep);
+    pciem_userspace_queue_event(tracer->us, &ev, NULL, io->may_sleep, tracer->func);
 }
 
 static void pciem_notif_write(struct smptrace_ctx *ctx, struct smptrace_io *io)
@@ -1553,9 +1747,10 @@ static void pciem_notif_read(struct smptrace_ctx *ctx, struct smptrace_io *io)
  * the device model, and for a destructive register that loses the value.
  *
  * Returns 0 with io->data holding the value on success; -ETIMEDOUT if
- * the daemon never answered. The caller (smptrace_emulate_read) treats
- * a nonzero return as a failed transaction and returns the standard
- * PCIe master-abort sentinel (all-1s).
+ * the daemon never answered, -ECONNRESET if a reset cancelled the read,
+ * -ENOSPC if the ring stayed full, -ENODEV if the device is going away.
+ * The caller (smptrace_emulate_read) treats a nonzero return as a failed
+ * transaction and returns the standard PCIe master-abort sentinel (all-1s).
  */
 #define PCIEM_SYNC_READ_TIMEOUT_MS 100
 #define PCIEM_SYNC_READ_SLEEP_TIMEOUT_MS 10000
@@ -1568,33 +1763,23 @@ static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *i
     struct pciem_event ev = {0};
     unsigned long deadline = jiffies + msecs_to_jiffies(PCIEM_SYNC_READ_TIMEOUT_MS);
     unsigned long flags;
-    int hash;
     bool answered = false;
+    int ret;
 
     ev.type = PCIEM_EVENT_MMIO_READ;
     ev.bar = ctx->opaque;
     ev.offset = io->offset;
     ev.size = io->size;
-    ev.seq = atomic64_inc_return(&us->event_seq);
 
-    req.seq = ev.seq;
+    req.func = tracer->func;
     req.response_data = 0;
     req.response_status = -ETIMEDOUT;
     init_completion(&req.done);
 
-    hash = (int)(req.seq % ARRAY_SIZE(us->pending_requests));
-
-    /* Publish the request before the event so the response always
-     * finds it. */
-    spin_lock_irqsave(&us->pending_lock, flags);
-    if (us->closing) {
-        spin_unlock_irqrestore(&us->pending_lock, flags);
-        return -ENODEV;
-    }
-    hlist_add_head(&req.node, &us->pending_requests[hash]);
-    spin_unlock_irqrestore(&us->pending_lock, flags);
-
-    pciem_userspace_queue_event(us, &ev, io->may_sleep);
+    /* Publishes the request along with the event, under its seq. */
+    ret = pciem_userspace_queue_event(us, &ev, &req, io->may_sleep, tracer->func);
+    if (ret)
+        return ret;
 
     if (io->may_sleep) {
         /* A successful wait consumes the completion, so completion_done()
@@ -1610,12 +1795,19 @@ static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *i
     }
 
     /* Unpublish under the lock; the responder also runs under it, so
-     * after this either the completion fired or it never will. */
+     * after this either the completion fired or it never will. A reset may
+     * have unpublished it already. */
     spin_lock_irqsave(&us->pending_lock, flags);
-    hlist_del(&req.node);
+    hlist_del_init(&req.node);
     answered = answered || completion_done(&req.done);
     spin_unlock_irqrestore(&us->pending_lock, flags);
 
+    if (answered && req.response_status == -ECONNRESET) {
+        pr_info_ratelimited("sync read cancelled by a reset of func%u (bar=%llu off=0x%llx seq=%llu)\n",
+                            tracer->func, (unsigned long long)ev.bar,
+                            (unsigned long long)ev.offset, (unsigned long long)ev.seq);
+        return -ECONNRESET;
+    }
     if (!answered || req.response_status) {
         pr_warn_ratelimited("sync read timed out/failed (bar=%llu off=0x%llx seq=%llu status=%d)\n",
                             (unsigned long long)ev.bar,
@@ -1704,6 +1896,7 @@ static int pciem_trace_bar(struct pciem_userspace_state *us, u32 bar_index, u32 
         len = bar->size;
 
         memset(tracer, 0, sizeof(*tracer));
+        tracer->func = func;
         tracer->ctx.opaque = bar_index;
         tracer->ctx.pa = pa;
         tracer->ctx.len = len;
