@@ -98,6 +98,45 @@ static unsigned long arm64_level2size(unsigned int level)
 }
 
 /*
+ * The entry at @level that maps va, whether valid or not, or NULL when a table
+ * above it is missing. Unlike arm64_walk_pte() it finds a leaf that has been
+ * poisoned, which is invalid.
+ */
+static pte_t *arm64_entry_at(unsigned long va, unsigned int level)
+{
+	pgd_t *pgdp, pgd;
+	p4d_t *p4dp, p4d;
+	pud_t *pudp, pud;
+	pmd_t *pmdp, pmd;
+
+	pgdp = pgd_offset_pgd(arm64_kernel_pgd(), va);
+	pgd  = READ_ONCE(*pgdp);
+	if (pgd_none(pgd) || pgd_bad(pgd))
+		return NULL;
+
+	p4dp = p4d_offset(pgdp, va);
+	p4d  = READ_ONCE(*p4dp);
+	if (p4d_none(p4d) || p4d_bad(p4d))
+		return NULL;
+
+	pudp = pud_offset(p4dp, va);
+	if (level == SMPTRACE_ARM64_LEVEL_PUD)
+		return (pte_t *)pudp;
+	pud = READ_ONCE(*pudp);
+	if (pud_none(pud) || pud_sect(pud) || pud_bad(pud))
+		return NULL;
+
+	pmdp = pmd_offset(pudp, va);
+	if (level == SMPTRACE_ARM64_LEVEL_PMD)
+		return (pte_t *)pmdp;
+	pmd = READ_ONCE(*pmdp);
+	if (pmd_none(pmd) || pmd_sect(pmd) || pmd_bad(pmd))
+		return NULL;
+
+	return pte_offset_kernel(pmdp, va);
+}
+
+/*
  * Poison the PTEs corresponding to the given VA range, saving the original
  * PTE values in the context struct so we can restore them later.
  * 
@@ -127,7 +166,8 @@ int smptrace_arch_poison_pte(struct smptrace_map *map)
 		}
 
 		INIT_LIST_HEAD(&orig->list);
-		orig->va    = va;
+		orig->size  = arm64_level2size(level);
+		orig->va    = va & ~(orig->size - 1);
 		orig->level = level;
 
 		switch (level) {
@@ -145,7 +185,7 @@ int smptrace_arch_poison_pte(struct smptrace_map *map)
 			break;
 		}
 
-		pr_info("poisoned PTE for VA=%lx (level=%u)", va, level);
+		pr_debug("poisoned PTE for VA=%lx (level=%u)", va, level);
 
 		remain -= arm64_level2size(level);
 		va     += arm64_level2size(level);
@@ -165,42 +205,26 @@ fail:
 }
 
 /*
- * Restore the PTEs corresponding to the given VA range.
+ * Puts back every entry smptrace_arch_poison_pte() saved, at the level it saved
+ * it. Entries that were never poisoned are not touched.
  */
 void smptrace_arch_restore_pte(struct smptrace_map *map)
 {
-	unsigned long va = map->va;
-	int64_t remain = map->len;
+	struct smptrace_pte *orig, *tmp;
 
-	while (remain > 0) {
-		unsigned int level;
-		pte_t *ptep = arm64_walk_pte(va, &level);
-		struct smptrace_pte *orig;
-		unsigned long step;
-
-		if (!ptep) {
-			remain -= PAGE_SIZE;
-			va     += PAGE_SIZE;
-			continue;
-		}
-
-		step = arm64_level2size(level);
-
-		orig = smptrace_find_pte(map, va);
-		if (!orig) {
-			pr_err("could not find saved PTE for va=0x%lx\n", va);
-			remain -= step;
-			va     += step;
-			continue;
-		}
+	list_for_each_entry_safe(orig, tmp, &map->ptes, list) {
+		pte_t *ptep = arm64_entry_at(orig->va, orig->level);
 
 		list_del(&orig->list);
 
-		if (orig->level != level)
-			pr_warn("PTE level mismatch for va=0x%lx (saved=%u walk=%u)",
-			        va, orig->level, level);
+		if (!ptep) {
+			pr_err("cannot restore PTE for va=0x%lx (level=%u)\n",
+			       orig->va, orig->level);
+			kfree(orig);
+			continue;
+		}
 
-		switch (level) {
+		switch (orig->level) {
 		case SMPTRACE_ARM64_LEVEL_PTE:
 			WRITE_ONCE(*ptep, __pte(orig->pte));
 			break;
@@ -212,10 +236,7 @@ void smptrace_arch_restore_pte(struct smptrace_map *map)
 			break;
 		}
 
-		pr_info("restored PTE for VA=%lx (level=%u)", va, level);
-
-		remain -= step;
-		va     += step;
+		pr_debug("restored PTE for VA=%lx (level=%u)", orig->va, orig->level);
 		kfree(orig);
 	}
 
@@ -372,8 +393,13 @@ static int emulate_arm64_fault(struct smptrace_ctx *ctx,
 		sse      = ls.sign_extend;
 		sf       = ls.sf;
 
-		if ((ls.pre_index || ls.post_index) && ls.rn != 31)
-			regs->regs[ls.rn] += ls.wb_delta;
+		/* As a base register, 31 is SP rather than XZR. */
+		if (ls.pre_index || ls.post_index) {
+			if (ls.rn == 31)
+				regs->sp += ls.wb_delta;
+			else
+				regs->regs[ls.rn] += ls.wb_delta;
+		}
 	}
 
 	if (is_store) {
