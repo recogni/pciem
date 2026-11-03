@@ -81,5 +81,8 @@ bool pciem_handle_cap_read(struct pciem_root_complex *v, int where, int size, u3
 bool pciem_handle_cap_write(struct pciem_root_complex *v, int where, int size, u32 value,
                             u32 *reset);
 void pciem_cap_reset(struct pciem_root_complex *v);
+bool pciem_cap_present(struct pciem_root_complex *v, u32 type);
+int pciem_cap_pcie_set_link(struct pciem_root_complex *v, u8 speed, u8 width);
+int pciem_cap_pcie_get_link(struct pciem_root_complex *v, u8 *speed, u8 *width);
 
 #endif /* PCIEM_CAPABILITIES_H */

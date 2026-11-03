@@ -92,6 +92,7 @@ struct smptrace_ctx {
 	unsigned long len;
 	/* Whether to emulate writes into the BAR */
 	bool stop_writes;
+	bool link_down;
 	/*
 	 * The parts of [pa, pa + len) that are traced: sorted, disjoint, not
 	 * adjacent, page aligned. NULL traces all of it. Accesses elsewhere go

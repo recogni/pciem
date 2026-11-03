@@ -270,6 +270,25 @@ void pciem_set_reset_notify(struct pciem_root_complex *v,
 }
 EXPORT_SYMBOL(pciem_set_reset_notify);
 
+static void pciem_function_reset_state(struct pciem_root_complex *v)
+{
+    int i;
+
+    scoped_guard(raw_spinlock_irqsave, &v->intx_lock) {
+        v->cfg[PCI_COMMAND] = 0;
+        v->cfg[PCI_COMMAND + 1] = 0;
+        v->cfg[PCI_STATUS] &= ~(PCIEM_STATUS_W1C & 0xff);
+        v->cfg[PCI_STATUS + 1] &= ~(PCIEM_STATUS_W1C >> 8);
+        WRITE_ONCE(v->intx_level, false);
+        v->intx_pulse_pending = false;
+    }
+
+    for (i = 0; i < PCI_STD_NUM_BARS; i++)
+        v->bars[i].base_addr_val = 0;
+
+    pciem_cap_reset(v);
+}
+
 /*
  * Resets the function as the host sees it, for an FLR or a PM reset
  * (@kind): PCI_COMMAND (memory decode, bus mastering, INTX_DISABLE: all of
@@ -285,29 +304,53 @@ EXPORT_SYMBOL(pciem_set_reset_notify);
  */
 static void pciem_function_reset(struct pciem_root_complex *v, u32 kind)
 {
-    int i;
-
     pr_info("func%u: %s reset\n", v->func_index,
             kind == PCIEM_RESET_FLR ? "function level" : "PM");
 
-    scoped_guard(raw_spinlock_irqsave, &v->intx_lock) {
-        v->cfg[PCI_COMMAND] = 0;
-        v->cfg[PCI_COMMAND + 1] = 0;
-        v->cfg[PCI_STATUS] &= ~(PCIEM_STATUS_W1C & 0xff);
-        v->cfg[PCI_STATUS + 1] &= ~(PCIEM_STATUS_W1C >> 8);
-        WRITE_ONCE(v->intx_level, false);
-        v->intx_pulse_pending = false;
-    }
-
-    for (i = 0; i < PCI_STD_NUM_BARS; i++)
-        v->bars[i].base_addr_val = 0;
-
-    pciem_cap_reset(v);
+    pciem_function_reset_state(v);
 
     guard(raw_spinlock_irqsave)(&v->cap_lock);
     if (v->reset_notify)
         v->reset_notify(v->reset_notify_data, kind);
 }
+
+static void pciem_config_access_drain(struct pciem_root_complex *v)
+{
+    struct pci_dev *pdev = v->pciem_pdev;
+    u32 val;
+
+    if (pdev)
+        pci_bus_read_config_dword(pdev->bus, pdev->devfn, PCI_VENDOR_ID, &val);
+}
+
+void pciem_link_down(struct pciem_root_complex *v)
+{
+    WRITE_ONCE(v->link_down, true);
+    pciem_config_access_drain(v);
+    pr_info("func%u: link down\n", v->func_index);
+}
+EXPORT_SYMBOL(pciem_link_down);
+
+static const char *const pciem_link_speed_names[] = {
+    "unknown", "2.5GT/s", "5GT/s", "8GT/s", "16GT/s", "32GT/s", "64GT/s",
+};
+
+int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width)
+{
+    int ret;
+
+    ret = pciem_cap_pcie_set_link(v, speed, width);
+    if (ret)
+        return ret;
+
+    pciem_function_reset_state(v);
+    smp_store_release(&v->link_down, false);
+    pr_info("func%u: link up, %s x%u\n", v->func_index,
+            speed < ARRAY_SIZE(pciem_link_speed_names) ? pciem_link_speed_names[speed] : "unknown",
+            width);
+    return 0;
+}
+EXPORT_SYMBOL(pciem_link_up);
 
 int pciem_register_bar(struct pciem_root_complex *v, u32 bar_num, resource_size_t size, u32 flags)
 {
@@ -609,6 +652,10 @@ static int pciem_conf_read_impl(struct pciem_root_complex *v, int where, int siz
         *value = ~0U;
         return PCIBIOS_DEVICE_NOT_FOUND;
     }
+    if (smp_load_acquire(&v->link_down)) {
+        *value = ~0U;
+        return PCIBIOS_SUCCESSFUL;
+    }
 
     if (where >= PCI_CFG_SPACE_SIZE)
     {
@@ -736,6 +783,8 @@ static int pciem_conf_write_impl(struct pciem_root_complex *v, int where, int si
     if (unlikely(v->detaching)) {
         return PCIBIOS_SUCCESSFUL;
     }
+    if (smp_load_acquire(&v->link_down))
+        return PCIBIOS_SUCCESSFUL;
 
     if (where >= PCI_CFG_SPACE_SIZE)
     {
