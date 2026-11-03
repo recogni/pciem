@@ -1012,9 +1012,15 @@ EXPORT_SYMBOL(pciem_set_multifunction);
 static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
                                         struct list_head *resources)
 {
+    bool fixed = v->mode_state.virtual_root.fixed;
     int rc, busnr = 1, domain = 0;
     struct pci_host_bridge *bridge;
     struct pciem_host_bridge_priv *priv;
+
+    if (fixed) {
+        domain = v->mode_state.virtual_root.assigned_domain;
+        busnr = v->mode_state.virtual_root.assigned_busnr;
+    }
 
     bridge = pci_alloc_host_bridge(sizeof(*priv));
     if (!bridge)
@@ -1081,13 +1087,16 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     pci_lock_rescan_remove();
     while (pci_find_bus(domain, busnr)) {
         busnr++;
-        if (busnr > 255) {
+        if (fixed || busnr > 255) {
             pci_unlock_rescan_remove();
-            pr_err("init: No free bus number available\n");
+            if (fixed)
+                pr_err("init: Bus %04x:%02x is taken\n", domain, busnr - 1);
+            else
+                pr_err("init: No free bus number available\n");
             dev_set_msi_domain(&bridge->dev, NULL);
             pciem_iommu_stub_unregister_bridge(&bridge->dev);
             pci_free_host_bridge(bridge);
-            return -EBUSY;
+            return fixed ? -EEXIST : -EBUSY;
         }
     }
     bridge->busnr = busnr;
