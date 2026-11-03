@@ -10,6 +10,8 @@ VENDOR=0x1ab8
 DEV0=0xd120
 DEV1=0xd121
 HELPER_PID=
+# A hex PCI domain: put the two devices at FIXED_DOMAIN:00 and FIXED_DOMAIN:01.
+FIXED_DOMAIN="${FIXED_DOMAIN:-}"
 
 die() {
 	echo "FATAL: $*" >&2
@@ -50,7 +52,7 @@ trap cleanup EXIT INT TERM
 
 rmmod pciem 2>/dev/null || true
 insmod "$PCIEM_KO"
-"$HELPER" &
+"$HELPER" ${FIXED_DOMAIN:+"$FIXED_DOMAIN"} &
 HELPER_PID=$!
 
 sleep 2
@@ -63,5 +65,14 @@ echo "virtual-root device count for $VENDOR:$DEV1 -> $count1"
 
 [ "$count0" -eq 1 ] || die "expected exactly one $VENDOR:$DEV0 device"
 [ "$count1" -eq 1 ] || die "expected exactly one $VENDOR:$DEV1 device"
+
+if [ -n "$FIXED_DOMAIN" ]; then
+	d=$(printf '%04x' "0x$FIXED_DOMAIN")
+	[ "$(cat "/sys/bus/pci/devices/$d:00:00.0/device")" = "$DEV0" ] ||
+		die "$VENDOR:$DEV0 is not at $d:00:00.0"
+	[ "$(cat "/sys/bus/pci/devices/$d:01:00.0/device")" = "$DEV1" ] ||
+		die "$VENDOR:$DEV1 is not at $d:01:00.0"
+	echo "fixed addresses: $d:00:00.0 and $d:01:00.0"
+fi
 
 echo "RESULT: PASS"

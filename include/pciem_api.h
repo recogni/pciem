@@ -27,6 +27,13 @@ typedef atomic_int atomic_t;
 #define PCIEM_CREATE_FLAG_BUS_MODE_ATTACH   0x00000001
 
 /**
+ * Virtual-root mode only: put the device at @domain:@bus:00, the same address on
+ * every host, instead of at the first free bus in domain 0. REGISTER fails with
+ * -EEXIST if that bus is already taken.
+ */
+#define PCIEM_CREATE_FLAG_FIXED_ADDRESS     0x00000004
+
+/**
  * Parameters for PCIEM_IOCTL_CREATE_DEVICE.
  *
  * @param flags     Bus-mode flags (PCIEM_CREATE_FLAG_BUS_MODE_*).
@@ -34,13 +41,15 @@ typedef atomic_int atomic_t;
  *                  Must be 0 for the first function on a slot.
  *                  Functions 1–7 must be created after func 0.
  *                  For single-function devices, leave at 0 (zero-init is fine).
- * @param reserved  Must be zero.
+ * @param bus       With PCIEM_CREATE_FLAG_FIXED_ADDRESS: the root bus number.
+ * @param domain    With PCIEM_CREATE_FLAG_FIXED_ADDRESS: the PCI domain.
  */
 struct pciem_create_device
 {
     uint32_t flags;
     uint8_t  func;
-    uint8_t  reserved[3];
+    uint8_t  bus;
+    uint16_t domain;
 };
 
 /**

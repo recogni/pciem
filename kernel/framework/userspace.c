@@ -826,6 +826,10 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
     func = cfg.func;
     if (func >= PCIEM_MAX_FUNCTIONS)
         return -EINVAL;
+    if ((cfg.flags & PCIEM_CREATE_FLAG_FIXED_ADDRESS) &&
+        (func != 0 || (cfg.flags & PCIEM_CREATE_FLAG_BUS_MODE_MASK) !=
+                          PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL))
+        return -EINVAL;
 
     spin_lock_irqsave(&us->slot.slot_lock, flags);
 
@@ -864,6 +868,11 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
             break;
         }
         us->slot.bus_mode = mode;
+        if (cfg.flags & PCIEM_CREATE_FLAG_FIXED_ADDRESS) {
+            v->mode_state.virtual_root.fixed = true;
+            v->mode_state.virtual_root.assigned_domain = cfg.domain;
+            v->mode_state.virtual_root.assigned_busnr = cfg.bus;
+        }
     } else {
         mode = us->slot.bus_mode;
     }

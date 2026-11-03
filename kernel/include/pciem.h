@@ -121,6 +121,8 @@ struct pciem_root_complex
             struct pci_host_bridge *bridge;
             int assigned_domain;
             int assigned_busnr;
+            /* Set before REGISTER: take assigned_domain:assigned_busnr. */
+            bool fixed;
         } virtual_root;
 
         struct pciem_hijack_state hijack;
