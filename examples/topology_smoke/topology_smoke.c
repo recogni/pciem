@@ -34,6 +34,7 @@ static struct pciem_shared_ring *ring;
 static int failures;
 static int eq_mode;
 static int placement;
+static uint32_t topo_flags;
 
 static char chain[MAX_CHAIN][16];
 static int depth;
@@ -401,7 +402,10 @@ static void create_device(void)
 	struct pciem_create_device create = {
 		.flags = PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL | PCIEM_CREATE_FLAG_PLACEMENT(placement),
 	};
-	struct pciem_topology topo = { .eq_fail_above = eq_mode ? PCIEM_LINK_SPEED_5GT : 0 };
+	struct pciem_topology topo = {
+		.flags = topo_flags,
+		.eq_fail_above = eq_mode ? PCIEM_LINK_SPEED_5GT : 0,
+	};
 	struct pciem_bar_config bar0 = {
 		.bar_index = 0, .flags = PCI_BASE_ADDRESS_MEM_TYPE_64 | PCI_BASE_ADDRESS_MEM_PREFETCH,
 		.size = BAR0_SIZE,
@@ -544,7 +548,8 @@ static void step_enumerate(void)
 	report(wait_service(chain[0], "pcie001", 3000), "RP %s has the PME service", chain[0]);
 	report(wait_service(chain[0], "pcie010", 3000), "RP %s has the bandwidth controller service",
 	       chain[0]);
-	report(!service_present(chain[0], "pcie002"), "RP %s has no AER service", chain[0]);
+	if (!(topo_flags & PCIEM_TOPO_FLAG_NATIVE_AER))
+		report(!service_present(chain[0], "pcie002"), "RP %s has no AER service", chain[0]);
 	if (placement == PCIEM_PLACEMENT_SWITCH) {
 		report(!service_present(chain[1], "pcie001") && !service_present(chain[1], "pcie010"),
 		       "USP %s binds with no services", chain[1]);
@@ -631,6 +636,37 @@ static void step_down_up(void)
 	cfg_read(ep_bdf, PCI_BASE_ADDRESS_0, 4, &bar0);
 	cfg_read(ep_bdf, PCI_BASE_ADDRESS_1, 4, &bar1);
 	report(bar1 == 0 && (bar0 & ~0xfu) == 0, "EP BARs read 0x%08x%08x after the link came back", bar1, bar0);
+	restore_ep_cfg();
+}
+
+static void step_rrs(void)
+{
+	uint32_t v = 0;
+	long t0, t_id = 0;
+	int rrs = 0, other = 0;
+
+	write_str(port_file("rrs_ms"), "200");
+	link_op(PCIEM_LINK_DOWN, 0, 0);
+	wait_state(200, 2, "dl", "down");
+	link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+	t0 = now_ms();
+	while (now_ms() < t0 + 2000) {
+		cfg_read(ep_bdf, PCI_VENDOR_ID, 4, &v);
+		if (v == 0xffff0001) {
+			rrs++;
+		} else if (v == (uint32_t)(EP_VENDOR | (EP_DEVICE << 16))) {
+			t_id = now_ms();
+			break;
+		} else if (v != 0xffffffff) {
+			other++;
+		}
+		usleep(5000);
+	}
+	report(rrs > 0 && !other && t_id - t0 >= 150 && t_id - t0 < 600,
+	       "RRS window: %d reads returned 0xffff0001, the vendor ID came %ld ms after the link up",
+	       rrs, t_id - t0);
+	write_str(port_file("rrs_ms"), "0");
+	wait_state(5000, 4, "ltssm", "L0", "dl", "up");
 	restore_ep_cfg();
 }
 
@@ -863,6 +899,79 @@ static int bdf_gone(void)
 	return 1;
 }
 
+static int ep_present(void)
+{
+	char path[200];
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/vendor", ep_bdf);
+	return access(path, F_OK) == 0;
+}
+
+static int wait_ep(int present, int ms)
+{
+	long end = now_ms() + ms;
+
+	do {
+		if (ep_present() == present)
+			return 1;
+		usleep(20000);
+	} while (now_ms() < end);
+	return 0;
+}
+
+static void options_run(int hotplug)
+{
+	char before[600], after[600];
+	uint32_t v = 0;
+	int cap, rc;
+
+	step_enumerate();
+	cap = pcie_cap(port_bdf);
+	if (hotplug) {
+		report(wait_service(port_bdf, port_is_dsp ? "pcie204" : "pcie004", 3000),
+		       "hot-plug service bound on %s", port_bdf);
+		sys_read(ep_bdf, "resource", before, sizeof(before));
+		rc = link_op(PCIEM_LINK_DOWN, 0, 0);
+		report(rc == 0, "PCIEM_LINK_DOWN: %s", strerror(rc));
+		report(wait_ep(0, 5000), "pciehp removed the EP after the link went down");
+		rc = link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+		report(rc == 0, "PCIEM_LINK_UP: %s", strerror(rc));
+		report(wait_ep(1, 10000), "pciehp enumerated the EP again");
+		sleep_ms(500);
+		sys_read(ep_bdf, "resource", after, sizeof(after));
+		if (strcmp(before, after))
+			note("EP BARs came back unassigned: Linux cannot allocate inside the e820 reserved pool (needs pci=no_e820)");
+		else
+			report(1, "EP BARs came back at the same addresses");
+		if (getenv("TOPO_IOMEM"))
+			(void)!system("grep -n -B2 -A6 '0000:01' /proc/iomem; lspci -vv -s 01:00.0 | grep -i 'prefetch\\|behind'");
+		cfg_read(ep_bdf, PCI_VENDOR_ID, 4, &v);
+		report(v == (uint32_t)(EP_VENDOR | (EP_DEVICE << 16)), "EP vendor/device read 0x%08x", v);
+		report(dmesg_count("Link Down") > 0 && dmesg_count("Card present") > 0,
+		       "dmesg has Slot Link Down and Card present");
+		dump_trace("sltsta");
+		dump_trace("irq");
+	} else {
+		uint32_t ue = 0, rs = 0, cmd;
+
+		report(wait_service(chain[0], "pcie002", 3000), "RP %s has the AER service", chain[0]);
+		report(wait_service(chain[0], "pcie008", 3000), "RP %s has the DPC service", chain[0]);
+		cfg_read(port_bdf, 0x140, 4, &v);
+		report((v & 0xffff) == PCI_EXT_CAP_ID_DPC, "DPC capability at 0x140 on the port above the EP");
+		rc = link_op(PCIEM_LINK_DOWN, 0, 0);
+		report(rc == 0, "PCIEM_LINK_DOWN: %s", strerror(rc));
+		sleep_ms(300);
+		cfg_read(port_bdf, 0x104, 4, &ue);
+		cfg_read(chain[0], 0x130, 4, &rs);
+		cfg_read(chain[0], cap + PCI_EXP_RTCTL, 2, &cmd);
+		report(ue & 0x20 || dmesg_count("AER:") > 0, "Surprise Down logged (UESta 0x%08x, Root Error Status 0x%08x)", ue, rs);
+		dump_trace("aer");
+		rc = link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+		report(rc == 0, "PCIEM_LINK_UP: %s", strerror(rc));
+		report(wait_state(5000, 4, "ltssm", "L0", "dl", "up") == 0, "link back");
+	}
+}
+
 static void teardown_cycles(void)
 {
 	static const char *const what[] = {
@@ -929,6 +1038,28 @@ int main(int argc, char **argv)
 	eq_mode = argc > 2 && !strcmp(argv[2], "eq");
 	warn_before = dmesg_count("WARNING:");
 	bug_before = dmesg_count("BUG:");
+	if (argc > 2 && (!strcmp(argv[2], "hotplug") || !strcmp(argv[2], "aer"))) {
+		int hp = !strcmp(argv[2], "hotplug");
+
+		topo_flags = hp ? PCIEM_TOPO_FLAG_HOTPLUG :
+				  PCIEM_TOPO_FLAG_NATIVE_AER | PCIEM_TOPO_FLAG_UNMASK_SDES | PCIEM_TOPO_FLAG_DPC;
+		create_device();
+		if (find_ep())
+			errx(1, "device did not appear");
+		split_chain();
+		options_run(hp);
+		munmap(ring, sizeof(*ring));
+		close(instance_fd);
+		close(ctl_fd);
+		end = now_ms() + 5000;
+		while (!bdf_gone() && now_ms() < end)
+			usleep(50000);
+		report(bdf_gone(), "no BDF of the chain remains after teardown");
+		report(dmesg_count("WARNING:") == warn_before && dmesg_count("BUG:") == bug_before,
+		       "dmesg has no new WARNING: or BUG: lines");
+		printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
+		return failures ? 1 : 0;
+	}
 	if (argc > 2 && !strcmp(argv[2], "teardown")) {
 		teardown_cycles();
 		sleep_ms(300);
@@ -954,6 +1085,7 @@ int main(int argc, char **argv)
 	step_initial_link();
 	save_ep_cfg();
 	step_down_up();
+	step_rrs();
 	step_retrain();
 	step_sbr();
 	step_eq_fallback();
