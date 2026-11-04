@@ -227,7 +227,7 @@ static void link_goto(struct pciem_plink *l, u8 st, u8 why)
 	s8 t;
 
 	l->state = st;
-	pciem_trace_ltssm(l->topo->v->trace, l->fn, from, st, l->speed, l->width, why);
+	pciem_trace_ltssm(pciem_link_trace(l), l->fn, from, st, l->speed, l->width, why);
 	pciem_port_lnksta_set(l->port, -1, -1, link_state_training(st), -1);
 
 	t = pciem_state_timing[st];
@@ -244,16 +244,20 @@ static void link_dl_up(struct pciem_plink *l)
 
 	l->dl_up = true;
 	l->rrs_until = ktime_add_ms(ktime_get(), l->rrs_ms);
-	pciem_trace_dl(t->v->trace, l->fn, true, l->speed, l->width);
+	pciem_trace_dl(pciem_link_trace(l), l->fn, true, l->speed, l->width);
 	pciem_port_lnksta_set(l->port, -1, -1, -1, 1);
 	pciem_port_dllsc(l->port);
 	pciem_topo_kick_work(t);
 
-	if (l == &t->links[PCIEM_ROLE_RP] && t->nports == 3) {
-		struct pciem_plink *dsp = &t->links[1];
+	if (l == &t->links[0] && t->placement == PCIEM_PLACEMENT_SWITCH) {
+		int k;
 
-		if (dsp->state == LT_DETECT_QUIET && !dsp->armed && dsp->partner)
-			link_arm(dsp, dsp->timing[T_DETECT_QUIET]);
+		for (k = 0; k < t->nslots; k++) {
+			struct pciem_plink *dsp = &t->links[1 + k];
+
+			if (dsp->state == LT_DETECT_QUIET && !dsp->armed && dsp->partner)
+				link_arm(dsp, dsp->timing[T_DETECT_QUIET]);
+		}
 	}
 }
 
@@ -263,7 +267,7 @@ static void link_dl_down(struct pciem_plink *l, bool sdes)
 
 	if (l->dl_up) {
 		l->dl_up = false;
-		pciem_trace_dl(t->v->trace, l->fn, false, l->speed, l->width);
+		pciem_trace_dl(pciem_link_trace(l), l->fn, false, l->speed, l->width);
 		pciem_port_dllsc(l->port);
 		if (sdes)
 			pciem_port_sdes(l->port);
@@ -307,10 +311,10 @@ static void link_l0_entered(struct pciem_plink *l, u8 why)
 	l->pending_lbms = false;
 	l->pending_labs = false;
 
-	if (l == &t->links[PCIEM_ROLE_RP] && t->nports == 3)
+	if (l == &t->links[0] && t->placement == PCIEM_PLACEMENT_SWITCH)
 		pciem_port_lnksta_mirror(PCIEM_PORT_USP(t), l->speed, width);
-	if (l == t->ep_link)
-		pciem_cap_pcie_set_lnksta(t->v, l->speed, width);
+	if (l->slot && l->slot->v)
+		pciem_cap_pcie_set_lnksta(l->slot->v, l->speed, width);
 
 	if (!l->dl_up)
 		link_arm(l, l->timing[T_DL_INIT]);
@@ -512,6 +516,17 @@ void pciem_link_stop(struct pciem_plink *l)
 	hrtimer_cancel(&l->timer);
 }
 
+void pciem_link_detach(struct pciem_plink *l)
+{
+	lockdep_assert_held(&l->topo->lock);
+
+	l->partner = false;
+	link_cancel(l);
+	link_dl_down(l, false);
+	link_reset_training(l);
+	link_goto(l, LT_DETECT_QUIET, PT_WHY_PARTNER_DOWN);
+}
+
 void pciem_link_partner(struct pciem_plink *l, bool present, u8 speed, u8 width)
 {
 	lockdep_assert_held(&l->topo->lock);
@@ -700,7 +715,7 @@ static ssize_t link_eq_write(struct file *file, const char __user *buf, size_t c
 		return -EINVAL;
 	scoped_guard(raw_spinlock_irqsave, &l->topo->lock)
 		pciem_link_set_eq_limit(l, v);
-	pciem_trace_link_op(l->topo->v->trace, PCIEM_LINK_EQ_LIMIT, v, 0, PT_SRC_DEBUGFS);
+	pciem_trace_link_op(pciem_link_trace(l), PCIEM_LINK_EQ_LIMIT, v, 0, PT_SRC_DEBUGFS);
 	return count;
 }
 

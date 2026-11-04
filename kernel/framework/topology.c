@@ -5,6 +5,7 @@
 #include "capabilities.h"
 #include "msi_domain.h"
 #include "pool.h"
+#include "iommu_stub.h"
 #include "topology.h"
 
 #include <linux/ioport.h>
@@ -18,6 +19,8 @@
 #define PCIEM_PORT_MSI  0x80
 #define PCIEM_PORT_AER  0x100
 #define PCIEM_PORT_DPC  0x140
+#define PCIEM_PORT_ACS  0x180
+#define ACS_CAPS       0x001f
 
 #define LNKCAP_SDERC  0x00080000
 #define LNKCAP_DLLLARC 0x00100000
@@ -85,14 +88,29 @@ static void w1cm(struct pciem_port *p, int off, int len, u32 mask)
 	set_mask(p->w1c, off, len, mask);
 }
 
-static int port_index(const struct pciem_port *p)
-{
-	return p->role;
-}
-
 u8 pciem_topo_depth(const struct pciem_topo *t)
 {
-	return t->placement == PCIEM_PLACEMENT_SWITCH ? 3 : 1;
+	return t->placement == PCIEM_PLACEMENT_SWITCH ? 2 + t->p.switch_ports : 1;
+}
+
+static DEFINE_MUTEX(pciem_switch_lock);
+static LIST_HEAD(pciem_switches);
+
+struct mutex *pciem_switch_mutex(void)
+{
+	return &pciem_switch_lock;
+}
+
+struct pciem_trace *pciem_port_trace(struct pciem_port *p)
+{
+	if (p->slot && p->slot->v)
+		return p->slot->v->trace;
+	return p->topo->trace;
+}
+
+struct pciem_trace *pciem_link_trace(struct pciem_plink *l)
+{
+	return pciem_port_trace(l->port);
 }
 
 u8 pciem_port_tls(struct pciem_port *p)
@@ -122,6 +140,7 @@ static void port_build(struct pciem_port *p)
 	bool ds = p->downstream;
 	bool slot = rp || p->role == PCIEM_ROLE_DSP;
 	bool dpc = ds && (t->p.flags & PCIEM_TOPO_FLAG_DPC);
+	bool acs = ds;
 	int c = p->pcie;
 	u32 lnkcap, sltcap = 0, uemsk, ue_impl, a = PCIEM_PORT_AER;
 	u8 type = rp ? PCI_EXP_TYPE_ROOT_PORT :
@@ -174,7 +193,7 @@ static void port_build(struct pciem_port *p)
 	w1cm(p, c + PCI_EXP_LNKSTA, 2, PCI_EXP_LNKSTA_LBMS | PCI_EXP_LNKSTA_LABS);
 
 	if (slot) {
-		sltcap = SLTCAP_NCCS | ((u32)t->ep_bus << 19);
+		sltcap = SLTCAP_NCCS | ((u32)p->slot_nr << 19);
 		if (p->hotplug)
 			sltcap |= PCI_EXP_SLTCAP_HPS | PCI_EXP_SLTCAP_HPC;
 		w32(p, c + PCI_EXP_SLTCAP, sltcap);
@@ -205,7 +224,8 @@ static void port_build(struct pciem_port *p)
 
 	ue_impl = 0x001ff010 | (ds ? UE_SDES : 0);
 	uemsk = 0x00100000 | ((ds && !(t->p.flags & PCIEM_TOPO_FLAG_UNMASK_SDES)) ? UE_SDES : 0);
-	w32(p, a, PCI_EXT_CAP_ID_ERR | (2 << 16) | ((dpc ? PCIEM_PORT_DPC : 0) << 20));
+	w32(p, a, PCI_EXT_CAP_ID_ERR | (2 << 16) |
+			 ((dpc ? PCIEM_PORT_DPC : acs ? PCIEM_PORT_ACS : 0) << 20));
 	w1cm(p, a + PCI_ERR_UNCOR_STATUS, 4, ue_impl);
 	w32(p, a + PCI_ERR_UNCOR_MASK, uemsk);
 	rwm(p, a + PCI_ERR_UNCOR_MASK, 4, ue_impl);
@@ -222,39 +242,58 @@ static void port_build(struct pciem_port *p)
 	if (dpc) {
 		int d = PCIEM_PORT_DPC;
 
-		w32(p, d, PCI_EXT_CAP_ID_DPC | (1 << 16));
+		w32(p, d, PCI_EXT_CAP_ID_DPC | (1 << 16) | ((acs ? PCIEM_PORT_ACS : 0) << 20));
 		w16(p, d + PCI_EXP_DPC_CAP, PCI_EXP_DPC_CAP_SW_TRIGGER | PCI_EXP_DPC_CAP_DL_ACTIVE);
 		w16(p, d + PCI_EXP_DPC_CTL, 0);
 		rwm(p, d + PCI_EXP_DPC_CTL, 2, 0xffff);
 		w1cm(p, d + PCI_EXP_DPC_STATUS, 2, 0x0009);
 	}
+
+	if (acs) {
+		int x = PCIEM_PORT_ACS;
+
+		w32(p, x, PCI_EXT_CAP_ID_ACS | (1 << 16));
+		w16(p, x + PCI_ACS_CAP, ACS_CAPS);
+		w16(p, x + PCI_ACS_CTRL, ACS_CAPS);
+		rwm(p, x + PCI_ACS_CTRL, 2, ACS_CAPS);
+	}
 }
 
-struct pciem_topo *pciem_topo_alloc(struct pciem_root_complex *v, u8 placement)
+struct pciem_topo *pciem_topo_alloc(u8 placement)
 {
 	struct pciem_topo *t = kzalloc(sizeof(*t), GFP_KERNEL);
-	int i;
 
 	if (!t)
 		return NULL;
-	t->v = v;
 	t->placement = placement;
-	t->nports = placement == PCIEM_PLACEMENT_SWITCH ? 3 : 1;
 	raw_spin_lock_init(&t->lock);
 	init_waitqueue_head(&t->trained_wq);
-	t->reach_last = true;
-	for (i = 0; i < 3; i++) {
-		t->ports[i].topo = t;
-		t->ports[i].role = i;
-		t->ports[i].fn = i;
-		t->ports[i].pcie = PCIEM_PORT_PCIE;
-		t->ports[i].downstream = i != PCIEM_ROLE_USP;
-	}
+	INIT_LIST_HEAD(&t->node);
 	return t;
+}
+
+static void topo_release_arrays(struct pciem_topo *t)
+{
+	int i;
+
+	for (i = 0; t->ports && i < t->nports; i++)
+		if (t->ports[i].vecs)
+			pciem_msi_vecs_destroy(t->ports[i].vecs);
+	kfree(t->ports);
+	kfree(t->links);
+	kfree(t->slots);
+	t->ports = NULL;
+	t->links = NULL;
+	t->slots = NULL;
+	t->nports = 0;
+	t->nslots = 0;
 }
 
 void pciem_topo_free(struct pciem_topo *t)
 {
+	topo_release_arrays(t);
+	if (t->trace_owned)
+		pciem_trace_free(t->trace);
 	kfree(t);
 }
 
@@ -306,11 +345,11 @@ int pciem_topo_set_params(struct pciem_topo *t, const struct pciem_topology *in)
 	return 0;
 }
 
-void pciem_topo_set_reach_cb(struct pciem_topo *t, void (*cb)(void *data, bool reachable),
-							 void *data)
+void pciem_topo_set_reach_cb(struct pciem_root_complex *v,
+							 void (*cb)(void *data, bool reachable), void *data)
 {
-	t->reach_cb = cb;
-	t->reach_data = data;
+	v->topo_reach_cb = cb;
+	v->topo_reach_data = data;
 }
 
 static void topo_apply_defaults(struct pciem_topo *t)
@@ -348,8 +387,9 @@ static int topo_layout_class(struct pciem_root_complex *v, bool pref, int ci,
 							 struct list_head *windows)
 {
 	struct pciem_topo *t = v->topo;
+	bool sw = t->placement == PCIEM_PLACEMENT_SWITCH;
 	struct bar_slot slots[PCI_STD_NUM_BARS];
-	resource_size_t cursor = 0, total, align = SZ_1M;
+	resource_size_t cursor = 0, total, region, align = SZ_1M;
 	struct pciem_topo_chunk *c = &t->chunk[ci];
 	struct resource_entry *entry;
 	struct resource *res;
@@ -371,6 +411,7 @@ static int topo_layout_class(struct pciem_root_complex *v, bool pref, int ci,
 		slots[n].size = b->size;
 		n++;
 	}
+
 	if (!n)
 		return 0;
 
@@ -382,44 +423,61 @@ static int topo_layout_class(struct pciem_root_complex *v, bool pref, int ci,
 		align = max(align, slots[i].size);
 	}
 	total = ALIGN(cursor, SZ_1M);
+	if (sw)
+		total = ALIGN(total, align);
 
-	base = pciem_pool_alloc_aligned(total, align);
+	if (sw && t->shared) {
+		if (total > c->stride) {
+			pr_err("port %u: BAR layout of 0x%llx bytes does not fit the switch chunk of 0x%llx\n",
+				   v->topo_port, (u64)total, (u64)c->stride);
+			return -ENOSPC;
+		}
+		base = c->start + (phys_addr_t)v->topo_port * c->stride;
+		goto place;
+	}
+
+	region = sw ? total * t->p.switch_ports : total;
+	base = pciem_pool_alloc_aligned(region, align);
 	if (!base)
 		return -ENOMEM;
-	if (!pref && base + total > SZ_4G) {
+	if (!pref && base + region > SZ_4G) {
 		pr_err("non-prefetchable BARs at 0x%llx are above 4 GiB, which a bridge memory window cannot cover\n",
 			   (u64)base);
-		pciem_pool_free(base, total);
+		pciem_pool_free(base, region);
 		return -EINVAL;
 	}
 
 	res = kzalloc(sizeof(*res), GFP_KERNEL);
 	if (!res) {
-		pciem_pool_free(base, total);
+		pciem_pool_free(base, region);
 		return -ENOMEM;
 	}
 	res->name = pref ? "PCI BAR chunk (prefetchable)" : "PCI BAR chunk";
 	res->start = base;
-	res->end = base + total - 1;
+	res->end = base + region - 1;
 	res->flags = IORESOURCE_MEM | (pref ? IORESOURCE_PREFETCH | IORESOURCE_MEM_64 : 0);
 	if (pciem_pool_insert(res)) {
 		kfree(res);
-		pciem_pool_free(base, total);
+		pciem_pool_free(base, region);
 		return -EBUSY;
 	}
 	entry = resource_list_create_entry(res, 0);
 	if (!entry) {
 		release_resource(res);
 		kfree(res);
-		pciem_pool_free(base, total);
+		pciem_pool_free(base, region);
 		return -ENOMEM;
 	}
 	resource_list_add_tail(entry, windows);
 
 	c->res = res;
 	c->start = base;
-	c->size = total;
+	c->size = region;
+	c->stride = total;
+	if (sw)
+		base += (phys_addr_t)v->topo_port * total;
 
+place:
 	for (i = 0; i < n; i++) {
 		struct pciem_bar_info *b = &v->bars[slots[i].idx];
 
@@ -442,7 +500,7 @@ int pciem_topo_layout_bars(struct pciem_root_complex *v, struct list_head *windo
 	return ret;
 }
 
-void pciem_topo_free_chunks(struct pciem_topo *t)
+static void topo_free_chunks(struct pciem_topo *t)
 {
 	int i;
 
@@ -459,6 +517,12 @@ void pciem_topo_free_chunks(struct pciem_topo *t)
 	}
 }
 
+void pciem_topo_free_chunks(struct pciem_topo *t)
+{
+	if (!t->shared)
+		topo_free_chunks(t);
+}
+
 static void port_set_buses(struct pciem_port *p, u8 pri, u8 sec, u8 sub)
 {
 	p->cfg[PCI_PRIMARY_BUS] = pri;
@@ -466,81 +530,144 @@ static void port_set_buses(struct pciem_port *p, u8 pri, u8 sec, u8 sub)
 	p->cfg[PCI_SUBORDINATE_BUS] = sub;
 }
 
-static void port_set_windows(struct pciem_port *p, struct pciem_topo *t)
+static void port_set_windows(struct pciem_port *p, struct pciem_topo *t, int k)
 {
 	struct pciem_topo_chunk *np = &t->chunk[0], *pf = &t->chunk[1];
 
 	if (np->size) {
-		w16(p, PCI_MEMORY_BASE, (np->start >> 16) & 0xfff0);
-		w16(p, PCI_MEMORY_LIMIT, ((np->start + np->size - 1) >> 16) & 0xfff0);
+		u64 start = np->start + (k >= 0 ? k * np->stride : 0);
+		u64 size = k >= 0 ? np->stride : np->size;
+
+		w16(p, PCI_MEMORY_BASE, (start >> 16) & 0xfff0);
+		w16(p, PCI_MEMORY_LIMIT, ((start + size - 1) >> 16) & 0xfff0);
 	}
 	if (pf->size) {
-		u64 end = pf->start + pf->size - 1;
+		u64 start = pf->start + (k >= 0 ? k * pf->stride : 0);
+		u64 size = k >= 0 ? pf->stride : pf->size;
+		u64 end = start + size - 1;
 
-		w16(p, PCI_PREF_MEMORY_BASE, ((pf->start >> 16) & 0xfff0) | 1);
+		w16(p, PCI_PREF_MEMORY_BASE, ((start >> 16) & 0xfff0) | 1);
 		w16(p, PCI_PREF_MEMORY_LIMIT, ((end >> 16) & 0xfff0) | 1);
-		w32(p, PCI_PREF_BASE_UPPER32, pf->start >> 32);
+		w32(p, PCI_PREF_BASE_UPPER32, start >> 32);
 		w32(p, PCI_PREF_LIMIT_UPPER32, end >> 32);
 	}
 }
 
-int pciem_topo_program(struct pciem_topo *t, int domain, u8 root_bus)
+int pciem_topo_program(struct pciem_root_complex *v, int domain, u8 root_bus)
 {
-	struct pciem_root_complex *v = t->v;
-	u8 depth = pciem_topo_depth(t);
-	struct pciem_port *rp = PCIEM_PORT_RP(t), *usp = PCIEM_PORT_USP(t), *dsp = PCIEM_PORT_DSP(t);
+	struct pciem_topo *t = v->topo;
+	bool sw = t->placement == PCIEM_PLACEMENT_SWITCH;
+	int i, k, nslots = sw ? t->p.switch_ports : 1;
+	struct pciem_port *rp, *usp;
 	u8 eq;
 
 	topo_apply_defaults(t);
-	t->domain = domain;
-	t->root_bus = root_bus;
-	t->ep_bus = root_bus + depth;
-	INIT_WORK(&t->work, topo_work_func);
-
-	rp->speed = t->p.rp_speed;
-	rp->width = t->p.rp_width;
-	usp->speed = PCIEM_LINK_SPEED_32GT;
-	usp->width = 16;
-	dsp->speed = t->p.dsp_speed;
-	dsp->width = t->p.dsp_width;
-	rp->bus = root_bus;
-	usp->bus = root_bus + 1;
-	dsp->bus = root_bus + 2;
-
-	rp->hotplug = (t->p.flags & PCIEM_TOPO_FLAG_HOTPLUG) && t->nports == 1;
-	dsp->hotplug = (t->p.flags & PCIEM_TOPO_FLAG_HOTPLUG) && t->nports == 3;
-
-	rp->vecs = &rp->msi_store;
-	dsp->vecs = &dsp->msi_store;
-	pciem_msi_vecs_init(rp->vecs);
-	pciem_msi_vecs_init(dsp->vecs);
-
-	port_build(rp);
-	port_set_windows(rp, t);
-	if (t->nports == 1) {
-		port_set_buses(rp, root_bus, root_bus + 1, root_bus + 1);
-		t->ep_link = &t->links[0];
+	topo_release_arrays(t);
+	t->nslots = nslots;
+	t->nports = sw ? 2 + nslots : 1;
+	t->ports = kcalloc(t->nports, sizeof(*t->ports), GFP_KERNEL);
+	t->links = kcalloc(1 + (sw ? nslots : 0), sizeof(*t->links), GFP_KERNEL);
+	t->slots = kcalloc(nslots, sizeof(*t->slots), GFP_KERNEL);
+	if (!t->ports || !t->links || !t->slots) {
+		topo_release_arrays(t);
+		return -ENOMEM;
+	}
+	if (sw) {
+		t->trace = pciem_trace_alloc();
+		if (!t->trace) {
+			topo_release_arrays(t);
+			return -ENOMEM;
+		}
+		t->trace_owned = true;
 	} else {
-		port_build(usp);
-		port_build(dsp);
-		port_set_windows(usp, t);
-		port_set_windows(dsp, t);
-		port_set_buses(rp, root_bus, root_bus + 1, root_bus + 3);
-		port_set_buses(usp, root_bus + 1, root_bus + 2, root_bus + 3);
-		port_set_buses(dsp, root_bus + 2, root_bus + 3, root_bus + 3);
-		t->ep_link = &t->links[1];
+		t->trace = v->trace;
 	}
 
+	t->domain = domain;
+	t->root_bus = root_bus;
+	INIT_WORK(&t->work, topo_work_func);
+
+	for (i = 0; i < t->nports; i++) {
+		struct pciem_port *p = &t->ports[i];
+
+		p->topo = t;
+		p->role = i == 0 ? PCIEM_ROLE_RP : i == 1 && sw ? PCIEM_ROLE_USP : PCIEM_ROLE_DSP;
+		p->fn = p->role;
+		p->pcie = PCIEM_PORT_PCIE;
+		p->downstream = p->role != PCIEM_ROLE_USP;
+	}
+	for (k = 0; k < nslots; k++) {
+		t->slots[k].p = t->p;
+		t->slots[k].reach_last = true;
+	}
+
+	rp = PCIEM_PORT_RP(t);
+	rp->speed = t->p.rp_speed;
+	rp->width = t->p.rp_width;
+	rp->bus = root_bus;
+	rp->vecs = &rp->msi_store;
+	pciem_msi_vecs_init(rp->vecs);
+
 	pciem_link_init(&t->links[0], t, rp, NULL);
-	if (t->nports == 3)
-		pciem_link_init(&t->links[1], t, dsp, &t->links[0]);
 
-	eq = t->p.eq_fail_above == PCIEM_EQ_LIMIT_NONE ? 0 : t->p.eq_fail_above;
-	t->ep_link->eq_limit = eq;
+	if (!sw) {
+		struct pciem_topo_slot *s = &t->slots[0];
+
+		s->v = v;
+		s->ep_bus = root_bus + 1;
+		s->link = &t->links[0];
+		s->reach_cb = v->topo_reach_cb;
+		s->reach_data = v->topo_reach_data;
+		rp->slot = s;
+		rp->slot_nr = s->ep_bus;
+		rp->hotplug = t->p.flags & PCIEM_TOPO_FLAG_HOTPLUG;
+		t->links[0].slot = s;
+		port_build(rp);
+		port_set_windows(rp, t, -1);
+		port_set_buses(rp, root_bus, root_bus + 1, root_bus + 1);
+		eq = t->p.eq_fail_above == PCIEM_EQ_LIMIT_NONE ? 0 : t->p.eq_fail_above;
+		t->links[0].eq_limit = eq;
+		t->links[0].rrs_ms = t->p.rrs_ms;
+		return pciem_cap_pcie_topo_setup(v, t->p.ep_speed, t->p.ep_width);
+	}
+
+	usp = PCIEM_PORT_USP(t);
+	usp->speed = PCIEM_LINK_SPEED_32GT;
+	usp->width = 16;
+	usp->bus = root_bus + 1;
+	rp->slot_nr = root_bus + 1;
 	t->links[0].rrs_ms = t->p.rrs_ms;
-	t->links[1].rrs_ms = t->p.rrs_ms;
+	port_build(rp);
+	port_build(usp);
+	port_set_windows(rp, t, -1);
+	port_set_windows(usp, t, -1);
+	port_set_buses(rp, root_bus, root_bus + 1, root_bus + 2 + nslots);
+	port_set_buses(usp, root_bus + 1, root_bus + 2, root_bus + 2 + nslots);
 
-	return pciem_cap_pcie_topo_setup(v, t->p.ep_speed, t->p.ep_width);
+	for (k = 0; k < nslots; k++) {
+		struct pciem_port *d = PCIEM_PORT_DSP(t, k);
+		struct pciem_topo_slot *s = &t->slots[k];
+		struct pciem_plink *l = &t->links[1 + k];
+
+		d->speed = t->p.dsp_speed;
+		d->width = t->p.dsp_width;
+		d->bus = root_bus + 2;
+		d->devfn = PCI_DEVFN(k, 0);
+		d->hotplug = t->p.flags & PCIEM_TOPO_FLAG_HOTPLUG;
+		d->slot = s;
+		d->slot_nr = root_bus + 3 + k;
+		d->vecs = &d->msi_store;
+		pciem_msi_vecs_init(d->vecs);
+		s->ep_bus = root_bus + 3 + k;
+		s->link = l;
+		pciem_link_init(l, t, d, &t->links[0]);
+		l->slot = s;
+		l->rrs_ms = t->p.rrs_ms;
+		port_build(d);
+		port_set_windows(d, t, k);
+		port_set_buses(d, root_bus + 2, root_bus + 3 + k, root_bus + 3 + k);
+	}
+	return 0;
 }
 
 static int topo_walk_fn(struct pci_dev *pdev, void *data)
@@ -555,14 +682,15 @@ void pciem_topo_scanned(struct pciem_topo *t, struct pci_bus *root)
 
 	pci_walk_bus(root, topo_walk_fn, NULL);
 	for (i = 0; i < t->nports; i++)
-		t->ports[i].pdev = pci_get_domain_bus_and_slot(t->domain, t->ports[i].bus, 0);
+		t->ports[i].pdev = pci_get_domain_bus_and_slot(t->domain, t->ports[i].bus,
+														   t->ports[i].devfn);
 }
 
 void pciem_topo_release_pdevs(struct pciem_topo *t)
 {
 	int i;
 
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < t->nports; i++) {
 		pci_dev_put(t->ports[i].pdev);
 		t->ports[i].pdev = NULL;
 	}
@@ -571,70 +699,58 @@ void pciem_topo_release_pdevs(struct pciem_topo *t)
 void pciem_topo_start(struct pciem_topo *t)
 {
 	struct pciem_plink *rpl = &t->links[0];
+	bool sw = t->placement == PCIEM_PLACEMENT_SWITCH;
+	int k;
 
-	pciem_trace_phase(t->v->trace, PT_PH_TRAIN_BEGIN);
+	pciem_trace_phase(t->trace, PT_PH_TRAIN_BEGIN);
 	scoped_guard(raw_spinlock_irqsave, &t->lock) {
 		t->registered = true;
-		if (t->nports == 3) {
-			rpl->partner = true;
-			rpl->partner_speed = PCIEM_LINK_SPEED_32GT;
-			rpl->partner_width = 16;
-			t->links[1].partner = true;
-			t->links[1].partner_speed = t->p.ep_speed;
-			t->links[1].partner_width = t->p.ep_width;
-		} else {
-			rpl->partner = true;
-			rpl->partner_speed = t->p.ep_speed;
-			rpl->partner_width = t->p.ep_width;
-		}
+		rpl->partner = true;
+		rpl->partner_speed = sw ? PCIEM_LINK_SPEED_32GT : t->p.ep_speed;
+		rpl->partner_width = sw ? 16 : t->p.ep_width;
 	}
 	pciem_link_start(rpl);
-	if (t->nports == 3)
-		pciem_link_start(&t->links[1]);
+	for (k = 0; sw && k < t->nslots; k++)
+		pciem_link_start(&t->links[1 + k]);
 }
 
-static bool topo_settled(struct pciem_topo *t)
+static bool topo_link_settled(struct pciem_topo *t, struct pciem_plink *l)
 {
-	bool ok;
-
 	guard(raw_spinlock_irqsave)(&t->lock);
-	ok = pciem_link_settled(&t->links[0]);
-	if (t->nports == 3)
-		ok = ok && pciem_link_settled(&t->links[1]);
-	return ok;
+	return pciem_link_settled(l);
+}
+
+static void topo_wait_link(struct pciem_topo *t, struct pciem_plink *l)
+{
+	long left = wait_event_timeout(t->trained_wq, topo_link_settled(t, l),
+								   msecs_to_jiffies(pciem_link_train_timeout_ms()));
+
+	if (!left)
+		pr_warn("link not settled after %u ms, continuing\n", pciem_link_train_timeout_ms());
 }
 
 void pciem_topo_wait_trained(struct pciem_topo *t)
 {
-	long left = wait_event_timeout(t->trained_wq, topo_settled(t),
-								   msecs_to_jiffies(pciem_link_train_timeout_ms()));
+	topo_wait_link(t, &t->links[0]);
+	pciem_trace_phase(t->trace, PT_PH_TRAIN_DONE);
+}
 
-	if (!left)
-		pr_warn("links not settled after %u ms, continuing\n", pciem_link_train_timeout_ms());
-	pciem_trace_phase(t->v->trace, PT_PH_TRAIN_DONE);
+static void topo_stop(struct pciem_topo *t)
+{
+	int i, nlinks = t->placement == PCIEM_PLACEMENT_SWITCH ? 1 + t->nslots : 1;
+
+	WRITE_ONCE(t->dying, true);
+	if (!t->registered)
+		return;
+	for (i = 0; i < nlinks; i++)
+		pciem_link_stop(&t->links[i]);
+	cancel_work_sync(&t->work);
 }
 
 void pciem_topo_quiesce(struct pciem_topo *t)
 {
-	int i;
-
-	WRITE_ONCE(t->dying, true);
-	for (i = 0; i < (t->nports == 3 ? 2 : 1) && t->registered; i++)
-		pciem_link_stop(&t->links[i]);
-	if (t->registered)
-		cancel_work_sync(&t->work);
-}
-
-static struct pciem_port *port_next(struct pciem_topo *t, struct pciem_port *p)
-{
-	switch (p->role) {
-	case PCIEM_ROLE_RP:
-		return t->nports == 3 ? PCIEM_PORT_USP(t) : NULL;
-	case PCIEM_ROLE_USP:
-		return PCIEM_PORT_DSP(t);
-	default:
-		return NULL;
-	}
+	if (!t->shared)
+		topo_stop(t);
 }
 
 enum { RT_NONE, RT_UR, RT_PORT, RT_EP };
@@ -643,15 +759,29 @@ struct pciem_route {
 	u8 kind;
 	bool rrs;
 	struct pciem_port *port;
+	struct pciem_topo_slot *slot;
 };
+
+static void route_ep(struct pciem_port *p, u8 busnr, unsigned int devfn, struct pciem_route *rt)
+{
+	if (busnr != p->cfg[PCI_SECONDARY_BUS] || PCI_SLOT(devfn) || PCI_FUNC(devfn) || !p->slot ||
+		!p->slot->v)
+		return;
+	rt->kind = RT_EP;
+	rt->slot = p->slot;
+	rt->rrs = ktime_before(ktime_get(), p->link->rrs_until);
+}
 
 static void topo_route(struct pciem_topo *t, u8 busnr, unsigned int devfn, struct pciem_route *rt)
 {
-	struct pciem_port *p = PCIEM_PORT_RP(t), *nxt;
+	struct pciem_port *p = PCIEM_PORT_RP(t);
+	bool sw = t->placement == PCIEM_PLACEMENT_SWITCH;
+	int k;
 
 	rt->kind = RT_NONE;
 	rt->rrs = false;
 	rt->port = NULL;
+	rt->slot = NULL;
 
 	if (busnr == t->root_bus) {
 		if (devfn == 0) {
@@ -670,36 +800,56 @@ static void topo_route(struct pciem_topo *t, u8 busnr, unsigned int devfn, struc
 			rt->kind = RT_UR;
 			return;
 		}
-		nxt = port_next(t, p);
-		if (busnr == sec) {
-			if (PCI_SLOT(devfn))
-				return;
-			if (!nxt) {
-				if (PCI_FUNC(devfn))
-					return;
-				rt->kind = RT_EP;
-				rt->rrs = ktime_before(ktime_get(), p->link->rrs_until);
+		switch (p->role) {
+		case PCIEM_ROLE_RP:
+			if (!sw) {
+				route_ep(p, busnr, devfn, rt);
 				return;
 			}
-			if (PCI_FUNC(devfn) == 0) {
-				rt->kind = RT_PORT;
-				rt->port = nxt;
+			if (busnr == sec) {
+				if (devfn == 0) {
+					rt->kind = RT_PORT;
+					rt->port = PCIEM_PORT_USP(t);
+				}
+				return;
 			}
+			p = PCIEM_PORT_USP(t);
+			break;
+		case PCIEM_ROLE_USP:
+			if (busnr == sec) {
+				k = PCI_SLOT(devfn);
+				if (!PCI_FUNC(devfn) && k < t->nslots) {
+					rt->kind = RT_PORT;
+					rt->port = PCIEM_PORT_DSP(t, k);
+				}
+				return;
+			}
+			for (k = 0; k < t->nslots; k++) {
+				struct pciem_port *d = PCIEM_PORT_DSP(t, k);
+
+				if (d->cfg[PCI_SECONDARY_BUS] && busnr >= d->cfg[PCI_SECONDARY_BUS] &&
+					busnr <= d->cfg[PCI_SUBORDINATE_BUS])
+					break;
+			}
+			if (k == t->nslots)
+				return;
+			p = PCIEM_PORT_DSP(t, k);
+			break;
+		default:
+			route_ep(p, busnr, devfn, rt);
 			return;
 		}
-		if (!nxt)
-			return;
-		p = nxt;
 	}
 }
 
-bool pciem_topo_bdf_is_ep(struct pciem_topo *t, struct pci_bus *bus, unsigned int devfn)
+struct pciem_root_complex *pciem_topo_ep_dev(struct pciem_topo *t, struct pci_bus *bus,
+											 unsigned int devfn)
 {
 	struct pciem_route rt;
 
 	guard(raw_spinlock_irqsave)(&t->lock);
 	topo_route(t, bus->number, devfn, &rt);
-	return rt.kind == RT_EP;
+	return rt.kind == RT_EP ? rt.slot->v : NULL;
 }
 
 struct pciem_msi_vecs *pciem_topo_msi_vecs(struct pciem_topo *t, struct pci_bus *bus,
@@ -710,7 +860,7 @@ struct pciem_msi_vecs *pciem_topo_msi_vecs(struct pciem_topo *t, struct pci_bus 
 	guard(raw_spinlock_irqsave)(&t->lock);
 	topo_route(t, bus->number, devfn, &rt);
 	if (rt.kind == RT_EP)
-		return &t->v->msi;
+		return &rt.slot->v->msi;
 	if (rt.kind == RT_PORT)
 		return rt.port->vecs;
 	return NULL;
@@ -730,33 +880,36 @@ static u32 port_read(struct pciem_port *p, int off, int size)
 static void port_reset_regs(struct pciem_port *p)
 {
 	port_build(p);
-	pciem_trace_reset(p->topo->v->trace, p->fn, PT_RESET_POWER_ON);
+	pciem_trace_reset(pciem_port_trace(p), p->fn, PT_RESET_POWER_ON);
 }
 
-void pciem_topo_ep_reset_hot(struct pciem_topo *t)
+static void topo_reset_slot(struct pciem_topo_slot *s)
 {
-	pciem_function_reset(t->v, PCIEM_RESET_HOT);
+	if (s->v)
+		pciem_function_reset(s->v, PCIEM_RESET_HOT);
 }
 
 static void topo_reset_below(struct pciem_topo *t, struct pciem_port *p)
 {
-	if (p->role == PCIEM_ROLE_RP && t->nports == 3) {
-		port_reset_regs(PCIEM_PORT_USP(t));
-		port_reset_regs(PCIEM_PORT_DSP(t));
-		pciem_link_hot_reset_from_above(&t->links[1]);
-	} else if (p->role == PCIEM_ROLE_USP) {
-		port_reset_regs(PCIEM_PORT_DSP(t));
-		pciem_link_hot_reset_from_above(&t->links[1]);
+	int k;
+
+	if (p->role == PCIEM_ROLE_DSP || t->placement != PCIEM_PLACEMENT_SWITCH) {
+		topo_reset_slot(p->slot);
+		return;
 	}
-	pciem_topo_ep_reset_hot(t);
+	if (p->role == PCIEM_ROLE_RP)
+		port_reset_regs(PCIEM_PORT_USP(t));
+	for (k = 0; k < t->nslots; k++) {
+		port_reset_regs(PCIEM_PORT_DSP(t, k));
+		pciem_link_hot_reset_from_above(&t->links[1 + k]);
+		topo_reset_slot(&t->slots[k]);
+	}
 }
 
 void pciem_port_irq(struct pciem_port *p, u8 cause)
 {
-	struct pciem_topo *t = p->topo;
-
-	t->pending |= BIT(port_index(p) * 8 + cause);
-	pciem_topo_kick_work(t);
+	p->pend |= BIT(cause);
+	pciem_topo_kick_work(p->topo);
 }
 
 void pciem_port_lnksta_set(struct pciem_port *p, int cls, int nlw, int lt, int dllla)
@@ -775,7 +928,7 @@ void pciem_port_lnksta_set(struct pciem_port *p, int cls, int nlw, int lt, int d
 	if (new == old)
 		return;
 	w16(p, off, new);
-	pciem_trace_lnksta(p->topo->v->trace, p->fn, old, new, true);
+	pciem_trace_lnksta(pciem_port_trace(p), p->fn, old, new, true);
 }
 
 void pciem_port_lnksta_mirror(struct pciem_port *p, u8 cls, u8 nlw)
@@ -787,7 +940,7 @@ void pciem_port_lnksta_mirror(struct pciem_port *p, u8 cls, u8 nlw)
 	if (new == old)
 		return;
 	w16(p, off, new);
-	pciem_trace_lnksta(p->topo->v->trace, p->fn, old, new, true);
+	pciem_trace_lnksta(pciem_port_trace(p), p->fn, old, new, true);
 }
 
 void pciem_port_lnksta_flag(struct pciem_port *p, u16 flag)
@@ -799,7 +952,7 @@ void pciem_port_lnksta_flag(struct pciem_port *p, u16 flag)
 	if (old & flag)
 		return;
 	w16(p, off, old | flag);
-	pciem_trace_lnksta(p->topo->v->trace, p->fn, old, old | flag, true);
+	pciem_trace_lnksta(pciem_port_trace(p), p->fn, old, old | flag, true);
 	ctl = r16(p, p->pcie + PCI_EXP_LNKCTL);
 	if (flag == PCI_EXP_LNKSTA_LBMS && (ctl & LNKCTL_LBMIE))
 		pciem_port_irq(p, PT_IRQ_LBMS);
@@ -823,7 +976,7 @@ static void port_slot_status(struct pciem_port *p, u16 bit, u8 cause, u16 enable
 	if (p->role == PCIEM_ROLE_USP || (old & bit))
 		return;
 	w16(p, off, old | bit);
-	pciem_trace_reg(p->topo->v->trace, PT_EV_SLTSTA, p->fn, PT_REG_SLTSTA, old, old | bit, true);
+	pciem_trace_reg(pciem_port_trace(p), PT_EV_SLTSTA, p->fn, PT_REG_SLTSTA, old, old | bit, true);
 	ctl = r16(p, p->pcie + PCI_EXP_SLTCTL);
 	if ((ctl & SLTCTL_HPIE) && (ctl & enable))
 		pciem_port_irq(p, cause);
@@ -848,10 +1001,10 @@ static void root_report(struct pciem_port *rp, struct pciem_port *src, bool fata
 			st |= ROOT_ERR_FIRST_FATAL;
 	}
 	st |= fatal ? ROOT_ERR_FATAL : ROOT_ERR_NONFATAL;
-	id = (id & 0xffff) | ((u32)src->bus << 24);
+	id = (id & 0xffff) | ((u32)src->bus << 24) | ((u32)src->devfn << 16);
 	w32(rp, PCIEM_PORT_AER + PCI_ERR_ROOT_STATUS, st);
 	w32(rp, PCIEM_PORT_AER + PCI_ERR_ROOT_ERR_SRC, id);
-	pciem_trace_reg(rp->topo->v->trace, PT_EV_AER, rp->fn, PT_REG_ROOTSTA, old, st, true);
+	pciem_trace_reg(pciem_port_trace(rp), PT_EV_AER, rp->fn, PT_REG_ROOTSTA, old, st, true);
 	if (cmd & (fatal ? 0x4 : 0x2))
 		pciem_port_irq(rp, PT_IRQ_AER);
 }
@@ -866,7 +1019,7 @@ void pciem_port_sdes(struct pciem_port *p)
 	if (!p->downstream)
 		return;
 	w32(p, a + PCI_ERR_UNCOR_STATUS, old | UE_SDES);
-	pciem_trace_reg(p->topo->v->trace, PT_EV_AER, p->fn, PT_REG_UESTA, old, old | UE_SDES, true);
+	pciem_trace_reg(pciem_port_trace(p), PT_EV_AER, p->fn, PT_REG_UESTA, old, old | UE_SDES, true);
 	if (r32(p, a + PCI_ERR_UNCOR_MASK) & UE_SDES)
 		return;
 
@@ -883,33 +1036,33 @@ static void port_post_write(struct pciem_port *p, u16 o_lnkctl, u16 o_lnkctl2, u
 							u32 o_uesta, u32 o_rootsta, bool rl)
 {
 	struct pciem_topo *t = p->topo;
-	struct pciem_root_complex *v = t->v;
+	struct pciem_trace *tr = pciem_port_trace(p);
 	int c = p->pcie;
 	u16 n;
 
 	n = r16(p, c + PCI_EXP_LNKCTL);
 	if (p->downstream) {
 		if (rl) {
-			pciem_trace_ctl(v->trace, p->fn, PT_CTL_RETRAIN, n);
+			pciem_trace_ctl(tr, p->fn, PT_CTL_RETRAIN, n);
 			pciem_link_retrain(p->link);
 		}
 		if ((o_lnkctl ^ n) & LNKCTL_LD) {
-			pciem_trace_ctl(v->trace, p->fn, n & LNKCTL_LD ? PT_CTL_LD_ON : PT_CTL_LD_OFF, n);
+			pciem_trace_ctl(tr, p->fn, n & LNKCTL_LD ? PT_CTL_LD_ON : PT_CTL_LD_OFF, n);
 			pciem_link_disable(p->link, n & LNKCTL_LD);
 		}
 	}
 	if ((o_lnkctl ^ n) & ~LNKCTL_RL & ~LNKCTL_LD)
-		pciem_trace_ctl(v->trace, p->fn, PT_CTL_LNKCTL, n);
+		pciem_trace_ctl(tr, p->fn, PT_CTL_LNKCTL, n);
 
 	n = r16(p, c + PCI_EXP_LNKCTL2);
 	if ((o_lnkctl2 ^ n) & PCI_EXP_LNKCTL2_TLS)
-		pciem_trace_ctl(v->trace, p->fn, PT_CTL_TLS, n & PCI_EXP_LNKCTL2_TLS);
+		pciem_trace_ctl(tr, p->fn, PT_CTL_TLS, n & PCI_EXP_LNKCTL2_TLS);
 
 	n = r16(p, PCI_BRIDGE_CONTROL);
 	if ((o_brctl ^ n) & BRCTL_SBR) {
 		bool set = n & BRCTL_SBR;
 
-		pciem_trace_ctl(v->trace, p->fn, set ? PT_CTL_SBR_ON : PT_CTL_SBR_OFF, n);
+		pciem_trace_ctl(tr, p->fn, set ? PT_CTL_SBR_ON : PT_CTL_SBR_OFF, n);
 		if (p->downstream) {
 			pciem_link_sbr(p->link, set);
 			if (set)
@@ -922,28 +1075,28 @@ static void port_post_write(struct pciem_port *p, u16 o_lnkctl, u16 o_lnkctl2, u
 	if (p->role != PCIEM_ROLE_USP) {
 		n = r16(p, c + PCI_EXP_SLTCTL);
 		if (n != o_sltctl)
-			pciem_trace_ctl(v->trace, p->fn, PT_CTL_SLTCTL, n);
+			pciem_trace_ctl(tr, p->fn, PT_CTL_SLTCTL, n);
 		n = r16(p, c + PCI_EXP_SLTSTA);
 		if (n != o_sltsta)
-			pciem_trace_reg(v->trace, PT_EV_SLTSTA, p->fn, PT_REG_SLTSTA, o_sltsta, n, false);
+			pciem_trace_reg(tr, PT_EV_SLTSTA, p->fn, PT_REG_SLTSTA, o_sltsta, n, false);
 		n = r16(p, PCIEM_PORT_MSI + PCI_MSI_FLAGS);
 		if (n != o_msi)
-			pciem_trace_ctl(v->trace, p->fn, PT_CTL_MSI, n);
+			pciem_trace_ctl(tr, p->fn, PT_CTL_MSI, n);
 	}
 	if (p->role == PCIEM_ROLE_RP) {
 		n = r16(p, c + PCI_EXP_RTCTL);
 		if (n != o_rootctl)
-			pciem_trace_ctl(v->trace, p->fn, PT_CTL_ROOTCTL, n);
+			pciem_trace_ctl(tr, p->fn, PT_CTL_ROOTCTL, n);
 		if (r32(p, PCIEM_PORT_AER + PCI_ERR_ROOT_STATUS) != o_rootsta)
-			pciem_trace_reg(v->trace, PT_EV_AER, p->fn, PT_REG_ROOTSTA, o_rootsta,
+			pciem_trace_reg(tr, PT_EV_AER, p->fn, PT_REG_ROOTSTA, o_rootsta,
 							r32(p, PCIEM_PORT_AER + PCI_ERR_ROOT_STATUS), false);
 	}
 	if (r32(p, PCIEM_PORT_AER + PCI_ERR_UNCOR_STATUS) != o_uesta)
-		pciem_trace_reg(v->trace, PT_EV_AER, p->fn, PT_REG_UESTA, o_uesta,
+		pciem_trace_reg(tr, PT_EV_AER, p->fn, PT_REG_UESTA, o_uesta,
 						r32(p, PCIEM_PORT_AER + PCI_ERR_UNCOR_STATUS), false);
 	n = r16(p, c + PCI_EXP_LNKSTA);
 	if ((n ^ o_lnksta) & (PCI_EXP_LNKSTA_LBMS | PCI_EXP_LNKSTA_LABS))
-		pciem_trace_lnksta(v->trace, p->fn, o_lnksta, n, false);
+		pciem_trace_lnksta(tr, p->fn, o_lnksta, n, false);
 }
 
 static void port_write(struct pciem_port *p, int off, int size, u32 val)
@@ -982,6 +1135,15 @@ static void port_write(struct pciem_port *p, int off, int size, u32 val)
 					o_uesta, o_rootsta, rl);
 }
 
+static struct pciem_trace *route_trace(struct pciem_topo *t, const struct pciem_route *rt)
+{
+	if (rt->kind == RT_PORT)
+		return pciem_port_trace(rt->port);
+	if (rt->kind == RT_EP)
+		return rt->slot->v->trace;
+	return t->trace;
+}
+
 static u8 route_fn(const struct pciem_route *rt, unsigned int devfn)
 {
 	if (rt->kind == RT_PORT)
@@ -995,6 +1157,7 @@ int pciem_topo_cfg_read(struct pciem_topo *t, u8 busnr, unsigned int devfn, int 
 						u32 *value, struct pciem_root_complex **ep)
 {
 	struct pciem_route rt;
+	struct pciem_trace *tr;
 	unsigned long flags;
 	u8 res = PT_RES_OK;
 	int ret = PCIBIOS_SUCCESSFUL;
@@ -1022,7 +1185,7 @@ int pciem_topo_cfg_read(struct pciem_topo *t, u8 busnr, unsigned int devfn, int 
 		break;
 	case RT_EP:
 		if (!rt.rrs) {
-			*ep = t->v;
+			*ep = rt.slot->v;
 			break;
 		}
 		res = PT_RES_RRS;
@@ -1034,12 +1197,12 @@ int pciem_topo_cfg_read(struct pciem_topo *t, u8 busnr, unsigned int devfn, int 
 		}
 		break;
 	}
+	tr = route_trace(t, &rt);
 	raw_spin_unlock_irqrestore(&t->lock, flags);
 
 	if (!*ep) {
 		*value = val;
-		pciem_trace_cfg_access(t->v->trace, route_fn(&rt, devfn), busnr, devfn, false, where, size,
-							   val, res);
+		pciem_trace_cfg_access(tr, route_fn(&rt, devfn), busnr, devfn, false, where, size, val, res);
 	}
 	return ret;
 }
@@ -1048,6 +1211,7 @@ int pciem_topo_cfg_write(struct pciem_topo *t, u8 busnr, unsigned int devfn, int
 						 u32 value, struct pciem_root_complex **ep)
 {
 	struct pciem_route rt;
+	struct pciem_trace *tr;
 	unsigned long flags;
 	u8 res = PT_RES_OK;
 	int ret = PCIBIOS_SUCCESSFUL;
@@ -1075,60 +1239,81 @@ int pciem_topo_cfg_write(struct pciem_topo *t, u8 busnr, unsigned int devfn, int
 		break;
 	case RT_EP:
 		if (!rt.rrs) {
-			*ep = t->v;
+			*ep = rt.slot->v;
 			break;
 		}
 		res = PT_RES_RRS;
 		break;
 	}
+	tr = route_trace(t, &rt);
 	raw_spin_unlock_irqrestore(&t->lock, flags);
 
 	if (!*ep)
-		pciem_trace_cfg_access(t->v->trace, route_fn(&rt, devfn), busnr, devfn, true, where, size,
-							   value, res);
+		pciem_trace_cfg_access(tr, route_fn(&rt, devfn), busnr, devfn, true, where, size, value,
+							   res);
 	return ret;
 }
 
-void pciem_topo_dev_down(struct pciem_topo *t)
+static struct pciem_topo_slot *dev_slot(struct pciem_root_complex *v)
 {
+	return &v->topo->slots[v->topo_port];
+}
+
+void pciem_topo_dev_down(struct pciem_root_complex *v)
+{
+	struct pciem_topo *t = v->topo;
+	struct pciem_topo_slot *s = dev_slot(v);
+
 	scoped_guard(raw_spinlock_irqsave, &t->lock) {
-		t->dev_down = true;
-		pciem_link_partner(t->ep_link, false, 0, 0);
+		s->dev_down = true;
+		pciem_link_partner(s->link, false, 0, 0);
 	}
 	pciem_topo_kick_work(t);
 }
 
-int pciem_topo_dev_up(struct pciem_topo *t, u8 speed, u8 width)
+int pciem_topo_dev_up(struct pciem_root_complex *v, u8 speed, u8 width)
 {
+	struct pciem_topo *t = v->topo;
+	struct pciem_topo_slot *s = dev_slot(v);
+
 	scoped_guard(raw_spinlock_irqsave, &t->lock) {
-		t->dev_down = false;
-		pciem_link_partner(t->ep_link, true, speed, width);
+		s->dev_down = false;
+		pciem_link_partner(s->link, true, speed, width);
 	}
 	pciem_topo_kick_work(t);
 	return 0;
 }
 
-bool pciem_topo_dev_is_down(struct pciem_topo *t)
+bool pciem_topo_dev_is_down(struct pciem_root_complex *v)
 {
-	guard(raw_spinlock_irqsave)(&t->lock);
-	return t->dev_down;
+	guard(raw_spinlock_irqsave)(&v->topo->lock);
+	return dev_slot(v)->dev_down;
 }
 
-int pciem_topo_set_eq_limit(struct pciem_topo *t, u8 speed)
+int pciem_topo_set_eq_limit(struct pciem_root_complex *v, u8 speed)
 {
-	guard(raw_spinlock_irqsave)(&t->lock);
-	pciem_link_set_eq_limit(t->ep_link, speed);
+	guard(raw_spinlock_irqsave)(&v->topo->lock);
+	pciem_link_set_eq_limit(dev_slot(v)->link, speed);
 	return 0;
 }
 
-int pciem_topo_link_read(struct pciem_topo *t, char *buf, size_t len)
+void pciem_topo_dev_limits(struct pciem_root_complex *v, u8 *speed, u8 *width)
 {
-	struct pciem_port *p = t->ep_link->port;
+	struct pciem_topo_slot *s = dev_slot(v);
+
+	*speed = s->p.ep_speed;
+	*width = s->p.ep_width;
+}
+
+int pciem_topo_link_read(struct pciem_root_complex *v, char *buf, size_t len)
+{
+	struct pciem_topo_slot *s = dev_slot(v);
+	struct pciem_port *p = s->link->port;
 	u16 sta;
 	bool up;
 
-	scoped_guard(raw_spinlock_irqsave, &t->lock) {
-		up = !t->dev_down && t->ep_link->dl_up;
+	scoped_guard(raw_spinlock_irqsave, &v->topo->lock) {
+		up = !s->dev_down && s->link->dl_up;
 		sta = r16(p, p->pcie + PCI_EXP_LNKSTA);
 	}
 	if (!up)
@@ -1140,35 +1325,51 @@ int pciem_topo_link_read(struct pciem_topo *t, char *buf, size_t len)
 static void topo_work_func(struct work_struct *work)
 {
 	struct pciem_topo *t = container_of(work, struct pciem_topo, work);
-	bool msi_en[3] = {};
-	bool reach;
-	u32 pend;
-	int i;
+	u8 pend[2 + PCIEM_SWITCH_MAX_PORTS] = {};
+	bool msi_en[2 + PCIEM_SWITCH_MAX_PORTS] = {};
+	bool reach[PCIEM_SWITCH_MAX_PORTS] = {};
+	void (*cb[PCIEM_SWITCH_MAX_PORTS])(void *data, bool reachable) = {};
+	void *cb_data[PCIEM_SWITCH_MAX_PORTS] = {};
+	int i, c;
 
 	scoped_guard(raw_spinlock_irqsave, &t->lock) {
-		pend = t->pending;
-		t->pending = 0;
-		reach = !t->dev_down && t->ep_link->dl_up;
-		for (i = 0; i < t->nports; i++)
-			if (t->ports[i].role != PCIEM_ROLE_USP)
-				msi_en[i] = r16(&t->ports[i], PCIEM_PORT_MSI + PCI_MSI_FLAGS) & PCI_MSI_FLAGS_ENABLE;
+		for (i = 0; i < t->nports; i++) {
+			struct pciem_port *p = &t->ports[i];
+
+			pend[i] = p->pend;
+			p->pend = 0;
+			if (p->role != PCIEM_ROLE_USP)
+				msi_en[i] = r16(p, PCIEM_PORT_MSI + PCI_MSI_FLAGS) & PCI_MSI_FLAGS_ENABLE;
+		}
+		for (i = 0; i < t->nslots; i++) {
+			struct pciem_topo_slot *s = &t->slots[i];
+
+			reach[i] = s->v && !s->dev_down && s->link->dl_up;
+			if (s->v && s->reach_cb && reach[i] != s->reach_last) {
+				s->reach_last = reach[i];
+				cb[i] = s->reach_cb;
+				cb_data[i] = s->reach_data;
+			}
+		}
 	}
 
-	for (i = 0; i < 3 * 8; i++) {
-		struct pciem_port *p = &t->ports[i / 8];
-		bool sent = false;
+	for (i = 0; i < t->nports; i++) {
+		struct pciem_port *p = &t->ports[i];
 
-		if (!(pend & BIT(i)))
-			continue;
-		if (msi_en[i / 8] && p->vecs)
-			sent = !pciem_msi_deliver(p->vecs, 0);
-		pciem_trace_irq(t->v->trace, p->fn, i % 8, 0, sent);
+		for (c = 0; c < 8; c++) {
+			bool sent = false;
+
+			if (!(pend[i] & BIT(c)))
+				continue;
+			if (msi_en[i] && p->vecs)
+				sent = !pciem_msi_deliver(p->vecs, 0);
+			pciem_trace_irq(pciem_port_trace(p), p->fn, c, 0, sent);
+		}
 	}
 
-	if (t->reach_cb && reach != t->reach_last) {
-		t->reach_last = reach;
-		t->reach_cb(t->reach_data, reach);
-	}
+	for (i = 0; i < t->nslots; i++)
+		if (cb[i])
+			cb[i](cb_data[i], reach[i]);
 	wake_up(&t->trained_wq);
 }
 
@@ -1191,30 +1392,52 @@ static const struct file_operations topology_fops = {
 	.release = single_release,
 };
 
+static void json_port(struct seq_file *m, bool *first, struct pciem_port *p, int domain, bool sw)
+{
+	seq_printf(m, "%s{\"role\":\"%s\",\"bdf\":\"%04x:%02x:%02x.0\",\"sec\":%u,\"sub\":%u",
+			   *first ? "" : ",", port_name(p->role), domain, p->bus, PCI_SLOT(p->devfn),
+			   p->cfg[PCI_SECONDARY_BUS], p->cfg[PCI_SUBORDINATE_BUS]);
+	if (sw && p->role == PCIEM_ROLE_DSP)
+		seq_printf(m, ",\"port\":%u", PCI_SLOT(p->devfn));
+	seq_puts(m, "}");
+	*first = false;
+}
+
+static void json_ep(struct seq_file *m, bool *first, int domain, u8 bus, int port, bool sw)
+{
+	seq_printf(m, "%s{\"role\":\"ep0\",\"bdf\":\"%04x:%02x:00.0\"", *first ? "" : ",", domain, bus);
+	if (sw)
+		seq_printf(m, ",\"port\":%d", port);
+	seq_puts(m, "}");
+	*first = false;
+}
+
 void pciem_topology_json_show(struct pciem_root_complex *v, struct seq_file *m)
 {
 	struct pciem_topo *t = v->topo;
 	struct pciem_host_bridge_priv *priv = v->bridge_priv;
 	int domain = v->mode_state.virtual_root.assigned_domain;
 	int root = v->mode_state.virtual_root.assigned_busnr;
+	bool sw = t && t->placement == PCIEM_PLACEMENT_SWITCH;
 	int i, f;
 	bool first = true;
 
-	seq_printf(m, "{\"placement\":\"%s\",\"domain\":%d,\"root_bus\":%d,\"functions\":[",
-			   pciem_placement_names[v->placement], domain, root);
+	seq_printf(m, "{\"placement\":\"%s\",\"domain\":%d,\"root_bus\":%d,", pciem_placement_names[v->placement],
+			   domain, root);
+	if (sw)
+		seq_printf(m, "\"port\":%u,\"switch_ports\":%u,", v->topo_port, t->nslots);
+	seq_puts(m, "\"functions\":[");
 	if (t) {
 		scoped_guard(raw_spinlock_irqsave, &t->lock) {
 			for (i = 0; i < t->nports; i++) {
 				struct pciem_port *p = &t->ports[i];
 
-				seq_printf(m, "%s{\"role\":\"%s\",\"bdf\":\"%04x:%02x:00.0\",\"sec\":%u,\"sub\":%u}",
-						   first ? "" : ",", port_name(p->role), domain, p->bus,
-						   p->cfg[PCI_SECONDARY_BUS], p->cfg[PCI_SUBORDINATE_BUS]);
-				first = false;
+				if (sw && p->role == PCIEM_ROLE_DSP && p->slot != dev_slot(v))
+					continue;
+				json_port(m, &first, p, domain, sw);
 			}
 		}
-		seq_printf(m, "%s{\"role\":\"ep0\",\"bdf\":\"%04x:%02x:00.0\"}", first ? "" : ",", domain,
-				   t->ep_bus);
+		json_ep(m, &first, domain, dev_slot(v)->ep_bus, v->topo_port, sw);
 	} else {
 		for (f = 0; priv && f < PCIEM_MAX_FUNCTIONS; f++) {
 			if (!priv->funcs[f])
@@ -1227,23 +1450,270 @@ void pciem_topology_json_show(struct pciem_root_complex *v, struct seq_file *m)
 	seq_puts(m, "]}\n");
 }
 
-void pciem_topo_debugfs_create(struct pciem_topo *t, struct dentry *dir)
+static int switch_topology_show(struct seq_file *m, void *unused)
 {
+	struct pciem_topo *t = m->private;
+	bool first = true;
 	int i;
+
+	seq_printf(m, "{\"placement\":\"switch\",\"domain\":%d,\"root_bus\":%u,\"switch_ports\":%u,\"functions\":[",
+			   t->domain, t->root_bus, t->nslots);
+	guard(raw_spinlock_irqsave)(&t->lock);
+	for (i = 0; i < t->nports; i++)
+		json_port(m, &first, &t->ports[i], t->domain, true);
+	for (i = 0; i < t->nslots; i++)
+		if (t->slots[i].v)
+			json_ep(m, &first, t->domain, t->slots[i].ep_bus, i, true);
+	seq_puts(m, "]}\n");
+	return 0;
+}
+
+static int switch_topology_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, switch_topology_show, inode->i_private);
+}
+
+static const struct file_operations switch_topology_fops = {
+	.owner = THIS_MODULE,
+	.open = switch_topology_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static void switch_debugfs_create(struct pciem_topo *t)
+{
+	struct pciem_plink *l = &t->links[0];
+	char name[32];
+
+	snprintf(name, sizeof(name), "switch-%04x:%02x", t->domain, t->root_bus);
+	t->dir = debugfs_create_dir(name, pciem_debugfs_root());
+	pciem_trace_debugfs_create(t->dir, t->trace);
+	debugfs_create_file("topology", 0400, t->dir, t, &switch_topology_fops);
+	l->dir = debugfs_create_dir("rp", t->dir);
+	pciem_plink_debugfs_create(l, l->dir);
+}
+
+void pciem_topo_debugfs_create(struct pciem_root_complex *v, struct dentry *dir)
+{
+	struct pciem_topo *t = v->topo;
 
 	if (!t)
 		return;
-	for (i = 0; i < t->nports; i++) {
-		struct pciem_port *p = &t->ports[i];
+	if (t->placement == PCIEM_PLACEMENT_SWITCH) {
+		struct pciem_plink *l = dev_slot(v)->link;
 
-		if (!p->link)
-			continue;
-		p->link->dir = debugfs_create_dir(port_name(p->role), dir);
-		pciem_plink_debugfs_create(p->link, p->link->dir);
+		l->dir = debugfs_create_dir("dsp", dir);
+		pciem_plink_debugfs_create(l, l->dir);
+		guard(mutex)(&pciem_switch_lock);
+		if (!t->dir)
+			switch_debugfs_create(t);
+		return;
 	}
+	t->links[0].dir = debugfs_create_dir(port_name(PCIEM_ROLE_RP), dir);
+	pciem_plink_debugfs_create(&t->links[0], t->links[0].dir);
 }
 
 void pciem_topology_debugfs_file(struct pciem_root_complex *v, struct dentry *dir)
 {
 	debugfs_create_file("topology", 0400, dir, v, &topology_fops);
+}
+
+static bool topo_params_match(const struct pciem_topology *a, const struct pciem_topology *b)
+{
+	return a->flags == b->flags && a->rp_speed == b->rp_speed && a->rp_width == b->rp_width &&
+		   a->dsp_speed == b->dsp_speed && a->dsp_width == b->dsp_width &&
+		   a->switch_ports == b->switch_ports;
+}
+
+static struct pciem_topo *switch_find(int domain, u8 bus)
+{
+	struct pciem_topo *t;
+
+	list_for_each_entry(t, &pciem_switches, node)
+		if (t->domain == domain && t->root_bus == bus)
+			return t;
+	return NULL;
+}
+
+int pciem_topo_join(struct pciem_root_complex *v)
+{
+	struct pciem_topo *mine = v->topo, *t;
+	int domain = v->mode_state.virtual_root.assigned_domain;
+	int bus = v->mode_state.virtual_root.assigned_busnr;
+
+	lockdep_assert_held(&pciem_switch_lock);
+	topo_apply_defaults(mine);
+	v->topo_port = mine->p.port;
+	if (bus + 2 + mine->p.switch_ports > 255)
+		return -EINVAL;
+
+	t = switch_find(domain, bus);
+	if (!t)
+		return 0;
+	if (!topo_params_match(&t->p, &mine->p)) {
+		pr_err("switch %04x:%02x: parameters differ from the switch's\n", domain, bus);
+		return -EINVAL;
+	}
+	if (t->slots[v->topo_port].v) {
+		pr_err("switch %04x:%02x: port %u is taken\n", domain, bus, v->topo_port);
+		return -EBUSY;
+	}
+
+	t->slots[v->topo_port].p = mine->p;
+	t->refs++;
+	v->topo = t;
+	pciem_topo_free(mine);
+	return 0;
+}
+
+void pciem_topo_make_shared(struct pciem_root_complex *v, struct pci_host_bridge *bridge,
+							struct pciem_host_bridge_priv *priv, struct platform_device *pdev)
+{
+	struct pciem_topo *t = v->topo;
+
+	lockdep_assert_held(&pciem_switch_lock);
+	t->bridge = bridge;
+	t->bus = bridge->bus;
+	t->priv = priv;
+	t->pdev = pdev;
+	t->refs = 1;
+	t->shared = true;
+	priv->trace = t->trace;
+	list_add_tail(&t->node, &pciem_switches);
+}
+
+int pciem_topo_attach(struct pciem_root_complex *v)
+{
+	struct pciem_topo *t = v->topo;
+	struct pciem_topo_slot *s = dev_slot(v);
+	struct pciem_port *dsp = PCIEM_PORT_DSP(t, v->topo_port);
+	struct pciem_plink *l = s->link;
+	struct pci_bus *child = dsp->pdev ? dsp->pdev->subordinate : NULL;
+	u8 eq = s->p.eq_fail_above == PCIEM_EQ_LIMIT_NONE ? 0 : s->p.eq_fail_above;
+	int rc;
+
+	lockdep_assert_held(&pciem_switch_lock);
+	if (!child)
+		return -ENODEV;
+	rc = pciem_cap_pcie_topo_setup(v, s->p.ep_speed, s->p.ep_width);
+	if (rc)
+		return rc;
+
+	v->root_bus = t->bus;
+	v->bridge_priv = t->priv;
+	v->mode_state.virtual_root.bridge = t->bridge;
+	v->mode_state.virtual_root.assigned_domain = t->domain;
+	v->mode_state.virtual_root.assigned_busnr = t->root_bus;
+
+	pciem_trace_phase(v->trace, PT_PH_TRAIN_BEGIN);
+	scoped_guard(raw_spinlock_irqsave, &t->lock) {
+		s->v = v;
+		s->dev_down = false;
+		s->reach_last = true;
+		s->reach_cb = v->topo_reach_cb;
+		s->reach_data = v->topo_reach_data;
+		l->rrs_ms = s->p.rrs_ms;
+		l->eq_limit = eq;
+		l->allow = 0xff;
+		l->eq_done = 0;
+		pciem_link_partner(l, true, s->p.ep_speed, s->p.ep_width);
+	}
+	pciem_topo_kick_work(t);
+	topo_wait_link(t, l);
+	pciem_trace_phase(v->trace, PT_PH_TRAIN_DONE);
+
+	pciem_trace_phase(v->trace, PT_PH_SCAN_BEGIN);
+	pci_lock_rescan_remove();
+	pci_scan_slot(child, 0);
+	pci_walk_bus(child, topo_walk_fn, NULL);
+	pci_bus_claim_resources(child);
+	v->pciem_pdev = pci_get_domain_bus_and_slot(t->domain, s->ep_bus, PCI_DEVFN(0, 0));
+	if (v->pciem_pdev)
+		pciem_mark_ep_bars(v);
+	pci_unlock_rescan_remove();
+	pciem_trace_phase(v->trace, PT_PH_SCAN_DONE);
+
+	if (!v->pciem_pdev) {
+		pr_err("port %u: no device found at %04x:%02x:00.0\n", v->topo_port, t->domain, s->ep_bus);
+		scoped_guard(raw_spinlock_irqsave, &t->lock) {
+			s->v = NULL;
+			pciem_link_detach(l);
+		}
+		synchronize_rcu();
+		return -ENODEV;
+	}
+	return 0;
+}
+
+static void switch_destroy(struct pciem_topo *t)
+{
+	int i;
+
+	list_del(&t->node);
+	topo_stop(t);
+	debugfs_remove_recursive(t->dir);
+	t->dir = NULL;
+	if (t->bus) {
+		if (t->bus->bridge)
+			pciem_iommu_stub_unregister_bridge(t->bus->bridge);
+		pci_lock_rescan_remove();
+		pci_stop_root_bus(t->bus);
+		pci_remove_root_bus(t->bus);
+		pci_unlock_rescan_remove();
+	}
+	for (i = 0; i < t->nports; i++) {
+		pci_dev_put(t->ports[i].pdev);
+		t->ports[i].pdev = NULL;
+	}
+	topo_free_chunks(t);
+	platform_device_unregister(t->pdev);
+	pciem_topo_free(t);
+}
+
+void pciem_topo_leave(struct pciem_root_complex *v)
+{
+	struct pciem_topo *t = v->topo;
+	struct pciem_topo_slot *s;
+
+	if (!t || !t->shared)
+		return;
+	guard(mutex)(&pciem_switch_lock);
+	s = dev_slot(v);
+	if (s->v == v) {
+		scoped_guard(raw_spinlock_irqsave, &t->lock) {
+			s->v = NULL;
+			s->reach_cb = NULL;
+			pciem_link_detach(s->link);
+		}
+		synchronize_rcu();
+	}
+	v->topo = NULL;
+	v->root_bus = NULL;
+	v->bridge_priv = NULL;
+	if (--t->refs == 0)
+		switch_destroy(t);
+}
+
+void pciem_topo_activate(struct pciem_root_complex *v)
+{
+	struct pciem_topo *t = v->topo;
+	struct pciem_port *chain[3];
+	int i;
+
+	if (!t)
+		return;
+	chain[0] = PCIEM_PORT_RP(t);
+	chain[1] = PCIEM_PORT_USP(t);
+	chain[2] = PCIEM_PORT_DSP(t, v->topo_port);
+	scoped_guard(mutex, &pciem_switch_lock) {
+		for (i = 0; i < 3; i++) {
+			if (chain[i]->pdev && !chain[i]->added) {
+				pci_bus_add_device(chain[i]->pdev);
+				chain[i]->added = true;
+			}
+		}
+	}
+	if (v->pciem_pdev)
+		pci_bus_add_device(v->pciem_pdev);
 }

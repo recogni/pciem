@@ -909,12 +909,12 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
         }
         if (placement) {
             v->placement = placement;
-            v->topo = pciem_topo_alloc(v, placement);
+            v->topo = pciem_topo_alloc(placement);
             if (!v->topo) {
                 pciem_free_root_complex(v);
                 return -ENOMEM;
             }
-            pciem_topo_set_reach_cb(v->topo, pciem_ep_reach, us);
+            pciem_topo_set_reach_cb(v, pciem_ep_reach, us);
         }
         pciem_trace_phase(v->trace, PT_PH_CREATE);
 
@@ -1127,6 +1127,11 @@ static long pciem_ioctl_set_config(struct pciem_userspace_state *us, struct pcie
 
 static struct dentry *pciem_debugfs;
 
+struct dentry *pciem_debugfs_root(void)
+{
+    return pciem_debugfs;
+}
+
 static bool pciem_link_width_valid(u8 width)
 {
     switch (width) {
@@ -1208,7 +1213,7 @@ static int pciem_link_set(struct pciem_userspace_state *us, u8 func, u8 op, u8 s
         if (func != 0 || !v->topo)
             return -EOPNOTSUPP;
         pciem_trace_link_op(v->trace, op, speed, 0, src);
-        return pciem_topo_set_eq_limit(v->topo, speed);
+        return pciem_topo_set_eq_limit(v, speed);
     }
 
     if (!pciem_cap_present(v, PCIEM_CAP_PCIE))
@@ -1216,12 +1221,16 @@ static int pciem_link_set(struct pciem_userspace_state *us, u8 func, u8 op, u8 s
 
     guard(mutex)(&us->link_lock);
 
-    if ((v->topo ? pciem_topo_dev_is_down(v->topo) : READ_ONCE(v->link_down)) ==
+    if ((v->topo ? pciem_topo_dev_is_down(v) : READ_ONCE(v->link_down)) ==
         (op == PCIEM_LINK_DOWN))
         return -EALREADY;
-    if (v->topo && op == PCIEM_LINK_UP &&
-        (speed > v->topo->p.ep_speed || width > v->topo->p.ep_width))
-        return -EINVAL;
+    if (v->topo && op == PCIEM_LINK_UP) {
+        u8 max_speed, max_width;
+
+        pciem_topo_dev_limits(v, &max_speed, &max_width);
+        if (speed > max_speed || width > max_width)
+            return -EINVAL;
+    }
 
     ret = pciem_userspace_queue_event(us, &ev, NULL, true, func);
     if (ret)
@@ -1254,7 +1263,7 @@ static ssize_t pciem_link_debugfs_read(struct file *file, char __user *buf, size
     if (!v)
         return -ENODEV;
     if (v->topo)
-        len = pciem_topo_link_read(v->topo, line, sizeof(line));
+        len = pciem_topo_link_read(v, line, sizeof(line));
     else if (READ_ONCE(v->link_down))
         len = scnprintf(line, sizeof(line), "down\n");
     else if (pciem_cap_pcie_get_link(v, &speed, &width))
@@ -1315,7 +1324,7 @@ static void pciem_link_debugfs_create(struct pciem_userspace_state *us)
         if (f == 0) {
             pciem_trace_debugfs_create(knob->dir, v->trace);
             pciem_topology_debugfs_file(v, knob->dir);
-            pciem_topo_debugfs_create(v->topo, knob->dir);
+            pciem_topo_debugfs_create(v, knob->dir);
         }
     }
 }

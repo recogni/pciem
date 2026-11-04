@@ -110,7 +110,10 @@ struct pciem_root_complex
     /* MSI/MSI-X vector -> Linux irq, for vectors allocated in pciem's MSI domain */
     struct pciem_msi_vecs msi;
     u8 placement;
+    u8 topo_port;
     struct pciem_topo *topo;
+    void (*topo_reach_cb)(void *data, bool reachable);
+    void *topo_reach_data;
     struct pciem_trace *trace;
     struct pci_dev *pciem_pdev;
     struct pci_bus *root_bus;
@@ -195,6 +198,7 @@ void pciem_set_reset_notify(struct pciem_root_complex *v,
 void pciem_link_down(struct pciem_root_complex *v);
 int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width);
 int pciem_complete_init(struct pciem_root_complex *v);
+void pciem_mark_ep_bars(struct pciem_root_complex *v);
 int pciem_start_device(struct pciem_root_complex *v);
 void pciem_set_multifunction(struct pciem_root_complex *func0,
                              unsigned int num_funcs);
