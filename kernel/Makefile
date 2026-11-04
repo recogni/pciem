@@ -18,6 +18,17 @@ endif
 
 ccflags-y := -I$(src)/../include -I$(src)/include
 
+# hrtimer_init() is gone in 6.18, and hrtimer_setup() only exists from 6.13;
+# <linux/unaligned.h> replaced <asm/unaligned.h> in 6.12
+ifneq ($(KERNELRELEASE),)
+ifeq ($(shell [ $(VERSION) -gt 6 ] || [ $(VERSION) -eq 6 -a $(PATCHLEVEL) -ge 13 ] && echo y),y)
+ccflags-y += -DPCIEM_HAVE_HRTIMER_SETUP
+endif
+ifeq ($(shell [ $(VERSION) -gt 6 ] || [ $(VERSION) -eq 6 -a $(PATCHLEVEL) -ge 12 ] && echo y),y)
+ccflags-y += -DPCIEM_HAVE_LINUX_UNALIGNED
+endif
+endif
+
 pciem-objs := framework/pciem.o \
               framework/capabilities.o \
               framework/p2p.o \
@@ -25,7 +36,10 @@ pciem-objs := framework/pciem.o \
               framework/userspace.o \
               framework/pool.o \
               framework/iommu_stub.o \
-              framework/msi_domain.o
+              framework/msi_domain.o \
+              framework/pcitrace.o \
+              framework/topology.o \
+              framework/ltssm.o
 
 pciem-objs += trace/smptrace.o \
               trace/smptrace_user.o \

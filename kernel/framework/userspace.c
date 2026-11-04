@@ -12,6 +12,8 @@
 #include "capabilities.h"
 #include "dma.h"
 #include "p2p.h"
+#include "pcitrace.h"
+#include "topology.h"
 
 #include <linux/anon_inodes.h>
 #include <linux/capability.h>
@@ -71,7 +73,7 @@ struct pciem_reset_state {
     struct pciem_userspace_state *us;
     struct work_struct work;
     u8 func;
-    atomic_t pending[2];        /* PCIEM_RESET_FLR, PCIEM_RESET_PM */
+    atomic_t pending[3];        /* PCIEM_RESET_FLR, PCIEM_RESET_PM, PCIEM_RESET_HOT */
     /* Synchronous reads of the function with a seq below @fail_seq, that
      * of its last reset or link-down event, are on the ring ahead of it,
      * and fail with @fail_status once @fail_needed is seen. */
@@ -168,6 +170,7 @@ static ssize_t pciem_device_write(struct file *file, const char __user *buf, siz
 static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static int pciem_device_mmap(struct file *file, struct vm_area_struct *vma);
 static int pciem_instance_release(struct inode *inode, struct file *file);
+static void pciem_ep_reach(void *data, bool reachable);
 
 const struct file_operations pciem_device_fops = {
     .owner = THIS_MODULE,
@@ -530,7 +533,7 @@ static void pciem_fail_reads_from(struct pciem_reset_state *rs, u64 seq, int sta
 static bool pciem_shared_ring_put_resets(struct pciem_userspace_state *us,
                                          struct pciem_reset_state *rs)
 {
-    static const u32 kinds[] = { PCIEM_RESET_FLR, PCIEM_RESET_PM };
+    static const u32 kinds[] = { PCIEM_RESET_FLR, PCIEM_RESET_PM, PCIEM_RESET_HOT };
     int k;
 
     for (k = 0; k < ARRAY_SIZE(kinds); k++) {
@@ -710,7 +713,7 @@ static void pciem_reset_notify(void *data, u32 kind)
 {
     struct pciem_reset_state *rs = data;
 
-    if (WARN_ON_ONCE(kind != PCIEM_RESET_FLR && kind != PCIEM_RESET_PM))
+    if (WARN_ON_ONCE(kind != PCIEM_RESET_FLR && kind != PCIEM_RESET_PM && kind != PCIEM_RESET_HOT))
         return;
 
     atomic_inc(&rs->pending[kind - 1]);
@@ -848,13 +851,22 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
     struct pciem_root_complex *v;
     enum pciem_bus_mode mode;
     unsigned long flags;
-    u8 func;
+    u8 func, placement;
 
     if (copy_from_user(&cfg, arg, sizeof(cfg)))
         return -EFAULT;
 
     func = cfg.func;
     if (func >= PCIEM_MAX_FUNCTIONS)
+        return -EINVAL;
+    if (cfg.flags & ~(PCIEM_CREATE_FLAG_BUS_MODE_MASK | PCIEM_CREATE_FLAG_FIXED_ADDRESS |
+                      PCIEM_CREATE_FLAG_PLACEMENT_MASK))
+        return -EINVAL;
+    placement = (cfg.flags & PCIEM_CREATE_FLAG_PLACEMENT_MASK) >> PCIEM_CREATE_FLAG_PLACEMENT_SHIFT;
+    if (placement > PCIEM_PLACEMENT_SWITCH)
+        return -EINVAL;
+    if (placement && (func != 0 || (cfg.flags & PCIEM_CREATE_FLAG_BUS_MODE_MASK) !=
+                                       PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL))
         return -EINVAL;
     if ((cfg.flags & PCIEM_CREATE_FLAG_FIXED_ADDRESS) &&
         (func != 0 || (cfg.flags & PCIEM_CREATE_FLAG_BUS_MODE_MASK) !=
@@ -874,6 +886,11 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
         return -EINVAL;
     }
 
+    if (func > 0 && us->slot.funcs[0]->placement) {
+        spin_unlock_irqrestore(&us->slot.slot_lock, flags);
+        return -EOPNOTSUPP;
+    }
+
     spin_unlock_irqrestore(&us->slot.slot_lock, flags);
 
     v = pciem_alloc_root_complex();
@@ -883,6 +900,22 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
     v->func_index = func;
 
     if (func == 0) {
+        v->trace = pciem_trace_alloc();
+        if (!v->trace) {
+            pciem_free_root_complex(v);
+            return -ENOMEM;
+        }
+        if (placement) {
+            v->placement = placement;
+            v->topo = pciem_topo_alloc(v, placement);
+            if (!v->topo) {
+                pciem_free_root_complex(v);
+                return -ENOMEM;
+            }
+            pciem_topo_set_reach_cb(v->topo, pciem_ep_reach, us);
+        }
+        pciem_trace_phase(v->trace, PT_PH_CREATE);
+
         switch (cfg.flags & PCIEM_CREATE_FLAG_BUS_MODE_MASK) {
         case PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL:
             mode = PCIEM_BUS_MODE_VIRTUAL_ROOT;
@@ -1122,7 +1155,17 @@ static void pciem_tracers_set_link_down(struct pciem_userspace_state *us,
     }
 }
 
-static int pciem_link_set(struct pciem_userspace_state *us, u8 func, u8 op, u8 speed, u8 width)
+static void pciem_ep_reach(void *data, bool reachable)
+{
+    struct pciem_userspace_state *us = data;
+    struct pciem_root_complex *v = us->slot.funcs[0];
+
+    if (v)
+        pciem_tracers_set_link_down(us, v, 0, !reachable);
+}
+
+static int pciem_link_set(struct pciem_userspace_state *us, u8 func, u8 op, u8 speed, u8 width,
+                          u8 src)
 {
     struct pciem_root_complex *v;
     struct pciem_event ev = {
@@ -1147,6 +1190,10 @@ static int pciem_link_set(struct pciem_userspace_state *us, u8 func, u8 op, u8 s
             !pciem_link_width_valid(width))
             return -EINVAL;
         break;
+    case PCIEM_LINK_EQ_LIMIT:
+        if (width || speed > PCIEM_LINK_SPEED_64GT)
+            return -EINVAL;
+        break;
     default:
         return -EINVAL;
     }
@@ -1154,17 +1201,30 @@ static int pciem_link_set(struct pciem_userspace_state *us, u8 func, u8 op, u8 s
     v = us_get_rc(us, func);
     if (!v)
         return -ENODEV;
+
+    if (op == PCIEM_LINK_EQ_LIMIT) {
+        if (func != 0 || !v->topo)
+            return -EOPNOTSUPP;
+        pciem_trace_link_op(v->trace, op, speed, 0, src);
+        return pciem_topo_set_eq_limit(v->topo, speed);
+    }
+
     if (!pciem_cap_present(v, PCIEM_CAP_PCIE))
         return -EOPNOTSUPP;
 
     guard(mutex)(&us->link_lock);
 
-    if (READ_ONCE(v->link_down) == (op == PCIEM_LINK_DOWN))
+    if ((v->topo ? pciem_topo_dev_is_down(v->topo) : READ_ONCE(v->link_down)) ==
+        (op == PCIEM_LINK_DOWN))
         return -EALREADY;
+    if (v->topo && op == PCIEM_LINK_UP &&
+        (speed > v->topo->p.ep_speed || width > v->topo->p.ep_width))
+        return -EINVAL;
 
     ret = pciem_userspace_queue_event(us, &ev, NULL, true, func);
     if (ret)
         return ret;
+    pciem_trace_link_op(us->slot.funcs[0]->trace, op, speed, width, src);
 
     if (op == PCIEM_LINK_DOWN) {
         pciem_link_down(v);
@@ -1175,7 +1235,8 @@ static int pciem_link_set(struct pciem_userspace_state *us, u8 func, u8 op, u8 s
     ret = pciem_link_up(v, speed, width);
     if (ret)
         return ret;
-    pciem_tracers_set_link_down(us, v, func, false);
+    if (!v->topo)
+        pciem_tracers_set_link_down(us, v, func, false);
     return 0;
 }
 
@@ -1190,7 +1251,9 @@ static ssize_t pciem_link_debugfs_read(struct file *file, char __user *buf, size
 
     if (!v)
         return -ENODEV;
-    if (READ_ONCE(v->link_down))
+    if (v->topo)
+        len = pciem_topo_link_read(v->topo, line, sizeof(line));
+    else if (READ_ONCE(v->link_down))
         len = scnprintf(line, sizeof(line), "down\n");
     else if (pciem_cap_pcie_get_link(v, &speed, &width))
         return -EOPNOTSUPP;
@@ -1215,10 +1278,12 @@ static ssize_t pciem_link_debugfs_write(struct file *file, const char __user *bu
     line[count] = '\0';
 
     if (sysfs_streq(line, "down"))
-        ret = pciem_link_set(knob->us, knob->func, PCIEM_LINK_DOWN, 0, 0);
+        ret = pciem_link_set(knob->us, knob->func, PCIEM_LINK_DOWN, 0, 0, PT_SRC_DEBUGFS);
     else if (sscanf(line, "up %u %u %c", &speed, &width, &extra) == 2 &&
              speed <= U8_MAX && width <= U8_MAX)
-        ret = pciem_link_set(knob->us, knob->func, PCIEM_LINK_UP, speed, width);
+        ret = pciem_link_set(knob->us, knob->func, PCIEM_LINK_UP, speed, width, PT_SRC_DEBUGFS);
+    else if (sscanf(line, "eq_limit %u %c", &speed, &extra) == 1 && speed <= U8_MAX)
+        ret = pciem_link_set(knob->us, knob->func, PCIEM_LINK_EQ_LIMIT, speed, 0, PT_SRC_DEBUGFS);
     else
         ret = -EINVAL;
 
@@ -1245,6 +1310,11 @@ static void pciem_link_debugfs_create(struct pciem_userspace_state *us)
             continue;
         knob->dir = debugfs_create_dir(pci_name(v->pciem_pdev), pciem_debugfs);
         debugfs_create_file("link", 0600, knob->dir, knob, &pciem_link_debugfs_fops);
+        if (f == 0) {
+            pciem_trace_debugfs_create(knob->dir, v->trace);
+            pciem_topology_debugfs_file(v, knob->dir);
+            pciem_topo_debugfs_create(v->topo, knob->dir);
+        }
     }
 }
 
@@ -1263,7 +1333,26 @@ static long pciem_ioctl_link(struct pciem_userspace_state *us, struct pciem_link
     if (link.flags)
         return -EINVAL;
 
-    return pciem_link_set(us, link.func, link.op, link.speed, link.width);
+    return pciem_link_set(us, link.func, link.op, link.speed, link.width, PT_SRC_IOCTL);
+}
+
+static long pciem_ioctl_set_topology(struct pciem_userspace_state *us,
+                                     struct pciem_topology __user *arg)
+{
+    struct pciem_topology topo;
+    int registered;
+
+    if (!us->slot.funcs[0])
+        return -EINVAL;
+    registered = atomic_read_acquire(&us->registered);
+    if (registered != PCIEM_UNREGISTERED)
+        return -EBUSY;
+    if (copy_from_user(&topo, arg, sizeof(topo)))
+        return -EFAULT;
+    if (!us->slot.funcs[0]->topo)
+        return -EINVAL;
+
+    return pciem_topo_set_params(us->slot.funcs[0]->topo, &topo);
 }
 
 static long pciem_ioctl_register(struct pciem_userspace_state *us)
@@ -2274,6 +2363,9 @@ static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned lon
 
     case PCIEM_IOCTL_LINK:
         return pciem_ioctl_link(us, (struct pciem_link __user *)arg);
+
+    case PCIEM_IOCTL_SET_TOPOLOGY:
+        return pciem_ioctl_set_topology(us, (struct pciem_topology __user *)arg);
 
     default:
         return -ENOTTY;

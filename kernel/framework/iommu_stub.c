@@ -339,10 +339,10 @@ static bool pciem_stub_owns_bus(struct pci_bus *bus)
     struct device *bridge_dev;
     bool found = false;
 
-    if (!bus || !bus->bridge)
+    if (!bus)
         return false;
 
-    bridge_dev = bus->bridge;
+    bridge_dev = &pci_find_host_bridge(bus)->dev;
 
     mutex_lock(&pciem_stub_bridges_lock);
     list_for_each_entry(entry, &pciem_stub_bridges, list) {

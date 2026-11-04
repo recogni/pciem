@@ -24,6 +24,7 @@
 #include <linux/xarray.h>
 
 #include "pciem_api.h"
+#include "msi_domain.h"
 
 #ifdef CONFIG_X86
 #include <asm/pci.h>
@@ -33,11 +34,15 @@
 #endif
 
 struct pciem_root_complex;
+struct pciem_topo;
+struct pciem_trace;
 
 struct pciem_host_bridge_priv {
     struct pciem_root_complex *funcs[PCIEM_MAX_FUNCTIONS];
+    struct pciem_topo *topo;
+    struct pciem_trace *trace;
 
-    /* The bridge's bus number window: exactly the one bus it has */
+    /* The bridge's bus number window: the root bus, and the buses of its bridges */
     struct resource busn;
 
 #ifdef CONFIG_X86
@@ -76,6 +81,7 @@ struct pciem_bar_info
 
     resource_size_t carved_start;
     resource_size_t carved_end;
+    bool in_chunk;
 
     struct list_head vma_list;
     spinlock_t vma_lock;
@@ -101,13 +107,11 @@ struct pciem_root_complex
     unsigned int msi_irq;
     struct irq_work msi_irq_work;
     atomic_t pending_msi_irq;
-    /*
-     * MSI/MSI-X vector -> Linux irq, for vectors allocated in pciem's MSI
-     * domain (msi_domain.c). msi_lock also keeps a vector's irq allocated
-     * while pciem_msi_deliver() runs its handler.
-     */
-    struct mutex msi_lock;
-    struct xarray msi_virqs;
+    /* MSI/MSI-X vector -> Linux irq, for vectors allocated in pciem's MSI domain */
+    struct pciem_msi_vecs msi;
+    u8 placement;
+    struct pciem_topo *topo;
+    struct pciem_trace *trace;
     struct pci_dev *pciem_pdev;
     struct pci_bus *root_bus;
     u8 cfg[256];
@@ -182,6 +186,8 @@ struct pciem_root_complex
 };
 
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector);
+void pciem_function_reset(struct pciem_root_complex *v, u32 kind);
+void pciem_function_reset_state(struct pciem_root_complex *v);
 struct pciem_root_complex *pciem_rc_from_pdev(struct pci_dev *pdev);
 void pciem_set_intx(struct pciem_root_complex *v, bool asserted);
 void pciem_set_reset_notify(struct pciem_root_complex *v,

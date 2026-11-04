@@ -51,7 +51,7 @@ static unsigned long pciem_first_fit_align(unsigned long *map, unsigned long siz
     return bitmap_find_next_zero_area_off(map, size, start, nr, align_mask, align_off);
 }
 
-phys_addr_t pciem_pool_alloc(resource_size_t size)
+phys_addr_t pciem_pool_alloc_aligned(resource_size_t size, resource_size_t align)
 {
     struct pciem_data_align align_data;
     unsigned long addr;
@@ -62,12 +62,12 @@ phys_addr_t pciem_pool_alloc(resource_size_t size)
         return 0;
     }
 
-    if (!size || (size & (size - 1))) {
-        pr_err("Allocation size 0x%llx is not a power of 2\n", (u64)size);
+    if (!size || !align || (align & (align - 1))) {
+        pr_err("Allocation size 0x%llx or alignment 0x%llx is invalid\n", (u64)size, (u64)align);
         return 0;
     }
 
-    align_data.align = size;
+    align_data.align = align;
 
     addr = gen_pool_alloc_algo(pciem_pool.pool, size, pciem_first_fit_align, &align_data);
     if (!addr) {
@@ -78,6 +78,16 @@ phys_addr_t pciem_pool_alloc(resource_size_t size)
     pr_info("Allocated 0x%llx bytes at phys 0x%llx (pool offset 0x%llx)\n",
             (u64)size, (u64)addr, (u64)(addr - pciem_pool.base));
     return addr;
+}
+
+phys_addr_t pciem_pool_alloc(resource_size_t size)
+{
+    if (!size || (size & (size - 1))) {
+        pr_err("Allocation size 0x%llx is not a power of 2\n", (u64)size);
+        return 0;
+    }
+
+    return pciem_pool_alloc_aligned(size, size);
 }
 
 void pciem_pool_free(phys_addr_t addr, resource_size_t size)
