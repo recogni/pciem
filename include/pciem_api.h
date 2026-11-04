@@ -478,15 +478,16 @@ struct pciem_link
  * prefetchable windows, Bridge Control, the PCIe capability with Link and
  * Slot registers (Slot Capabilities report a present device and no
  * power controller; Hot-Plug only with PCIEM_TOPO_FLAG_HOTPLUG), one-vector
- * MSI on the Root Port and the Downstream Port, and an AER capability. Not
- * modelled: power states and the PM capability (so a port cannot be runtime
- * suspended), ASPM and Clock PM, SR-IOV, ARI, a Gen3/Gen4+ equalization
+ * MSI on the Root Port and the Downstream Port, an AER capability and a PM
+ * capability (version 3, No_Soft_Reset set, the power state bits are stored
+ * and nothing else is powered down; with it Linux waits for a port's link
+ * after a Secondary Bus Reset before it restores what is below). Not
+ * modelled: ASPM and Clock PM, SR-IOV, ARI, a Gen3/Gen4+ equalization
  * control with lane registers, and any traffic through a bridge. The Root
  * Port and every Downstream Port have an ACS extended capability: Source
  * Validation, Translation Blocking, P2P Request Redirect, P2P Completion
- * Redirect and Upstream Forwarding, all writable. With them enabled (Linux
- * does when an IOMMU asks for ACS) each device of a switch is in its own
- * IOMMU group.
+ * Redirect and Upstream Forwarding, all writable and all enabled at reset.
+ * With them enabled each device of a switch is in its own IOMMU group.
  *
  * Link. The Root Port, and in a switch each Downstream Port, drives a
  * link to the next function with a small LTSSM (the Link Training and Status

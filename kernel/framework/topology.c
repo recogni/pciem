@@ -17,6 +17,7 @@
 #define PCIEM_VENDOR_ID 0x1ab8
 #define PCIEM_PORT_PCIE 0x40
 #define PCIEM_PORT_MSI  0x80
+#define PCIEM_PORT_PM   0xa0
 #define PCIEM_PORT_AER  0x100
 #define PCIEM_PORT_DPC  0x140
 #define PCIEM_PORT_ACS  0x180
@@ -174,7 +175,7 @@ static void port_build(struct pciem_port *p)
 	rwm(p, PCI_BRIDGE_CONTROL, 2, 0x007f);
 
 	p->cfg[c] = PCI_CAP_ID_EXP;
-	p->cfg[c + 1] = slot ? PCIEM_PORT_MSI : 0;
+	p->cfg[c + 1] = slot ? PCIEM_PORT_MSI : PCIEM_PORT_PM;
 	w16(p, c + PCI_EXP_FLAGS, (type << 4) | 2 | (slot ? PCI_EXP_FLAGS_SLOT : 0));
 	w32(p, c + PCI_EXP_DEVCAP, PCI_EXP_DEVCAP_RBER | 2);
 	w16(p, c + PCI_EXP_DEVCTL, 0x2810);
@@ -220,7 +221,13 @@ static void port_build(struct pciem_port *p)
 		rwm(p, m + PCI_MSI_ADDRESS_LO, 4, 0xfffffffc);
 		rwm(p, m + PCI_MSI_ADDRESS_HI, 4, ~0u);
 		rwm(p, m + PCI_MSI_DATA_64, 2, 0xffff);
+		p->cfg[m + 1] = PCIEM_PORT_PM;
 	}
+
+	p->cfg[PCIEM_PORT_PM] = PCI_CAP_ID_PM;
+	w16(p, PCIEM_PORT_PM + PCI_PM_PMC, 3);
+	w16(p, PCIEM_PORT_PM + PCI_PM_CTRL, PCI_PM_CTRL_NO_SOFT_RESET);
+	rwm(p, PCIEM_PORT_PM + PCI_PM_CTRL, 2, PCI_PM_CTRL_STATE_MASK);
 
 	ue_impl = 0x001ff010 | (ds ? UE_SDES : 0);
 	uemsk = 0x00100000 | ((ds && !(t->p.flags & PCIEM_TOPO_FLAG_UNMASK_SDES)) ? UE_SDES : 0);
