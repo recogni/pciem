@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 #
-# Usage: test_topology.sh [root-port|switch|all] [eq]
+# Usage: test_topology.sh [root-port|switch|switch-multi|all] [eq]
 
 set -eu
 
@@ -27,12 +27,12 @@ cleanup() {
 [ "$(id -u)" -eq 0 ] || die "this script must be run as root"
 [ -x "$HELPER" ] || die "helper not found: $HELPER"
 case "$WHICH" in
-root-port | switch | all) ;;
-*) die "usage: $0 [root-port|switch|all] [eq]" ;;
+root-port | switch | switch-multi | all) ;;
+*) die "usage: $0 [root-port|switch|switch-multi|all] [eq]" ;;
 esac
 case "$EQ" in
 "" | eq) ;;
-*) die "usage: $0 [root-port|switch|all] [eq]" ;;
+*) die "usage: $0 [root-port|switch|switch-multi|all] [eq]" ;;
 esac
 
 trap cleanup EXIT INT TERM
@@ -49,7 +49,7 @@ fi
 echo 1 > /sys/module/pciem/parameters/trace_cfg
 
 if [ "$WHICH" = all ]; then
-	PLACEMENTS="root-port switch"
+	PLACEMENTS="root-port switch switch-multi"
 else
 	PLACEMENTS="$WHICH"
 fi
@@ -57,8 +57,23 @@ fi
 rc=0
 for p in $PLACEMENTS; do
 	echo "=== placement $p ${EQ:+with an equalization limit}"
-	"$HELPER" "$p" $EQ || rc=1
+	if [ "$p" = switch-multi ]; then
+		"$HELPER" switch-multi 3 || rc=1
+		"$HELPER" switch-multi partial || rc=1
+		sleep 1
+	else
+		"$HELPER" "$p" $EQ || rc=1
+	fi
 done
+
+if [ "$LOADED" -eq 1 ]; then
+	if rmmod pciem; then
+		LOADED=0
+	else
+		echo "FAIL: rmmod pciem"
+		rc=1
+	fi
+fi
 
 if [ "$rc" -eq 0 ]; then
 	echo "RESULT: PASS"

@@ -26,6 +26,7 @@
 #define BAR0_SIZE (1u << 20)
 #define BAR2_SIZE (16u << 20)
 #define MAX_CHAIN 4
+#define SW_BUS 0xb0
 #define TRACE_MAX (64u << 20)
 
 static int ctl_fd = -1;
@@ -425,6 +426,11 @@ static void create_device(void)
 		.vendor_id = EP_VENDOR, .device_id = EP_DEVICE, .class_code = { 0x10, 0x02, 0x05 },
 	};
 
+	if (placement == PCIEM_PLACEMENT_SWITCH) {
+		create.flags |= PCIEM_CREATE_FLAG_FIXED_ADDRESS;
+		create.bus = SW_BUS;
+		topo.switch_ports = 1;
+	}
 	ctl_fd = open("/dev/pciem", O_RDWR);
 	if (ctl_fd < 0)
 		err(1, "open /dev/pciem");
@@ -1025,15 +1031,654 @@ static void teardown_cycles(void)
 	}
 }
 
+#define MAXDEV 9
+
+struct mdev {
+	int ctl, inst;
+	struct pciem_shared_ring *ring;
+	int port, hot;
+	uint32_t bar0, bar1, bar2, bar3, cmd;
+	char ep[16], dsp[16], dbg[160];
+};
+
+static struct mdev md[MAXDEV + 1];
+static struct mdev *cur;
+static int nports = 3;
+static char sw_rp[16], sw_usp[16], sw_dbg[160];
+
+static void mflush(void)
+{
+	if (!cur)
+		return;
+	drain_events(NULL);
+	cur->hot += ev_resets[PCIEM_RESET_HOT];
+	memset(ev_resets, 0, sizeof(ev_resets));
+}
+
+static void msel(struct mdev *m)
+{
+	mflush();
+	cur = m;
+	ctl_fd = m->ctl;
+	ring = m->ring;
+	snprintf(ep_bdf, sizeof(ep_bdf), "%s", m->ep);
+	snprintf(port_bdf, sizeof(port_bdf), "%s", m->dsp);
+	snprintf(dbg, sizeof(dbg), "%s", m->dbg);
+	snprintf(portdir, sizeof(portdir), "%s/dsp", m->dbg);
+	port_is_dsp = 1;
+}
+
+static int mdev_create(int port, int total, uint32_t tflags, uint32_t bar2_size, int fixed)
+{
+	struct mdev *m = &md[port];
+	struct pciem_create_device create = {
+		.flags = PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL |
+			 PCIEM_CREATE_FLAG_PLACEMENT(PCIEM_PLACEMENT_SWITCH) |
+			 (fixed ? PCIEM_CREATE_FLAG_FIXED_ADDRESS : 0),
+		.bus = SW_BUS,
+	};
+	struct pciem_topology topo = { .flags = tflags, .port = port, .switch_ports = total };
+	struct pciem_bar_config bar0 = {
+		.bar_index = 0, .flags = PCI_BASE_ADDRESS_MEM_TYPE_64 | PCI_BASE_ADDRESS_MEM_PREFETCH,
+		.size = BAR0_SIZE,
+	};
+	struct pciem_bar_config bar2 = {
+		.bar_index = 2, .flags = PCI_BASE_ADDRESS_MEM_TYPE_64 | PCI_BASE_ADDRESS_MEM_PREFETCH,
+		.size = bar2_size,
+	};
+	struct pciem_cap_config pcie = {
+		.cap_type = PCIEM_CAP_PCIE, .pcie.flags = PCIEM_CAP_PCIE_FLAG_FLR,
+	};
+	struct pciem_cap_config msi = {
+		.cap_type = PCIEM_CAP_MSI, .msi = { .num_vectors_log2 = 0, .has_64bit = 1 },
+	};
+	struct pciem_cap_config pm = { .cap_type = PCIEM_CAP_PM };
+	struct pciem_config_space cfg = {
+		.vendor_id = EP_VENDOR, .device_id = EP_DEVICE, .class_code = { 0x10, 0x02, 0x05 },
+	};
+	int rc = 0;
+
+	memset(m, 0, sizeof(*m));
+	m->port = port;
+	m->ctl = open("/dev/pciem", O_RDWR);
+	if (m->ctl < 0)
+		err(1, "open /dev/pciem");
+	m->ring = mmap(NULL, sizeof(*m->ring), PROT_READ | PROT_WRITE, MAP_SHARED, m->ctl, 0);
+	if (m->ring == MAP_FAILED)
+		err(1, "mmap event ring");
+	m->inst = -1;
+	if (ioctl(m->ctl, PCIEM_IOCTL_CREATE_DEVICE, &create) < 0)
+		rc = errno;
+	else if (ioctl(m->ctl, PCIEM_IOCTL_SET_TOPOLOGY, &topo) < 0)
+		rc = errno;
+	else if (ioctl(m->ctl, PCIEM_IOCTL_ADD_BAR, &bar0) < 0 || ioctl(m->ctl, PCIEM_IOCTL_ADD_BAR, &bar2) < 0)
+		rc = errno;
+	else if (ioctl(m->ctl, PCIEM_IOCTL_ADD_CAPABILITY, &pcie) < 0 ||
+		 ioctl(m->ctl, PCIEM_IOCTL_ADD_CAPABILITY, &msi) < 0 ||
+		 ioctl(m->ctl, PCIEM_IOCTL_ADD_CAPABILITY, &pm) < 0)
+		rc = errno;
+	else if (ioctl(m->ctl, PCIEM_IOCTL_SET_CONFIG, &cfg) < 0)
+		rc = errno;
+	else if ((m->inst = ioctl(m->ctl, PCIEM_IOCTL_REGISTER)) < 0)
+		rc = errno;
+	else if (ioctl(m->ctl, PCIEM_IOCTL_START) < 0)
+		rc = errno;
+	snprintf(m->ep, sizeof(m->ep), "0000:%02x:00.0", SW_BUS + 3 + port);
+	snprintf(m->dsp, sizeof(m->dsp), "0000:%02x:%02x.0", SW_BUS + 2, port);
+	snprintf(m->dbg, sizeof(m->dbg), "/sys/kernel/debug/pciem/0000:%02x:00.0", SW_BUS + 3 + port);
+	return rc;
+}
+
+static void mdev_close(struct mdev *m)
+{
+	if (cur == m) {
+		mflush();
+		cur = NULL;
+	}
+	if (m->ctl < 0)
+		return;
+	munmap(m->ring, sizeof(*m->ring));
+	if (m->inst >= 0)
+		close(m->inst);
+	close(m->ctl);
+	m->ctl = -1;
+}
+
+static int path_exists(const char *fmt, const char *a)
+{
+	char path[300];
+
+	snprintf(path, sizeof(path), fmt, a);
+	return access(path, F_OK) == 0;
+}
+
+static int wait_path(const char *fmt, const char *a, int present, int ms)
+{
+	long end = now_ms() + ms;
+
+	do {
+		if (path_exists(fmt, a) == present)
+			return 1;
+		usleep(20000);
+	} while (now_ms() < end);
+	return 0;
+}
+
+static void msave(struct mdev *m)
+{
+	cfg_read(m->ep, PCI_BASE_ADDRESS_0, 4, &m->bar0);
+	cfg_read(m->ep, PCI_BASE_ADDRESS_1, 4, &m->bar1);
+	cfg_read(m->ep, PCI_BASE_ADDRESS_2, 4, &m->bar2);
+	cfg_read(m->ep, PCI_BASE_ADDRESS_3, 4, &m->bar3);
+	cfg_read(m->ep, PCI_COMMAND, 2, &m->cmd);
+}
+
+static void mrestore(struct mdev *m)
+{
+	cfg_write32(m->ep, PCI_BASE_ADDRESS_0, m->bar0);
+	cfg_write32(m->ep, PCI_BASE_ADDRESS_1, m->bar1);
+	cfg_write32(m->ep, PCI_BASE_ADDRESS_2, m->bar2);
+	cfg_write32(m->ep, PCI_BASE_ADDRESS_3, m->bar3);
+	cfg_write16(m->ep, PCI_COMMAND, m->cmd);
+}
+
+static int vendor_ok(const char *bdf)
+{
+	uint32_t v = 0;
+
+	return !cfg_read(bdf, PCI_VENDOR_ID, 4, &v) && v == (uint32_t)(EP_VENDOR | (EP_DEVICE << 16));
+}
+
+static int mlink_up(struct mdev *m)
+{
+	msel(m);
+	return state_is("ltssm", "L0") && state_is("dl", "up") && state_is("lt", "0");
+}
+
+static int count_ids(uint16_t dev)
+{
+	DIR *d = opendir("/sys/bus/pci/devices");
+	struct dirent *de;
+	int n = 0;
+
+	if (!d)
+		err(1, "opendir");
+	while ((de = readdir(d))) {
+		char p[300];
+
+		if (strlen(de->d_name) != 12)
+			continue;
+		snprintf(p, sizeof(p), "/sys/bus/pci/devices/%s/vendor", de->d_name);
+		if (read_hex(p) != 0x1ab8)
+			continue;
+		snprintf(p, sizeof(p), "/sys/bus/pci/devices/%s/device", de->d_name);
+		if (read_hex(p) == dev)
+			n++;
+	}
+	closedir(d);
+	return n;
+}
+
+static int group_of(const char *bdf)
+{
+	char path[300], link[300], *b;
+	ssize_t n;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/iommu_group", bdf);
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n < 0)
+		return -1;
+	link[n] = '\0';
+	b = strrchr(link, '/');
+	return atoi(b ? b + 1 : link);
+}
+
+static int group_size(int g)
+{
+	char path[100];
+	DIR *d;
+	struct dirent *de;
+	int n = 0;
+
+	snprintf(path, sizeof(path), "/sys/kernel/iommu_groups/%d/devices", g);
+	d = opendir(path);
+	if (!d)
+		return -1;
+	while ((de = readdir(d)))
+		if (de->d_name[0] != '.')
+			n++;
+	closedir(d);
+	return n;
+}
+
+static int ext_cap(const char *bdf, int id)
+{
+	uint32_t hdr;
+	int off = 0x100, guard = 0;
+
+	while (off >= 0x100 && guard++ < 32) {
+		if (cfg_read(bdf, off, 4, &hdr) || !hdr || hdr == 0xffffffff)
+			return -1;
+		if ((hdr & 0xffff) == (uint32_t)id)
+			return off;
+		off = hdr >> 20;
+	}
+	return -1;
+}
+
+static void multi_enumerate(int n)
+{
+	char b[600], js[4096];
+	int g[MAXDEV], k, j, distinct = 1, alone = 1, acs_ok = 1;
+
+	report(count_ids(0xd130) == 1 && count_ids(0xd131) == 1 && count_ids(0xd132) == n,
+	       "one Root Port, one Upstream Port and %d Downstream Ports (%d, %d, %d)", n,
+	       count_ids(0xd130), count_ids(0xd131), count_ids(0xd132));
+	for (k = 0; k < n; k++) {
+		char path[300], real[PATH_MAX];
+
+		snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s", md[k].ep);
+		report(realpath(path, real) && strstr(real, sw_rp) && strstr(real, sw_usp) && strstr(real, md[k].dsp),
+		       "EP %s sits below RP %s, USP %s, DSP %s", md[k].ep, sw_rp, sw_usp, md[k].dsp);
+		report(mlink_up(&md[k]), "port %d link is in L0", k);
+		g[k] = group_of(md[k].ep);
+	}
+	for (k = 0; k < n; k++) {
+		if (g[k] < 0 || group_size(g[k]) != 1)
+			alone = 0;
+		for (j = k + 1; j < n; j++)
+			if (g[k] == g[j])
+				distinct = 0;
+	}
+	b[0] = '\0';
+	for (k = 0; k < n; k++)
+		snprintf(b + strlen(b), sizeof(b) - strlen(b), " %d", g[k]);
+	report(distinct && alone, "each EP is alone in its IOMMU group (groups:%s)", b);
+	note("port groups: RP %d, USP %d, DSP0 %d", group_of(sw_rp), group_of(sw_usp), group_of(md[0].dsp));
+	for (k = 0; k < n; k++) {
+		int off = ext_cap(md[k].dsp, PCI_EXT_CAP_ID_ACS);
+		uint32_t ctl = 0;
+
+		if (off < 0 || cfg_read(md[k].dsp, off + PCI_ACS_CTRL, 2, &ctl) || (ctl & 0x1f) != 0x1f)
+			acs_ok = 0;
+	}
+	report(ext_cap(sw_rp, PCI_EXT_CAP_ID_ACS) > 0 && acs_ok, "RP and every DSP have ACS with SV TB RR CR UF enabled");
+	{
+		uint32_t rp = 0, usp = 0, dsp = 0;
+
+		cfg_read(sw_rp, PCI_PRIMARY_BUS, 4, &rp);
+		cfg_read(sw_usp, PCI_PRIMARY_BUS, 4, &usp);
+		cfg_read(md[n - 1].dsp, PCI_PRIMARY_BUS, 4, &dsp);
+		report((rp & 0xffffff) == (unsigned)(SW_BUS | (SW_BUS + 1) << 8 | (SW_BUS + 2 + n) << 16) &&
+		       (usp & 0xffffff) == (unsigned)((SW_BUS + 1) | (SW_BUS + 2) << 8 | (SW_BUS + 2 + n) << 16) &&
+		       (dsp & 0xffffff) == (unsigned)((SW_BUS + 2) | (SW_BUS + 2 + n) << 8 | (SW_BUS + 2 + n) << 16),
+		       "bus numbers: RP %06x USP %06x last DSP %06x", rp & 0xffffff, usp & 0xffffff, dsp & 0xffffff);
+	}
+	snprintf(sw_dbg, sizeof(sw_dbg), "/sys/kernel/debug/pciem/switch-0000:%02x", SW_BUS);
+	report(path_exists("%s/trace", sw_dbg) && path_exists("%s/trace_ctl", sw_dbg) &&
+	       path_exists("%s/topology", sw_dbg) && path_exists("%s/rp/state", sw_dbg),
+	       "switch debugfs directory %s has trace, trace_ctl, topology and rp/state", sw_dbg);
+	{
+		char path[200];
+
+		snprintf(path, sizeof(path), "%s/topology", md[n - 1].dbg);
+		slurp(path, b, sizeof(b));
+		report(strstr(b, "\"switch_ports\":") && strstr(b, md[n - 1].dsp) && strstr(b, md[n - 1].ep) &&
+		       strstr(b, sw_rp) && strstr(b, sw_usp),
+		       "device topology lists the shared RP, USP, its DSP and its EP");
+		snprintf(path, sizeof(path), "%s/topology", sw_dbg);
+		slurp(path, js, sizeof(js));
+		report(strstr(js, md[0].dsp) && strstr(js, md[n - 1].dsp) && strstr(js, md[n - 1].ep),
+		       "switch topology lists every DSP and EP");
+	}
+}
+
+static int trace_events_after(struct mdev *m, const char *mark, const char *ev)
+{
+	char needle[64];
+
+	msel(m);
+	snprintf(needle, sizeof(needle), "\"ev\":\"%s\"", ev);
+	return count_after(after_mark(mark), needle);
+}
+
+static int switch_events_after(const char *mark, const char *ev)
+{
+	char path[200], needle[64], *p;
+	int n = 0;
+
+	snprintf(path, sizeof(path), "%s/trace", sw_dbg);
+	trace_load();
+	if (slurp(path, trace_buf, TRACE_MAX) < 0)
+		return -1;
+	snprintf(needle, sizeof(needle), "\"text\":\"%s\"", mark);
+	p = strstr(trace_buf, needle);
+	if (!p)
+		return -1;
+	snprintf(needle, sizeof(needle), "\"ev\":\"%s\"", ev);
+	for (p = strstr(p, needle); p; p = strstr(p + 1, needle))
+		n++;
+	return n;
+}
+
+static void mark_all(int n, const char *text)
+{
+	char cmd[80], path[200];
+	int k;
+
+	for (k = 0; k < n; k++) {
+		snprintf(path, sizeof(path), "%s/trace_ctl", md[k].dbg);
+		snprintf(cmd, sizeof(cmd), "mark %s", text);
+		write_str(path, cmd);
+	}
+	snprintf(path, sizeof(path), "%s/trace_ctl", sw_dbg);
+	write_str(path, cmd);
+}
+
+static void multi_isolation(int n)
+{
+	int picks[3] = { 0, n / 2, n - 1 }, pi;
+
+	for (pi = 0; pi < 3; pi++) {
+		int k = picks[pi], j, others_up = 1, others_quiet = 1, rc;
+		char mk[16];
+
+		if (pi && k == picks[pi - 1])
+			continue;
+		for (j = 0; j < n; j++)
+			msave(&md[j]);
+		snprintf(mk, sizeof(mk), "iso%d", k);
+		mark_all(n, mk);
+		msel(&md[k]);
+		rc = link_op(PCIEM_LINK_DOWN, 0, 0);
+		report(rc == 0, "port %d: PCIEM_LINK_DOWN: %s", k, strerror(rc));
+		report(wait_state(300, 2, "dl", "down") == 0, "port %d dl=down", k);
+		sleep_ms(100);
+		for (j = 0; j < n; j++) {
+			if (j == k)
+				continue;
+			others_up = others_up && mlink_up(&md[j]) && vendor_ok(md[j].ep);
+			others_quiet = others_quiet && !trace_events_after(&md[j], mk, "dl") &&
+				       !trace_events_after(&md[j], mk, "ltssm");
+		}
+		report(others_up, "port %d down: the other %d links stay in L0 and their EPs answer", k, n - 1);
+		report(others_quiet, "port %d down: no dl or ltssm record in the other devices' traces", k);
+		report(switch_events_after(mk, "dl") == 0 && switch_events_after(mk, "ltssm") == 0,
+		       "port %d down: the switch trace has no dl or ltssm record", k);
+		report(!vendor_ok(md[k].ep), "port %d down: its EP does not answer", k);
+		msel(&md[k]);
+		rc = link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+		report(rc == 0, "port %d: PCIEM_LINK_UP: %s", k, strerror(rc));
+		report(wait_state(3000, 4, "ltssm", "L0", "dl", "up") == 0, "port %d link back in L0", k);
+		sleep_ms(300);
+		msel(&md[k]);
+		report(wait_state(3000, 4, "ltssm", "L0", "speed", "5") == 0, "port %d link at full speed again", k);
+		mrestore(&md[k]);
+		others_quiet = 1;
+		for (j = 0; j < n; j++)
+			if (j != k)
+				others_quiet = others_quiet && !trace_events_after(&md[j], mk, "dl");
+		report(others_quiet && vendor_ok(md[k].ep), "port %d up: only its own trace saw the link events", k);
+	}
+}
+
+static int resets_of(int j)
+{
+	msel(&md[j]);
+	mflush();
+	return md[j].hot;
+}
+
+static int link_up_rp(void)
+{
+	char path[200], buf[400];
+
+	snprintf(path, sizeof(path), "%s/rp/state", sw_dbg);
+	return !read_text(path, buf, sizeof(buf)) && strstr(buf, "ltssm=L0") && strstr(buf, "dl=up");
+}
+
+static void multi_sbr(int n)
+{
+	int k = n > 1 ? 1 : 0, j, all_ok = 1, only = 1, rc;
+	char path[200];
+
+	for (j = 0; j < n; j++) {
+		msave(&md[j]);
+		resets_of(j);
+		md[j].hot = 0;
+	}
+	mark_all(n, "sbr1");
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/reset_subordinate", md[k].dsp);
+	rc = write_str(path, "1");
+	report(rc == 0, "reset_subordinate on DSP %s: %s", md[k].dsp, strerror(rc ? errno : 0));
+	sleep_ms(500);
+	report(mlink_up(&md[k]) && vendor_ok(md[k].ep), "DSP %d reset: device %d is back", k, k);
+	for (j = 0; j < n; j++) {
+		int h = resets_of(j);
+
+		if (j == k ? h != 1 : h != 0)
+			only = 0;
+		if (j != k && (trace_events_after(&md[j], "sbr1", "dl") || !mlink_up(&md[j])))
+			all_ok = 0;
+	}
+	report(only, "SBR on DSP %d: PCIEM_RESET_HOT reached device %d only", k, k);
+	report(all_ok, "SBR on DSP %d: the other links saw no dl record", k);
+	mrestore(&md[k]);
+
+	for (j = 0; j < n; j++) {
+		msave(&md[j]);
+		resets_of(j);
+		md[j].hot = 0;
+	}
+	mark_all(n, "sbr2");
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/reset_subordinate", sw_rp);
+	rc = write_str(path, "1");
+	report(rc == 0, "reset_subordinate on RP %s: %s", sw_rp, strerror(rc ? errno : 0));
+	sleep_ms(1500);
+	all_ok = 1;
+	only = 1;
+	for (j = 0; j < n; j++) {
+		int h = resets_of(j);
+
+		if (h != 1)
+			only = 0;
+		if (!mlink_up(&md[j]) || !vendor_ok(md[j].ep))
+			all_ok = 0;
+	}
+	report(only, "SBR on the RP: every device got exactly one PCIEM_RESET_HOT");
+	{
+		int seen = 1;
+
+		for (j = 0; j < n; j++) {
+			msel(&md[j]);
+			seen = seen && count_after(after_mark("sbr2"), "\"kind\":\"hot\"") >= 1;
+		}
+		report(seen, "SBR on the RP: every device's trace has a hot reset record");
+	}
+	report(all_ok, "SBR on the RP: every link is back in L0 and every EP answers");
+	report(switch_events_after("sbr2", "reset") > 0, "SBR on the RP: the switch trace has reset records");
+	{
+		uint32_t b[MAXDEV] = {};
+		int same = 1;
+
+		for (j = 0; j < n; j++) {
+			cfg_read(md[j].ep, PCI_BASE_ADDRESS_2, 4, &b[j]);
+			same = same && b[j] == md[j].bar2;
+		}
+		report(same, "SBR on the RP: BARs restored by Linux");
+	}
+}
+
+static void multi_usp_sbr(int n)
+{
+	int j, only = 1, all_ok = 1, rc;
+	char path[200];
+
+	for (j = 0; j < n; j++) {
+		msave(&md[j]);
+		resets_of(j);
+		md[j].hot = 0;
+	}
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/reset_subordinate", sw_usp);
+	rc = write_str(path, "1");
+	report(rc == 0, "reset_subordinate on USP %s: %s", sw_usp, strerror(rc ? errno : 0));
+	sleep_ms(1500);
+	for (j = 0; j < n; j++) {
+		only = only && resets_of(j) == 1;
+		all_ok = all_ok && mlink_up(&md[j]) && vendor_ok(md[j].ep);
+	}
+	report(only, "SBR on the USP: every device got exactly one PCIEM_RESET_HOT");
+	report(all_ok, "SBR on the USP: every link is back in L0 and every EP answers");
+	report(link_up_rp(), "SBR on the USP: the RP link was not disturbed");
+}
+
+static void multi_detach(int n)
+{
+	int order[3] = { n > 1 ? 1 : 0, 0, n - 1 }, oi;
+
+	for (oi = 0; oi < 3; oi++) {
+		int k = order[oi], j, others = 1, rc;
+
+		if (oi && k == order[oi - 1])
+			continue;
+		mdev_close(&md[k]);
+		report(wait_path("/sys/bus/pci/devices/%s", md[k].ep, 0, 5000), "port %d detached: EP %s is gone", k, md[k].ep);
+		report(path_exists("/sys/bus/pci/devices/%s", sw_rp) && path_exists("/sys/bus/pci/devices/%s", md[k].dsp),
+		       "port %d detached: RP and its DSP remain", k);
+		for (j = 0; j < n; j++)
+			if (j != k)
+				others = others && mlink_up(&md[j]) && vendor_ok(md[j].ep);
+		report(others, "port %d detached: the other devices are unaffected", k);
+		rc = mdev_create(k, n, 0, BAR2_SIZE, 1);
+		report(rc == 0, "port %d attached again: %s", k, strerror(rc));
+		report(wait_path("/sys/bus/pci/devices/%s", md[k].ep, 1, 5000) && mlink_up(&md[k]) && vendor_ok(md[k].ep),
+		       "port %d attached again: EP %s is back with its link in L0", k, md[k].ep);
+	}
+}
+
+static void multi_errors(int n)
+{
+	struct mdev saved = md[n - 1];
+	int rc;
+
+	rc = mdev_create(n - 1, n, 0, BAR2_SIZE, 1);
+	report(rc == EBUSY, "a second device on port %d: %s (expected EBUSY)", n - 1, strerror(rc));
+	mdev_close(&md[n - 1]);
+	md[n - 1] = saved;
+
+	rc = mdev_create(n, n + 1, 0, BAR2_SIZE, 1);
+	report(rc == EINVAL, "a device with another switch_ports: %s (expected EINVAL)", strerror(rc));
+	mdev_close(&md[n]);
+
+	rc = mdev_create(n, n, 0, BAR2_SIZE, 1);
+	report(rc == EINVAL, "a device on port %d of %d: %s (expected EINVAL)", n, n, strerror(rc));
+	mdev_close(&md[n]);
+}
+
+static void multi_errors_free_port(int n)
+{
+	int rc;
+
+	rc = mdev_create(n - 1, n, PCIEM_TOPO_FLAG_UNMASK_SDES, BAR2_SIZE, 1);
+	report(rc == EINVAL, "a device with other flags than the switch's: %s (expected EINVAL)", strerror(rc));
+	mdev_close(&md[n - 1]);
+	rc = mdev_create(n - 1, n, 0, 64u << 20, 1);
+	report(rc == ENOSPC, "a device with BARs larger than the chunk: %s (expected ENOSPC)", strerror(rc));
+	mdev_close(&md[n - 1]);
+}
+
+static void multi_run_close_all(int n, const int *order)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		mdev_close(&md[order[i]]);
+}
+
+static int multi_partial(void)
+{
+	static const int ports[] = { 2, 0 };
+	int i, rc;
+
+	for (i = 0; i <= MAXDEV; i++)
+		md[i].ctl = -1;
+	for (i = 0; i < 2; i++) {
+		rc = mdev_create(ports[i], 3, 0, BAR2_SIZE, 1);
+		report(rc == 0, "device on port %d registered: %s", ports[i], strerror(rc));
+		if (rc)
+			return 1;
+		report(wait_path("/sys/bus/pci/devices/%s", md[ports[i]].ep, 1, 5000), "EP %s appeared", md[ports[i]].ep);
+	}
+	printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
+	return failures ? 1 : 0;
+}
+
+static int multi_main(int n)
+{
+	int warn_before = dmesg_count("WARNING:"), bug_before = dmesg_count("BUG:");
+	int k, rc, order[MAXDEV], i;
+	long end;
+
+	if (n < 1 || n > MAXDEV)
+		errx(1, "ports must be 1..%d", MAXDEV);
+	nports = n;
+	snprintf(sw_rp, sizeof(sw_rp), "0000:%02x:00.0", SW_BUS);
+	snprintf(sw_usp, sizeof(sw_usp), "0000:%02x:00.0", SW_BUS + 1);
+	for (k = 0; k <= MAXDEV; k++)
+		md[k].ctl = -1;
+
+	rc = mdev_create(0, n, 0, BAR2_SIZE, 0);
+	report(rc == EINVAL, "a switch device without FIXED_ADDRESS: %s (expected EINVAL)", strerror(rc));
+	mdev_close(&md[0]);
+
+	for (k = 0; k < n; k++) {
+		if (k == n - 1 && n > 1)
+			multi_errors_free_port(n);
+		rc = mdev_create(k, n, 0, BAR2_SIZE, 1);
+		report(rc == 0, "device on port %d registered: %s", k, strerror(rc));
+		if (rc)
+			errx(1, "cannot continue");
+	}
+	for (k = 0; k < n; k++)
+		report(wait_path("/sys/bus/pci/devices/%s", md[k].ep, 1, 5000), "EP %s appeared", md[k].ep);
+	(void)!system("lspci -tv 2>/dev/null | grep -v '^ |'");
+	multi_enumerate(n);
+	if (getenv("TOPO_HOLD") && *getenv("TOPO_HOLD"))
+		sleep(atoi(getenv("TOPO_HOLD")));
+	multi_isolation(n);
+	multi_sbr(n);
+	multi_usp_sbr(n);
+	multi_detach(n);
+	if (n > 1)
+		multi_errors(n);
+
+	for (i = 0; i < n; i++)
+		order[i] = n - 1 - i;
+	multi_run_close_all(n, order);
+	end = now_ms() + 5000;
+	while (now_ms() < end && (count_ids(0xd130) || count_ids(0xd131) || count_ids(0xd132)))
+		usleep(50000);
+	report(!count_ids(0xd130) && !count_ids(0xd131) && !count_ids(0xd132),
+	       "no port of the switch remains after the last device left");
+	report(!path_exists("%s", sw_dbg), "the switch debugfs directory is gone");
+	report(dmesg_count("WARNING:") == warn_before && dmesg_count("BUG:") == bug_before,
+	       "dmesg has no new WARNING: or BUG: lines");
+	printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
+	return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
 	int warn_before, bug_before;
 	long end;
 
-	if (argc < 2 || (strcmp(argv[1], "root-port") && strcmp(argv[1], "switch"))) {
-		fprintf(stderr, "usage: %s root-port|switch [eq]\n", argv[0]);
+	if (argc < 2 || (strcmp(argv[1], "root-port") && strcmp(argv[1], "switch") &&
+			 strcmp(argv[1], "switch-multi"))) {
+		fprintf(stderr, "usage: %s root-port|switch [eq] | switch-multi [ports|partial]\n", argv[0]);
 		return 2;
 	}
+	if (!strcmp(argv[1], "switch-multi"))
+		return argc > 2 && !strcmp(argv[2], "partial") ? multi_partial() : multi_main(argc > 2 ? atoi(argv[2]) : 3);
 	placement = !strcmp(argv[1], "switch") ? PCIEM_PLACEMENT_SWITCH : PCIEM_PLACEMENT_ROOT_PORT;
 	eq_mode = argc > 2 && !strcmp(argv[2], "eq");
 	warn_before = dmesg_count("WARNING:");
@@ -1062,7 +1707,7 @@ int main(int argc, char **argv)
 	}
 	if (argc > 2 && !strcmp(argv[2], "teardown")) {
 		teardown_cycles();
-		sleep_ms(300);
+		usleep(300000);
 		report(dmesg_count("WARNING:") == warn_before && dmesg_count("BUG:") == bug_before,
 		       "dmesg has no new WARNING: or BUG: lines");
 		return failures ? 1 : 0;
