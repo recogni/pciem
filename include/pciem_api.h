@@ -33,10 +33,25 @@ typedef atomic_int atomic_t;
  */
 #define PCIEM_CREATE_FLAG_FIXED_ADDRESS     0x00000004
 
+/** Bits 4-5 of the flags: where a virtual-root device sits; see "Topology" below. */
+#define PCIEM_CREATE_FLAG_PLACEMENT_SHIFT 4
+#define PCIEM_CREATE_FLAG_PLACEMENT_MASK  0x00000030
+#define PCIEM_CREATE_FLAG_PLACEMENT(p)    ((uint32_t)(p) << PCIEM_CREATE_FLAG_PLACEMENT_SHIFT)
+#define PCIEM_PLACEMENT_ROOT_BUS  0   /* on its root bus, as before */
+#define PCIEM_PLACEMENT_ROOT_PORT 1   /* root bus -> Root Port -> device */
+#define PCIEM_PLACEMENT_SWITCH    2   /* root bus -> Root Port -> switch Upstream Port -> Downstream Port -> device */
+
 /**
  * Parameters for PCIEM_IOCTL_CREATE_DEVICE.
  *
- * @param flags     Bus-mode flags (PCIEM_CREATE_FLAG_BUS_MODE_*).
+ * @param flags     Bus-mode flags (PCIEM_CREATE_FLAG_BUS_MODE_*),
+ *                  PCIEM_CREATE_FLAG_FIXED_ADDRESS and the placement
+ *                  (PCIEM_CREATE_FLAG_PLACEMENT()). Bits not defined here
+ *                  fail with EINVAL. A placement of 3, or other than
+ *                  PCIEM_PLACEMENT_ROOT_BUS with a BUS_MODE_ATTACH, fails
+ *                  with EINVAL; a function above 0 of a slot whose function 0
+ *                  has a placement other than PCIEM_PLACEMENT_ROOT_BUS,
+ *                  with EOPNOTSUPP.
  * @param func      Function index to create (0–PCIEM_MAX_FUNCTIONS-1).
  *                  Must be 0 for the first function on a slot.
  *                  Functions 1–7 must be created after func 0.
@@ -224,8 +239,9 @@ struct pciem_event
  * without the device model doing anything.
  *
  * The device model gets one PCIEM_EVENT_RESET per reset, with @offset the
- * function index, @data PCIEM_RESET_FLR or PCIEM_RESET_PM, and @bar and
- * @size 0. It has to reset its own state: registers, queues, FIFOs,
+ * function index, @data PCIEM_RESET_FLR, PCIEM_RESET_PM or, for a function
+ * behind a port that got a hot reset (see "Topology"), PCIEM_RESET_HOT, and
+ * @bar and @size 0. It has to reset its own state: registers, queues, FIFOs,
  * anything in flight, and the BAR contents if it wants them reset (pciem
  * does not touch BAR memory, including the MSI-X table). A reset does not
  * stop MMIO: accesses to the BARs keep being delivered afterwards, the host
@@ -252,6 +268,8 @@ struct pciem_event
 /* Kinds of reset. */
 #define PCIEM_RESET_FLR 1
 #define PCIEM_RESET_PM  2
+/* A hot reset (secondary bus reset) of the port above the function; see "Topology". */
+#define PCIEM_RESET_HOT 3
 
 /*
  * Link.
@@ -271,7 +289,8 @@ struct pciem_event
  * bring up one that is up.
  *
  * While the link is down the function does not answer. The host is not
- * told: there is no port above the function to report the link going down,
+ * told (with PCIEM_PLACEMENT_ROOT_BUS; see "Topology" for the others):
+ * there is no port above the function to report the link going down,
  * so nothing in Linux saves or restores anything, and nothing resets the
  * device.
  *
@@ -351,6 +370,8 @@ struct pciem_event
 /* PCIEM_IOCTL_LINK operations, and the op of a PCIEM_EVENT_LINK. */
 #define PCIEM_LINK_DOWN 1
 #define PCIEM_LINK_UP   2
+/* PCIEM_IOCTL_LINK only, not an event op: equalization above @speed fails (0: no limit); see "Topology". */
+#define PCIEM_LINK_EQ_LIMIT 3
 
 /* Link speeds: the encoding of Current Link Speed in Link Status. */
 #define PCIEM_LINK_SPEED_2_5GT 1
@@ -368,7 +389,10 @@ struct pciem_event
  * Parameters for PCIEM_IOCTL_LINK; see "Link" above.
  *
  * @param func   Function index (0–PCIEM_MAX_FUNCTIONS-1).
- * @param op     PCIEM_LINK_DOWN or PCIEM_LINK_UP.
+ * @param op     PCIEM_LINK_DOWN or PCIEM_LINK_UP, or PCIEM_LINK_EQ_LIMIT
+ *               (function 0 of a device with a placement other than
+ *               PCIEM_PLACEMENT_ROOT_BUS, or EOPNOTSUPP): @speed 0 to
+ *               PCIEM_LINK_SPEED_64GT, @width 0.
  * @param speed  PCIEM_LINK_UP: the speed the link comes back at,
  *               PCIEM_LINK_SPEED_*. Must be 0 for PCIEM_LINK_DOWN.
  * @param width  PCIEM_LINK_UP: the width the link comes back at: 1, 2, 4,
@@ -384,6 +408,263 @@ struct pciem_link
     uint8_t  speed;
     uint8_t  width;
     uint32_t flags;
+};
+
+/*
+ * Topology.
+ *
+ * A virtual-root device is placed with two bits of the flags of
+ * PCIEM_IOCTL_CREATE_DEVICE (PCIEM_CREATE_FLAG_PLACEMENT()), on function 0;
+ * pciem gives the device its own host bridge, and, below it:
+ *
+ * - PCIEM_PLACEMENT_ROOT_BUS: nothing. The device is function 0 on its root
+ *   bus, N:00.0, as it always was. Nothing in this section applies to it,
+ *   except the trace and the debugfs files "trace", "trace_ctl" and
+ *   "topology".
+ * - PCIEM_PLACEMENT_ROOT_PORT: a Root Port at N:00.0, and the device at
+ *   N+1:00.0. The host bridge's bus window is [N, N+1].
+ * - PCIEM_PLACEMENT_SWITCH: a Root Port at N:00.0, a switch Upstream Port at
+ *   N+1:00.0, a Downstream Port at N+2:00.0, and the device at N+3:00.0. The
+ *   window is [N, N+3]. The switch has one Downstream Port: it is the
+ *   device's own.
+ *
+ * N is the first free bus range of the needed size in domain 0, or the
+ * domain and bus of PCIEM_CREATE_FLAG_FIXED_ADDRESS. Registration is
+ * serialised, so the numbering is deterministic: on a host with only bus 00,
+ * the device k of a series that all take the same placement sits at
+ * k+1 (root bus), 2k+2 (Root Port) or 4k+4 (switch). A placement other than
+ * PCIEM_PLACEMENT_ROOT_BUS needs PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL, and is
+ * for single-function devices. An older pciem.ko does not know the placement
+ * bits and ignores them, so a caller that needs one checks where the device
+ * landed (the depth of its path in /sys/bus/pci/devices, 1, 2 or 4).
+ *
+ * pciem acts as the platform firmware: before the host scans the bus it
+ * writes the primary, secondary and subordinate bus numbers of every bridge,
+ * lays the device's BARs out in one chunk of the pool, programs each
+ * bridge's prefetchable window to cover that chunk, and clears Command. The
+ * host then claims what it finds instead of reassigning it, so a BAR never
+ * moves. BAR memory is not routed through the bridges: the windows and the
+ * Command bits are stored and read back, and nothing else uses them. A
+ * device with only prefetchable BARs has no memory window; one with
+ * non-prefetchable BARs needs them below 4 GiB, or REGISTER fails with
+ * EINVAL.
+ *
+ * The bridges are PCI-to-PCI bridges with PCIe capability version 2. Their
+ * IDs are vendor 0x1ab8, device 0xd130 (Root Port), 0xd131 (Upstream Port)
+ * and 0xd132 (Downstream Port); class 0x060400. Modelled: the type 1
+ * header (no I/O window, no BARs, Interrupt Pin 0), the memory and
+ * prefetchable windows, Bridge Control, the PCIe capability with Link and
+ * Slot registers (Slot Capabilities report a present device and no
+ * power controller; Hot-Plug only with PCIEM_TOPO_FLAG_HOTPLUG), one-vector
+ * MSI on the Root Port and the Downstream Port, and an AER capability. Not
+ * modelled: power states and the PM capability (so a port cannot be runtime
+ * suspended), ASPM and Clock PM, ACS, SR-IOV, ARI, a Gen3/Gen4+ equalization
+ * control with lane registers, and any traffic through a bridge.
+ *
+ * Link. The Root Port, and in a switch the Downstream Port, each drive a
+ * link to the next function with a small LTSSM (the Link Training and Status
+ * State Machine) whose state names, in the order a link visits them, are
+ * Detect.Quiet, Detect.Active, Polling.Active, Polling.Configuration,
+ * Configuration.Linkwidth, Configuration.Lanenum, Configuration.Complete,
+ * Configuration.Idle, L0, Recovery.RcvrLock, Recovery.RcvrCfg,
+ * Recovery.Speed, Recovery.Equalization.Phase1 to Phase3, Recovery.Idle,
+ * HotReset and Disabled. The time spent in each state is a model
+ * parameter, in microseconds, not a measurement; the defaults are at the
+ * scale of the PCIe Base Specification's timeouts (a 12 ms Detect.Quiet
+ * and so on), set with the module parameter ltssm_us ("key=value,...") and
+ * per link in the debugfs file "timing".
+ *
+ * A link trains up to L0 at 2.5GT/s, with the width of the narrower end.
+ * Data Link Layer Link Active (DLLLA) follows a few microseconds later
+ * (DL_Up), the device becomes reachable, and Slot Status DLLSC is set.
+ * After a short settle time the link steps up, through Recovery, to the
+ * target speed: the lowest of the Target Link Speed of the port's Link
+ * Control 2 (TLS), the port's maximum, the partner's maximum, and any
+ * limit left by a failed equalization. A step goes from 2.5GT/s to 5GT/s
+ * if that is the target, and otherwise to 8GT/s, 16GT/s and 32GT/s in turn
+ * (5GT/s is skipped). A rate of 8GT/s or more equalizes once per link
+ * training before it is used. The link equalizes unless the device's
+ * equalization limit (PCIEM_LINK_EQ_LIMIT, struct pciem_topology
+ * @eq_fail_above) is below the rate: then Phase 2 of the equalization
+ * times out, the link returns to the previous rate, the rate and the ones
+ * above it are excluded until the next Detect, a retrain or a change of
+ * the limit, and the link steps up to the highest rate still allowed
+ * (which needs no equalization up to 5GT/s). With a limit of 5GT/s
+ * (PCIEM_LINK_SPEED_5GT) the link comes up at 5GT/s with Link Bandwidth
+ * Management Status (LBMS) set, as a link does that cannot equalize.
+ *
+ * Link Status semantics. Link Training (LT) is 1 in every Configuration and
+ * Recovery state and 0 otherwise. LBMS is set at the end of a Recovery that
+ * a write of Retrain Link started, and when the hardware changes speed or
+ * width for reliability (a failed equalization, a Recovery that times out
+ * and trains down). Link Autonomous Bandwidth Status (LABS) is set when the
+ * link steps up by itself after DL_Up, not after a Retrain Link. Neither
+ * is set by the link coming up from DL_Down. Both are write-1-to-clear and
+ * raise the port's interrupt when set, if Link Control enables it. LNKSTA
+ * Current Link Speed and Negotiated Link Width change when L0 is entered.
+ * DLLSC is set at every change of DLLLA.
+ *
+ * Config responses. While the link above a function is not in DL_Up (or is
+ * in HotReset or Disabled), a config read of anything behind the port
+ * completes with all-ones and a write is dropped, as an Unsupported Request
+ * does. For @rrs_ms after each DL_Up (struct pciem_topology; the module
+ * parameter rrs_ms, default 0, none) the device answers Configuration
+ * Request Retry Status (RRS) instead: a read that covers its Vendor ID
+ * returns 0001h in the low half, with ffffh above it in a dword read, if
+ * the Root Port's Root Control has RRS Software Visibility enabled (Linux
+ * does, in pci_enable_rrs_sv()); any other read in that time returns
+ * all-ones, and writes are dropped.
+ * Functions on a bus with no device at that slot answer
+ * PCIBIOS_DEVICE_NOT_FOUND, as always.
+ *
+ * With a placement other than PCIEM_PLACEMENT_ROOT_BUS, PCIEM_LINK_DOWN and
+ * PCIEM_LINK_UP act on the link above the device (the Root Port's in
+ * PCIEM_PLACEMENT_ROOT_PORT, the Downstream Port's in PCIEM_PLACEMENT_SWITCH)
+ * and the host is told: "Link" above stops being true. PCIEM_LINK_DOWN
+ * makes the device stop answering at once; the partner is then gone, the
+ * link falls to Recovery and, after recovery_timeout, to Detect.Quiet with
+ * DLLLA 0, Negotiated Link Width 0, Current Link Speed 2.5GT/s and DLLSC
+ * set. PCIEM_LINK_UP resets the function's config state and makes the
+ * partner present again; the ioctl returns while the link trains, and the
+ * device is reachable once DL_Up is reached, after the RRS window. Reading
+ * the debugfs "link" file gives "down" until then. Either must not
+ * be repeated: EALREADY is judged on what the device last asked for, not on
+ * where the link is. PCIEM_LINK_EQ_LIMIT sets the equalization limit of
+ * the device's link (@speed, 0 for none, with @width 0); it takes effect
+ * at the next equalization and does not retrain.
+ *
+ * The host operates the ports as on hardware, in config writes:
+ *
+ * - Retrain Link (Link Control bit 5), in L0, takes the link through
+ *   Recovery to the current target speed, up or down, and sets LBMS. It
+ *   clears the exclusions of a failed equalization first. LT is 1
+ *   from the write until the link is back in L0. It is ignored outside L0.
+ * - A write of Target Link Speed is stored, and caps the next training or
+ *   retrain. It does not retrain by itself.
+ * - Link Disable puts the link in Disabled with DL_Down, and clearing it in
+ *   Detect.Quiet. Linux uses it before it resets a port.
+ * - Secondary Bus Reset (Bridge Control bit 6), 0 to 1, puts the link in
+ *   HotReset with DL_Down, and resets the device as a Function Level Reset
+ *   does: the device model gets PCIEM_EVENT_RESET with @data PCIEM_RESET_HOT.
+ *   Setting it on a Root Port in switch placement resets the switch
+ *   too: the Upstream and Downstream Port go back to their power-on config
+ *   (bus numbers and windows 0), the Downstream Port's link goes to HotReset
+ *   and stays there until the Root Port's link is up again. Setting it on
+ *   the Upstream Port resets the Downstream Port and the device. When
+ *   it clears again, after the link has spent hot_reset microseconds in
+ *   HotReset it goes to Detect.Quiet and trains; a device whose link was
+ *   down stays down. Linux's pci_reset_secondary_bus() waits 2 ms with the
+ *   bit set, and then waits for the link; with the defaults DL_Up comes
+ *   some 15 ms after the bit clears, and the steps to the target speed
+ *   follow.
+ * - Linux's pcie_failed_link_retrain() (a quirk) retrains a downstream link
+ *   to 2.5GT/s when, after a reset wait, DLLLA is 0 and LBMS has been seen.
+ *   A link whose equalization limit makes it train to a lower speed with
+ *   LBMS set, and then goes down and comes back later than the host's wait
+ *   (about a second), can arm it; the kernel logs it.
+ *
+ * Options, in struct pciem_topology @flags, off by default as on the
+ * hardware this models:
+ *
+ * - PCIEM_TOPO_FLAG_HOTPLUG: the port above the device is Hot-Plug Capable
+ *   and Surprise Hot-Plug capable; Slot Status DLLSC and PDC raise its
+ *   interrupt when Slot Control enables it, and pciehp removes and
+ *   re-enumerates the device on link down and up.
+ * - PCIEM_TOPO_FLAG_NATIVE_AER: the host bridge grants Linux AER and DPC
+ *   (native_aer, native_dpc), so the AER and DPC drivers bind to the Root
+ *   Port. Without it Linux leaves them to the firmware and does nothing.
+ * - PCIEM_TOPO_FLAG_UNMASK_SDES: the Uncorrectable Error Mask of the
+ *   ports resets without Surprise Down masked. A link that goes down other
+ *   than by a reset, a Link Disable or a hot reset from above then sets
+ *   Uncorrectable Error Status SDES on the port, which reports it to the Root
+ *   Port as an error message that sets Root Error Status and its
+ *   interrupt, if the Device and Root Control bits allow it.
+ * - PCIEM_TOPO_FLAG_DPC: the downstream-facing ports have a DPC capability
+ *   (control and status registers only: the trigger is never modelled).
+ *
+ * Interrupts. The Root Port and the Downstream Port have one MSI vector.
+ * A port raises it on a rising edge of LBMS or LABS with its enable in Link
+ * Control (LBMIE, LABIE), of DLLSC, PDC or CC of Slot Status with the
+ * hot-plug interrupt enable and the matching enable, and, for the Root Port,
+ * of a Root Error Status bit with its Root Error Command enable. If the
+ * port's MSI is not enabled, or the vector has no interrupt, the request is
+ * dropped and not repeated.
+ *
+ * Trace. Each device keeps a ring of the last pciem.trace_records (default
+ * 16384, at least 1024) records of what happened on its links and ports, one
+ * JSON object a line, read from /sys/kernel/debug/pciem/<domain:bus:dev.fn>/
+ * (root only, <bdf> of function 0, the device):
+ *
+ *   trace      JSON lines of the ring, oldest first, as a snapshot. Every
+ *              line has t (ktime_get_ns()), seq (per device), ev and fn (rp,
+ *              usp, dsp, ep0..ep7, none). ev is cfg (a config access,
+ *              with pciem.trace_cfg set: bus, devfn, op, off, len, val,
+ *              res), ltssm (from, to, speed, width, why), dl (up, speed,
+ *              width), lnksta (old, new, cls, nlw, lt, dllla, lbms, labs,
+ *              why), sltsta and aer (reg, old, new, why), ctl (what, val),
+ *              link_op (op, speed, width, src), reset (kind), irq (cause,
+ *              vec, sent), phase (name, lc) or mark (text, lc), lc being
+ *              local_clock(), which relates printk times to t. When
+ *              records were overwritten the first line is ev "lost" with
+ *              n the count.
+ *   trace_ctl  write "clear" or "mark <text>".
+ *   topology   one JSON object: the placement, the bus range, and the
+ *              BDF, role and bus numbers of every function.
+ *   rp/ and dsp/ (the ports that drive a link): "state" (one line of
+ *              key=value), "eq_limit" (a rate code, 0 for none), "timing"
+ *              (read all keys, write "key=value ..."), "rrs_ms".
+ *
+ * and the module parameters trace_cfg, trace_ep_irq, trace_records,
+ * ltssm_us, eq_fail_above, rrs_ms and train_timeout_ms (how long REGISTER
+ * waits for the links to settle before it scans, default 1000 ms).
+ */
+
+#define PCIEM_TOPO_FLAG_HOTPLUG     (1u << 0) /* port above the device: Slot Hot-Plug Capable + Surprise */
+#define PCIEM_TOPO_FLAG_NATIVE_AER  (1u << 1) /* host bridge grants Linux AER and DPC (native_aer/native_dpc) */
+#define PCIEM_TOPO_FLAG_UNMASK_SDES (1u << 2) /* AER UEMsk resets without Surprise Down masked */
+#define PCIEM_TOPO_FLAG_DPC         (1u << 3) /* DPC extended capability on downstream-facing ports */
+
+/** @eq_fail_above value for no limit. */
+#define PCIEM_EQ_LIMIT_NONE 0xff
+
+/**
+ * Parameters for PCIEM_IOCTL_SET_TOPOLOGY; see "Topology" above. Zero
+ * fields take defaults. Allowed between PCIEM_IOCTL_CREATE_DEVICE and
+ * PCIEM_IOCTL_REGISTER, for a device with a placement other than
+ * PCIEM_PLACEMENT_ROOT_BUS: EINVAL otherwise, or for a bad speed or width,
+ * a reserved field that is not zero, or an unknown flag; EBUSY after
+ * REGISTER.
+ *
+ * @param flags          PCIEM_TOPO_FLAG_*.
+ * @param rp_speed       Root Port Max Link Speed (PCIEM_LINK_SPEED_*).
+ *                       Default 32GT/s.
+ * @param rp_width       Root Port width. Default 16.
+ * @param dsp_speed      Switch Downstream Port speed; 0 with
+ *                       PCIEM_PLACEMENT_ROOT_PORT. Default 32GT/s.
+ * @param dsp_width      Switch Downstream Port width. Default 8.
+ * @param ep_speed       The device's Max Link Speed (its Link Capabilities).
+ *                       Default 32GT/s.
+ * @param ep_width       The device's Maximum Link Width. Default 8.
+ * @param eq_fail_above  The device's link: equalization to a rate above this
+ *                       fails. 0: the module parameter eq_fail_above;
+ *                       PCIEM_EQ_LIMIT_NONE: no limit.
+ * @param rrs_ms         The device answers Configuration RRS this long after
+ *                       each DL_Up. 0: the module parameter rrs_ms.
+ */
+struct pciem_topology
+{
+    uint32_t flags;
+    uint8_t  rp_speed;
+    uint8_t  rp_width;
+    uint8_t  dsp_speed;
+    uint8_t  dsp_width;
+    uint8_t  ep_speed;
+    uint8_t  ep_width;
+    uint8_t  eq_fail_above;
+    uint8_t  reserved0;
+    uint16_t rrs_ms;
+    uint16_t reserved1;
+    uint32_t reserved[4];
 };
 
 struct pciem_response
@@ -698,6 +979,7 @@ struct pciem_trace_bar_ranges
 #define PCIEM_IOCTL_START _IO(PCIEM_IOCTL_MAGIC, 26)
 #define PCIEM_IOCTL_TRACE_BAR_RANGES _IOW(PCIEM_IOCTL_MAGIC, 27, struct pciem_trace_bar_ranges)
 #define PCIEM_IOCTL_LINK _IOW(PCIEM_IOCTL_MAGIC, 28, struct pciem_link)
+#define PCIEM_IOCTL_SET_TOPOLOGY _IOW(PCIEM_IOCTL_MAGIC, 29, struct pciem_topology)
 
 #define PCIEM_RING_SIZE 256
 #define PCIEM_MAX_IRQFDS 32
