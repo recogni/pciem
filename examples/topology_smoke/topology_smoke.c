@@ -1293,7 +1293,10 @@ static void multi_enumerate(int n)
 	b[0] = '\0';
 	for (k = 0; k < n; k++)
 		snprintf(b + strlen(b), sizeof(b) - strlen(b), " %d", g[k]);
-	report(distinct && alone, "each EP is alone in its IOMMU group (groups:%s)", b);
+	if (g[0] < 0)
+		note("no IOMMU claims these devices, so they have no IOMMU group");
+	else
+		report(distinct && alone, "each EP is alone in its IOMMU group (groups:%s)", b);
 	note("port groups: RP %d, USP %d, DSP0 %d", group_of(sw_rp), group_of(sw_usp), group_of(md[0].dsp));
 	for (k = 0; k < n; k++) {
 		int off = ext_cap(md[k].dsp, PCI_EXT_CAP_ID_ACS);
