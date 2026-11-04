@@ -178,6 +178,33 @@ struct pciem_msi_vecs *pciem_msi_vecs_from_pdev(struct pci_dev *pdev)
     return v ? &v->msi : NULL;
 }
 
+static int pciem_pdev_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+    struct device *dev = data;
+    struct pciem_root_complex *v;
+    struct pci_dev *pdev, *old;
+
+    if (action != BUS_NOTIFY_ADD_DEVICE || !dev_is_pci(dev))
+        return NOTIFY_DONE;
+
+    pdev = to_pci_dev(dev);
+    v = pciem_rc_from_pdev(pdev);
+    if (!v || !v->topo)
+        return NOTIFY_DONE;
+
+    old = READ_ONCE(v->pciem_pdev);
+    if (!old || old == pdev)
+        return NOTIFY_DONE;
+
+    WRITE_ONCE(v->pciem_pdev, pci_dev_get(pdev));
+    pci_dev_put(old);
+    return NOTIFY_OK;
+}
+
+static struct notifier_block pciem_pdev_nb = {
+    .notifier_call = pciem_pdev_notify,
+};
+
 static struct pciem_trace *pciem_rc_trace(struct pciem_root_complex *v)
 {
     if (v->trace)
@@ -1782,6 +1809,10 @@ static int __init pciem_init(void)
     if (ret)
         goto fail_msi_domain;
 
+    ret = bus_register_notifier(&pci_bus_type, &pciem_pdev_nb);
+    if (ret)
+        goto fail_notifier;
+
     ret = pciem_userspace_init();
     if (ret) {
         pr_err("init: Failed to initialize userspace support: %d\n", ret);
@@ -1817,6 +1848,8 @@ static int __init pciem_init(void)
 fail_misc:
     pciem_userspace_cleanup();
 fail_userspace:
+    bus_unregister_notifier(&pci_bus_type, &pciem_pdev_nb);
+fail_notifier:
     pciem_msi_domain_exit();
 fail_msi_domain:
     pciem_pool_exit();
@@ -1832,6 +1865,7 @@ static void __exit pciem_exit(void)
     pciem_iommu_stub_exit();
     misc_deregister(&pciem_dev);
     pciem_userspace_cleanup();
+    bus_unregister_notifier(&pci_bus_type, &pciem_pdev_nb);
     pciem_msi_domain_exit();
     pciem_pool_exit();
     pr_info("exit: Unregistered /dev/pciem\n");
