@@ -423,25 +423,47 @@ struct pciem_link
  *   "topology".
  * - PCIEM_PLACEMENT_ROOT_PORT: a Root Port at N:00.0, and the device at
  *   N+1:00.0. The host bridge's bus window is [N, N+1].
- * - PCIEM_PLACEMENT_SWITCH: a Root Port at N:00.0, a switch Upstream Port at
- *   N+1:00.0, a Downstream Port at N+2:00.0, and the device at N+3:00.0. The
- *   window is [N, N+3]. The switch has one Downstream Port: it is the
- *   device's own.
+ * - PCIEM_PLACEMENT_SWITCH: one switch that many devices share. The switch
+ *   has a Root Port at N:00.0 (secondary N+1, subordinate N+2+P), an Upstream
+ *   Port at N+1:00.0 (secondary N+2), and P Downstream Ports, port k at
+ *   N+2:k.0 (secondary and subordinate N+3+k). The device on port k is at
+ *   N+3+k:00.0. The host bridge's bus window is [N, N+2+P]. P is
+ *   struct pciem_topology @switch_ports and the device picks its port with
+ *   @port.
  *
  * N is the first free bus range of the needed size in domain 0, or the
- * domain and bus of PCIEM_CREATE_FLAG_FIXED_ADDRESS. Registration is
- * serialised, so the numbering is deterministic: on a host with only bus 00,
- * the device k of a series that all take the same placement sits at
- * k+1 (root bus), 2k+2 (Root Port) or 4k+4 (switch). A placement other than
- * PCIEM_PLACEMENT_ROOT_BUS needs PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL, and is
- * for single-function devices. An older pciem.ko does not know the placement
- * bits and ignores them, so a caller that needs one checks where the device
- * landed (the depth of its path in /sys/bus/pci/devices, 1, 2 or 4).
+ * domain and bus of PCIEM_CREATE_FLAG_FIXED_ADDRESS. A switch placement
+ * needs PCIEM_CREATE_FLAG_FIXED_ADDRESS: N is the Root Port's bus, the same
+ * for every device of the switch. Registration is serialised, so the
+ * numbering is deterministic: on a host with only bus 00, the device k of a
+ * series that all take the same placement sits at k+1 (root bus) or 2k+2
+ * (Root Port). A placement other than PCIEM_PLACEMENT_ROOT_BUS needs
+ * PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL, and is for single-function devices. An
+ * older pciem.ko does not know the placement bits and ignores them, so a
+ * caller that needs one checks where the device landed (the depth of its
+ * path in /sys/bus/pci/devices, 1, 2 or 4).
+ *
+ * Shared switch. The first device to REGISTER at (domain, N) creates the
+ * switch: the host bridge, the Root Port, the Upstream Port and all P
+ * Downstream Ports, and one pool region of P equal chunks for the BARs of
+ * the devices, the size of the first device's chunk. A later device with the
+ * same N joins it. Its @switch_ports, @flags and the @rp_*, @dsp_* fields
+ * must equal the first device's, or REGISTER fails with EINVAL; a port that
+ * is taken fails with EBUSY, and a BAR layout larger than one chunk with
+ * ENOSPC. REGISTER of a device waits (module parameter train_timeout_ms) for
+ * its Downstream Port's link to reach L0 and then scans the port's bus; a
+ * Downstream Port with no device has no link partner and stays in
+ * Detect.Quiet. The switch lasts until the last of its devices unregisters
+ * or has its file descriptor closed, in any order; a device that leaves
+ * removes only its own function and brings its port's link down, and a
+ * device that registers on the freed port again gets a fresh link.
  *
  * pciem acts as the platform firmware: before the host scans the bus it
  * writes the primary, secondary and subordinate bus numbers of every bridge,
  * lays the device's BARs out in one chunk of the pool, programs each
- * bridge's prefetchable window to cover that chunk, and clears Command. The
+ * bridge's prefetchable window to cover that chunk (in a switch, the Root
+ * Port's and the Upstream Port's cover the whole region and Downstream Port
+ * k's covers chunk k), and clears Command. The
  * host then claims what it finds instead of reassigning it, so a BAR never
  * moves. BAR memory is not routed through the bridges: the windows and the
  * Command bits are stored and read back, and nothing else uses them. A
@@ -458,10 +480,15 @@ struct pciem_link
  * power controller; Hot-Plug only with PCIEM_TOPO_FLAG_HOTPLUG), one-vector
  * MSI on the Root Port and the Downstream Port, and an AER capability. Not
  * modelled: power states and the PM capability (so a port cannot be runtime
- * suspended), ASPM and Clock PM, ACS, SR-IOV, ARI, a Gen3/Gen4+ equalization
- * control with lane registers, and any traffic through a bridge.
+ * suspended), ASPM and Clock PM, SR-IOV, ARI, a Gen3/Gen4+ equalization
+ * control with lane registers, and any traffic through a bridge. The Root
+ * Port and every Downstream Port have an ACS extended capability: Source
+ * Validation, Translation Blocking, P2P Request Redirect, P2P Completion
+ * Redirect and Upstream Forwarding, all writable. With them enabled (Linux
+ * does when an IOMMU asks for ACS) each device of a switch is in its own
+ * IOMMU group.
  *
- * Link. The Root Port, and in a switch the Downstream Port, each drive a
+ * Link. The Root Port, and in a switch each Downstream Port, drives a
  * link to the next function with a small LTSSM (the Link Training and Status
  * State Machine) whose state names, in the order a link visits them, are
  * Detect.Quiet, Detect.Active, Polling.Active, Polling.Configuration,
@@ -519,8 +546,9 @@ struct pciem_link
  *
  * With a placement other than PCIEM_PLACEMENT_ROOT_BUS, PCIEM_LINK_DOWN and
  * PCIEM_LINK_UP act on the link above the device (the Root Port's in
- * PCIEM_PLACEMENT_ROOT_PORT, the Downstream Port's in PCIEM_PLACEMENT_SWITCH)
- * and the host is told: "Link" above stops being true. PCIEM_LINK_DOWN
+ * PCIEM_PLACEMENT_ROOT_PORT, the device's own Downstream Port's in
+ * PCIEM_PLACEMENT_SWITCH, which leaves the other devices alone) and the host
+ * is told: "Link" above stops being true. PCIEM_LINK_DOWN
  * makes the device stop answering at once; the partner is then gone, the
  * link falls to Recovery and, after recovery_timeout, to Detect.Quiet with
  * DLLLA 0, Negotiated Link Width 0, Current Link Speed 2.5GT/s and DLLSC
@@ -547,10 +575,12 @@ struct pciem_link
  *   HotReset with DL_Down, and resets the device as a Function Level Reset
  *   does: the device model gets PCIEM_EVENT_RESET with @data PCIEM_RESET_HOT.
  *   Setting it on a Root Port in switch placement resets the switch
- *   too: the Upstream and Downstream Port go back to their power-on config
- *   (bus numbers and windows 0), the Downstream Port's link goes to HotReset
- *   and stays there until the Root Port's link is up again. Setting it on
- *   the Upstream Port resets the Downstream Port and the device. When
+ *   too: the Upstream Port and every Downstream Port go back to their
+ *   power-on config (bus numbers and windows 0), every Downstream Port's link
+ *   goes to HotReset and stays there until the Root Port's link is up again,
+ *   and every device of the switch gets the reset event. Setting it on the
+ *   Upstream Port does the same for the Downstream Ports and the devices.
+ *   Setting it on Downstream Port k resets device k only. When
  *   it clears again, after the link has spent hot_reset microseconds in
  *   HotReset it goes to Detect.Quiet and trains; a device whose link was
  *   down stays down. Linux's pci_reset_secondary_bus() waits 2 ms with the
@@ -578,11 +608,12 @@ struct pciem_link
  *   than by a reset, a Link Disable or a hot reset from above then sets
  *   Uncorrectable Error Status SDES on the port, which reports it to the Root
  *   Port as an error message that sets Root Error Status and its
- *   interrupt, if the Device and Root Control bits allow it.
+ *   interrupt, if the Device and Root Control bits allow it. In a switch the
+ *   one Root Port receives the messages of all the Downstream Ports.
  * - PCIEM_TOPO_FLAG_DPC: the downstream-facing ports have a DPC capability
  *   (control and status registers only: the trigger is never modelled).
  *
- * Interrupts. The Root Port and the Downstream Port have one MSI vector.
+ * Interrupts. The Root Port and each Downstream Port have one MSI vector.
  * A port raises it on a rising edge of LBMS or LABS with its enable in Link
  * Control (LBMIE, LABIE), of DLLSC, PDC or CC of Slot Status with the
  * hot-plug interrupt enable and the matching enable, and, for the Root Port,
@@ -593,7 +624,12 @@ struct pciem_link
  * Trace. Each device keeps a ring of the last pciem.trace_records (default
  * 16384, at least 1024) records of what happened on its links and ports, one
  * JSON object a line, read from /sys/kernel/debug/pciem/<domain:bus:dev.fn>/
- * (root only, <bdf> of function 0, the device):
+ * (root only, <bdf> of function 0, the device). In a switch the device's ring
+ * has the records of its own Downstream Port and endpoint; the Root Port's
+ * and the Upstream Port's go to a ring of the switch, in
+ * /sys/kernel/debug/pciem/switch-<domain>:<bus>/ (the Root Port's bus), with
+ * the files "trace", "trace_ctl", "topology" and "rp/" below, which lasts as
+ * long as the switch. Both have the same record schema.
  *
  *   trace      JSON lines of the ring, oldest first, as a snapshot. Every
  *              line has t (ktime_get_ns()), seq (per device), ev and fn (rp,
@@ -609,7 +645,10 @@ struct pciem_link
  *              n the count.
  *   trace_ctl  write "clear" or "mark <text>".
  *   topology   one JSON object: the placement, the bus range, and the
- *              BDF, role and bus numbers of every function.
+ *              BDF, role and bus numbers of every function. A device of a
+ *              switch lists the shared Root Port and Upstream Port, its own
+ *              Downstream Port and its endpoint, with "port" and
+ *              "switch_ports"; the switch's lists every function.
  *   rp/ and dsp/ (the ports that drive a link): "state" (one line of
  *              key=value), "eq_limit" (a rate code, 0 for none), "timing"
  *              (read all keys, write "key=value ..."), "rrs_ms".
@@ -624,6 +663,9 @@ struct pciem_link
 #define PCIEM_TOPO_FLAG_UNMASK_SDES (1u << 2) /* AER UEMsk resets without Surprise Down masked */
 #define PCIEM_TOPO_FLAG_DPC         (1u << 3) /* DPC extended capability on downstream-facing ports */
 
+/** Most Downstream Ports a switch placement has. */
+#define PCIEM_SWITCH_MAX_PORTS 32
+
 /** @eq_fail_above value for no limit. */
 #define PCIEM_EQ_LIMIT_NONE 0xff
 
@@ -632,8 +674,11 @@ struct pciem_link
  * fields take defaults. Allowed between PCIEM_IOCTL_CREATE_DEVICE and
  * PCIEM_IOCTL_REGISTER, for a device with a placement other than
  * PCIEM_PLACEMENT_ROOT_BUS: EINVAL otherwise, or for a bad speed or width,
- * a reserved field that is not zero, or an unknown flag; EBUSY after
- * REGISTER.
+ * a reserved field that is not zero, an unknown flag, @port or
+ * @switch_ports set with another placement than PCIEM_PLACEMENT_SWITCH, a
+ * switch without @switch_ports or with a @port that is not below it, or a
+ * switch without PCIEM_CREATE_FLAG_FIXED_ADDRESS (checked at REGISTER too);
+ * EBUSY after REGISTER.
  *
  * @param flags          PCIEM_TOPO_FLAG_*.
  * @param rp_speed       Root Port Max Link Speed (PCIEM_LINK_SPEED_*).
@@ -650,6 +695,12 @@ struct pciem_link
  *                       PCIEM_EQ_LIMIT_NONE: no limit.
  * @param rrs_ms         The device answers Configuration RRS this long after
  *                       each DL_Up. 0: the module parameter rrs_ms.
+ * @param port           PCIEM_PLACEMENT_SWITCH: the Downstream Port the
+ *                       device attaches to, 0..switch_ports-1. 0 otherwise.
+ * @param switch_ports   PCIEM_PLACEMENT_SWITCH: the number of Downstream
+ *                       Ports of the switch, 1..PCIEM_SWITCH_MAX_PORTS. 0
+ *                       otherwise. Every device of the switch passes the
+ *                       same value.
  */
 struct pciem_topology
 {
@@ -661,9 +712,9 @@ struct pciem_topology
     uint8_t  ep_speed;
     uint8_t  ep_width;
     uint8_t  eq_fail_above;
-    uint8_t  reserved0;
+    uint8_t  port;
     uint16_t rrs_ms;
-    uint16_t reserved1;
+    uint16_t switch_ports;
     uint32_t reserved[4];
 };
 

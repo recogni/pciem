@@ -282,8 +282,14 @@ int pciem_topo_set_params(struct pciem_topo *t, const struct pciem_topology *in)
 	if (p.flags & ~(PCIEM_TOPO_FLAG_HOTPLUG | PCIEM_TOPO_FLAG_NATIVE_AER |
 					PCIEM_TOPO_FLAG_UNMASK_SDES | PCIEM_TOPO_FLAG_DPC))
 		return -EINVAL;
-	if (p.reserved0 || p.reserved1 || memchr_inv(p.reserved, 0, sizeof(p.reserved)))
+	if (memchr_inv(p.reserved, 0, sizeof(p.reserved)))
 		return -EINVAL;
+	if (t->placement == PCIEM_PLACEMENT_SWITCH) {
+		if (!p.switch_ports || p.switch_ports > PCIEM_SWITCH_MAX_PORTS || p.port >= p.switch_ports)
+			return -EINVAL;
+	} else if (p.port || p.switch_ports) {
+		return -EINVAL;
+	}
 	if ((p.rp_speed && !speed_valid(p.rp_speed)) || (p.dsp_speed && !speed_valid(p.dsp_speed)) ||
 		(p.ep_speed && !speed_valid(p.ep_speed)))
 		return -EINVAL;

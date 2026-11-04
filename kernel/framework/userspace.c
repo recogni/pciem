@@ -865,6 +865,8 @@ static long pciem_ioctl_create_device(struct pciem_userspace_state *us, struct p
     placement = (cfg.flags & PCIEM_CREATE_FLAG_PLACEMENT_MASK) >> PCIEM_CREATE_FLAG_PLACEMENT_SHIFT;
     if (placement > PCIEM_PLACEMENT_SWITCH)
         return -EINVAL;
+    if (placement == PCIEM_PLACEMENT_SWITCH && !(cfg.flags & PCIEM_CREATE_FLAG_FIXED_ADDRESS))
+        return -EINVAL;
     if (placement && (func != 0 || (cfg.flags & PCIEM_CREATE_FLAG_BUS_MODE_MASK) !=
                                        PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL))
         return -EINVAL;
