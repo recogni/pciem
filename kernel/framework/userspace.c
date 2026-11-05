@@ -78,7 +78,7 @@ struct pciem_reset_state {
      * of its last reset or link-down event, are on the ring ahead of it,
      * and fail with @fail_status once @fail_needed is seen. */
     atomic_t fail_needed;
-    atomic64_t fail_seq;
+    u64 fail_seq;
     int fail_status;
 };
 
@@ -523,7 +523,7 @@ static bool pciem_shared_ring_put(struct pciem_userspace_state *us,
 
 static void pciem_fail_reads_from(struct pciem_reset_state *rs, u64 seq, int status)
 {
-    atomic64_set(&rs->fail_seq, seq);
+    rs->fail_seq = seq;
     rs->fail_status = status;
     atomic_set_release(&rs->fail_needed, 1);
 }
@@ -640,8 +640,10 @@ static void pciem_reset_fail_reads(struct pciem_userspace_state *us,
 
     if (!atomic_xchg(&rs->fail_needed, 0))
         return;
-    seq = atomic64_read(&rs->fail_seq);
-    status = rs->fail_status;
+    scoped_guard(spinlock_irqsave, &us->shared_ring_lock) {
+        seq = rs->fail_seq;
+        status = rs->fail_status;
+    }
 
     guard(spinlock_irqsave)(&us->pending_lock);
     for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++) {
