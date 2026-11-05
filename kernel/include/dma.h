@@ -11,6 +11,7 @@
 
 struct pciem_root_complex;
 
+int pciem_dma_check(struct pciem_root_complex *v);
 int pciem_dma_read_from_guest(struct pciem_root_complex *v, u64 guest_iova, void *dst, size_t len, u32 pasid);
 int pciem_dma_write_to_guest(struct pciem_root_complex *v, u64 guest_iova, const void *src, size_t len, u32 pasid);
 

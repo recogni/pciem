@@ -1473,6 +1473,8 @@ static long pciem_ioctl_inject_irq(struct pciem_userspace_state *us, struct pcie
         return 0;
     }
     if (inject.flags & PCIEM_IRQ_INJECT_FLAG_LEVEL) {
+        if (!pciem_ep_reachable(v))
+            return -ENOLINK;
         pciem_set_intx(v, true);
         return 0;
     }
@@ -1480,7 +1482,7 @@ static long pciem_ioctl_inject_irq(struct pciem_userspace_state *us, struct pcie
     pr_debug("Injecting MSI vector %d to func %u\n", inject.vector, inject.func);
 
     ret = pciem_trigger_msi(v, inject.vector);
-    if (ret)
+    if (ret && ret != -ENOLINK)
         pr_err_ratelimited("pciem_ioctl_inject_irq: Failed to trigger MSI for func %u, vector %d\n",
                            inject.func, inject.vector);
 
@@ -1551,6 +1553,9 @@ static long pciem_ioctl_dma_atomic(struct pciem_userspace_state *us, struct pcie
     struct pciem_root_complex *v = us_get_rc(us, atomic.func);
     if (!v)
         return -ENODEV;
+    ret = pciem_dma_check(v);
+    if (ret)
+        return ret;
 
     switch (atomic.op_type)
     {
@@ -1600,13 +1605,15 @@ static long pciem_ioctl_p2p(struct pciem_userspace_state *us, struct pciem_p2p_o
     if (op.length == 0)
         return -EINVAL;
 
-    kernel_buf = kmalloc(op.length, GFP_KERNEL);
-    if (!kernel_buf)
-        return -ENOMEM;
-
     struct pciem_root_complex *v = us_get_rc(us, op.func);
     if (!v)
         return -ENODEV;
+    if (!pciem_ep_reachable(v))
+        return -ENOLINK;
+
+    kernel_buf = kmalloc(op.length, GFP_KERNEL);
+    if (!kernel_buf)
+        return -ENOMEM;
 
     if (op.flags & PCIEM_DMA_FLAG_WRITE)
     {
@@ -1734,7 +1741,7 @@ static void pciem_irqfd_work(struct work_struct *work)
         return;
 
     ret = pciem_trigger_msi(v, irqfd->vector);
-    if (ret)
+    if (ret && ret != -ENOLINK)
         pr_warn_ratelimited("irqfd: func%u vector %u: interrupt dropped (%d)\n",
                             irqfd->func, irqfd->vector, ret);
 }

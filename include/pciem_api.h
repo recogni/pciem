@@ -292,7 +292,8 @@ struct pciem_event
  * told (with PCIEM_PLACEMENT_ROOT_BUS; see "Topology" for the others):
  * there is no port above the function to report the link going down,
  * so nothing in Linux saves or restores anything, and nothing resets the
- * device.
+ * device. Interrupts and DMA stop: INJECT_IRQ fails with ENOLINK unless it
+ * deasserts, an irqfd's interrupt is dropped, and DMA and P2P ioctls fail too.
  *
  * - A config read from the PCI core completes with all-ones, as a root port
  *   completes one that got no answer, so lspci, the sysfs config file, what
@@ -310,8 +311,6 @@ struct pciem_event
  * - A synchronous read (PCIEM_TRACE_SYNC_READS) waiting for an answer fails
  *   as on a reset: the access returns all-ones, and an answer the device
  *   model writes for it afterwards fails with EINVAL.
- * - Interrupts are not stopped: an MSI or INTx the device model raises
- *   reaches the host, where the hardware could send nothing.
  *
  * PCIEM_LINK_UP brings the function back as the retrain leaves it:
  *
@@ -562,7 +561,8 @@ struct pciem_link
  * be repeated: EALREADY is judged on what the device last asked for, not on
  * where the link is. PCIEM_LINK_EQ_LIMIT sets the equalization limit of
  * the device's link (@speed, 0 for none, with @width 0); it takes effect
- * at the next equalization and does not retrain.
+ * at the next equalization and does not retrain. While the device is not
+ * reachable, interrupts and DMA stop as "Link" describes.
  *
  * The host operates the ports as on hardware, in config writes:
  *
@@ -603,7 +603,8 @@ struct pciem_link
  * - PCIEM_TOPO_FLAG_HOTPLUG: the port above the device is Hot-Plug Capable
  *   and Surprise Hot-Plug capable; Slot Status DLLSC and PDC raise its
  *   interrupt when Slot Control enables it, and pciehp removes and
- *   re-enumerates the device on link down and up.
+ *   re-enumerates the device on link down and up. DMA fails with ENODEV
+ *   from the removal until Linux enumerates the device again.
  * - PCIEM_TOPO_FLAG_NATIVE_AER: the host bridge grants Linux AER and DPC
  *   (native_aer, native_dpc), so the AER and DPC drivers bind to the Root
  *   Port. Without it Linux leaves them to the firmware and does nothing.
@@ -767,7 +768,7 @@ struct pciem_response
  *
  * A pulse or MSI with nowhere to go (no driver has bound yet, so the INTx
  * line is not routed, and no MSI) fails with -EINVAL, or, from an irqfd, is
- * dropped with a warning. A level assertion always succeeds: it sets the
+ * dropped with a warning. A level assertion while the link is up sets the
  * line, and on a VIRTUAL bus the host is interrupted once it requests or
  * unmasks its irq.
  *

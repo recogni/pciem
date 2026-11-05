@@ -422,6 +422,11 @@ int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width)
     return 0;
 }
 
+bool pciem_ep_reachable(struct pciem_root_complex *v)
+{
+    return !READ_ONCE(v->link_down) && !READ_ONCE(v->dl_down);
+}
+
 int pciem_register_bar(struct pciem_root_complex *v, u32 bar_num, resource_size_t size, u32 flags)
 {
     phys_addr_t phys;
@@ -470,6 +475,7 @@ EXPORT_SYMBOL(pciem_register_bar);
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
 {
     struct pci_dev *dev = v->pciem_pdev;
+    bool reachable;
     int irq, ret;
 
     if (!dev) {
@@ -477,8 +483,11 @@ int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
         return -ENODEV;
     }
 
+    reachable = pciem_ep_reachable(v);
     if (READ_ONCE(pciem_trace_ep_irq))
-        pciem_trace_irq(pciem_rc_trace(v), PT_FN_EP0 + v->func_index, PT_IRQ_EP, vector, true);
+        pciem_trace_irq(pciem_rc_trace(v), PT_FN_EP0 + v->func_index, PT_IRQ_EP, vector, reachable);
+    if (!reachable)
+        return -ENOLINK;
 
     ret = pciem_msi_deliver(&v->msi, vector);
     if (ret != -ENOENT)
@@ -523,6 +532,9 @@ EXPORT_SYMBOL(pciem_trigger_msi);
 void pciem_set_intx(struct pciem_root_complex *v, bool asserted)
 {
     bool raise;
+
+    if (asserted && !pciem_ep_reachable(v))
+        return;
 
     scoped_guard(raw_spinlock_irqsave, &v->intx_lock) {
         raise = asserted && !v->intx_level && !pciem_intx_disabled(v);

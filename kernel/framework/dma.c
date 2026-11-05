@@ -42,6 +42,17 @@ static void pciem_unmap_phys(struct pciem_dma_mapping *m)
 
 DEFINE_FREE(pciem_unmap_phys, struct pciem_dma_mapping, pciem_unmap_phys(&_T))
 
+int pciem_dma_check(struct pciem_root_complex *v)
+{
+    struct pci_dev *pdev = READ_ONCE(v->pciem_pdev);
+
+    if (!pciem_ep_reachable(v))
+        return -ENOLINK;
+    if (!pdev || !device_is_registered(&pdev->dev))
+        return -ENODEV;
+    return 0;
+}
+
 static inline phys_addr_t translate_iova_once(struct iommu_domain *domain,
                                               dma_addr_t iova)
 {
@@ -97,6 +108,9 @@ int pciem_dma_read_from_guest(struct pciem_root_complex *v, u64 guest_iova,
 
     if (!v || !dst || !len)
         return -EINVAL;
+    ret = pciem_dma_check(v);
+    if (ret)
+        return ret;
 
     pages = translate_iova(v, guest_iova, len, &num_pages);
     if (IS_ERR(pages))
@@ -144,6 +158,9 @@ int pciem_dma_write_to_guest(struct pciem_root_complex *v, u64 guest_iova,
 
     if (!v || !src || !len)
         return -EINVAL;
+    ret = pciem_dma_check(v);
+    if (ret)
+        return ret;
 
     pages = translate_iova(v, guest_iova, len, &num_pages);
     if (IS_ERR(pages))
@@ -183,11 +200,15 @@ EXPORT_SYMBOL(pciem_dma_write_to_guest);
 
 static u64 do_atomic_op(struct pciem_root_complex *v, u64 guest_iova, u8 op_type, u64 operand, u64 compare, u32 pasid)
 {
-    struct iommu_domain *domain = iommu_get_domain_for_dev(&v->pciem_pdev->dev);
     struct pciem_dma_mapping m __free(pciem_unmap_phys) = {};
+    struct iommu_domain *domain;
     phys_addr_t phys_addr;
     u64 old_val = 0;
     int ret;
+
+    if (pciem_dma_check(v))
+        return 0;
+    domain = iommu_get_domain_for_dev(&v->pciem_pdev->dev);
 
     if (!IS_ALIGNED(guest_iova, 8)) {
         pr_err("Atomic operation on unaligned address 0x%llx\n", guest_iova);
