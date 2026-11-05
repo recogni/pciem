@@ -398,6 +398,23 @@ static int link_op(uint8_t op, uint8_t speed, uint8_t width)
 	return ioctl(ctl_fd, PCIEM_IOCTL_LINK, &link) < 0 ? errno : 0;
 }
 
+static int dma_read_iova0(int fd)
+{
+	uint64_t buf = 0;
+	struct pciem_dma_op op = {
+		.user_addr = (uintptr_t)&buf, .length = sizeof(buf), .flags = PCIEM_DMA_FLAG_READ,
+	};
+
+	return ioctl(fd, PCIEM_IOCTL_DMA, &op) < 0 ? errno : 0;
+}
+
+static int inject_irq(int fd, uint8_t flags)
+{
+	struct pciem_irq_inject inject = { .flags = flags };
+
+	return ioctl(fd, PCIEM_IOCTL_INJECT_IRQ, &inject) < 0 ? errno : 0;
+}
+
 static void create_device(void)
 {
 	struct pciem_create_device create = {
@@ -629,6 +646,14 @@ static void step_down_up(void)
 	report(!(sta & PCI_EXP_LNKSTA_DLLLA) && !(sta & PCI_EXP_LNKSTA_NLW),
 	       "port LnkSta 0x%04x has DLLLA=0 NLW=0", sta);
 	report(link_op(PCIEM_LINK_DOWN, 0, 0) == EALREADY, "second PCIEM_LINK_DOWN gives EALREADY");
+	rc = dma_read_iova0(ctl_fd);
+	report(rc == ENOLINK, "DMA with the link down: %s (expected ENOLINK)", strerror(rc));
+	rc = inject_irq(ctl_fd, 0);
+	report(rc == ENOLINK, "INJECT_IRQ with the link down: %s (expected ENOLINK)", strerror(rc));
+	rc = inject_irq(ctl_fd, PCIEM_IRQ_INJECT_FLAG_LEVEL);
+	report(rc == ENOLINK, "INJECT_IRQ LEVEL with the link down: %s (expected ENOLINK)", strerror(rc));
+	rc = inject_irq(ctl_fd, PCIEM_IRQ_INJECT_FLAG_DEASSERT);
+	report(rc == 0, "INJECT_IRQ DEASSERT with the link down: %s", strerror(rc));
 
 	rc = link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
 	report(rc == 0, "PCIEM_LINK_UP 5 8: %s", strerror(rc));
@@ -642,6 +667,8 @@ static void step_down_up(void)
 	cfg_read(ep_bdf, PCI_BASE_ADDRESS_0, 4, &bar0);
 	cfg_read(ep_bdf, PCI_BASE_ADDRESS_1, 4, &bar1);
 	report(bar1 == 0 && (bar0 & ~0xfu) == 0, "EP BARs read 0x%08x%08x after the link came back", bar1, bar0);
+	rc = dma_read_iova0(ctl_fd);
+	report(rc != ENOLINK, "DMA after the link came back reaches translation: %s", strerror(rc));
 	restore_ep_cfg();
 }
 
@@ -713,6 +740,33 @@ static void step_retrain(void)
 		       "TLS=%d then Retrain Link ends at speed %d", tls, want);
 		sleep_ms(50);
 	}
+}
+
+static void step_recovery_resume(void)
+{
+	char timing[1024];
+	const char *from;
+	uint32_t v = 0, bar0 = 0;
+	int cap = pcie_cap(port_bdf), rc;
+
+	if (read_text(port_file("timing"), timing, sizeof(timing)))
+		err(1, "read timing");
+	write_str(port_file("timing"), "recovery_speed=300000 recovery_timeout=1000000");
+	trace_mark("rr1");
+	cfg_read(port_bdf, cap + PCI_EXP_LNKCTL, 2, &v);
+	cfg_write16(port_bdf, cap + PCI_EXP_LNKCTL, v | PCI_EXP_LNKCTL_RL);
+	report(wait_state(500, 2, "ltssm", "Recovery.Speed") == 0, "Retrain Link reaches Recovery.Speed");
+	rc = link_op(PCIEM_LINK_DOWN, 0, 0);
+	if (!rc)
+		rc = link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+	report(rc == 0, "PCIEM_LINK_DOWN then PCIEM_LINK_UP in Recovery.Speed: %s", strerror(rc));
+	report(wait_state(5000, 6, "ltssm", "L0", "dl", "up", "lt", "0") == 0, "the link finishes Recovery in L0");
+	write_str(port_file("timing"), timing);
+	sleep_ms(50);
+	from = after_mark("rr1");
+	report(from && !count_after(from, "\"ev\":\"dl\""), "no DL_Down or DL_Up since the retrain");
+	cfg_read(ep_bdf, PCI_BASE_ADDRESS_0, 4, &bar0);
+	report(bar0 == saved_bar0, "EP BAR0 kept its address through the Recovery (0x%08x)", bar0);
 }
 
 static void step_sbr(void)
@@ -1109,7 +1163,7 @@ static int mdev_create(int port, int total, uint32_t tflags, uint32_t bar2_size,
 	m->inst = -1;
 	if (ioctl(m->ctl, PCIEM_IOCTL_CREATE_DEVICE, &create) < 0)
 		rc = errno;
-	else if (ioctl(m->ctl, PCIEM_IOCTL_SET_TOPOLOGY, &topo) < 0)
+	else if (total > 0 && ioctl(m->ctl, PCIEM_IOCTL_SET_TOPOLOGY, &topo) < 0)
 		rc = errno;
 	else if (ioctl(m->ctl, PCIEM_IOCTL_ADD_BAR, &bar0) < 0 || ioctl(m->ctl, PCIEM_IOCTL_ADD_BAR, &bar2) < 0)
 		rc = errno;
@@ -1587,6 +1641,11 @@ static void multi_errors_free_port(int n)
 	mdev_close(&md[n - 1]);
 	rc = mdev_create(n - 1, n, 0, 64u << 20, 1);
 	report(rc == ENOSPC, "a device with BARs larger than the chunk: %s (expected ENOSPC)", strerror(rc));
+	rc = ioctl(md[n - 1].ctl, PCIEM_IOCTL_REGISTER) < 0 ? errno : 0;
+	report(rc == EINVAL, "REGISTER again after the failed one: %s (expected EINVAL)", strerror(rc));
+	mdev_close(&md[n - 1]);
+	rc = mdev_create(n - 1, 0, 0, BAR2_SIZE, 1);
+	report(rc == EINVAL, "a switch device without SET_TOPOLOGY: %s (expected EINVAL)", strerror(rc));
 	mdev_close(&md[n - 1]);
 }
 
@@ -1735,6 +1794,7 @@ int main(int argc, char **argv)
 	step_down_up();
 	step_rrs();
 	step_retrain();
+	step_recovery_resume();
 	step_sbr();
 	step_eq_fallback();
 	step_quirk();

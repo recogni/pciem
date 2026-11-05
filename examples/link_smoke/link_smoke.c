@@ -143,6 +143,23 @@ static int link_op(uint8_t op, uint8_t speed, uint8_t width, uint32_t flags)
 	return ioctl(ctl_fd, PCIEM_IOCTL_LINK, &link) < 0 ? errno : 0;
 }
 
+static int dma_read_iova0(void)
+{
+	uint64_t buf = 0;
+	struct pciem_dma_op op = {
+		.user_addr = (uintptr_t)&buf, .length = sizeof(buf), .flags = PCIEM_DMA_FLAG_READ,
+	};
+
+	return ioctl(ctl_fd, PCIEM_IOCTL_DMA, &op) < 0 ? errno : 0;
+}
+
+static int inject_irq(uint8_t flags)
+{
+	struct pciem_irq_inject inject = { .flags = flags };
+
+	return ioctl(ctl_fd, PCIEM_IOCTL_INJECT_IRQ, &inject) < 0 ? errno : 0;
+}
+
 static void create_device(void)
 {
 	struct pciem_create_device create = {
@@ -253,6 +270,7 @@ static void check_down(const char *how, volatile uint32_t *host, volatile uint32
 	uint8_t cfg[256];
 	char buf[64];
 	uint32_t v;
+	int rc;
 
 	if (read_config(cfg))
 		err(1, "read config");
@@ -265,6 +283,12 @@ static void check_down(const char *how, volatile uint32_t *host, volatile uint32
 	host[0] = HOST_WRITE_DOWN;
 	v = model[0];
 	report(v == model_value, "%s: MMIO write dropped, BAR holds 0x%08x", how, v);
+	rc = dma_read_iova0();
+	report(rc == ENOLINK, "%s: DMA fails with %s (expected ENOLINK)", how, strerror(rc));
+	rc = inject_irq(0);
+	report(rc == ENOLINK, "%s: INJECT_IRQ fails with %s (expected ENOLINK)", how, strerror(rc));
+	rc = inject_irq(PCIEM_IRQ_INJECT_FLAG_LEVEL);
+	report(rc == ENOLINK, "%s: INJECT_IRQ LEVEL fails with %s (expected ENOLINK)", how, strerror(rc));
 }
 
 static void check_up(const char *how, const char *speed_str, const char *resource_before,
@@ -303,6 +327,8 @@ static void check_up(const char *how, const char *speed_str, const char *resourc
 	host[0] = host_value;
 	v = model[0];
 	report(v == host_value, "%s: MMIO write reaches the BAR (0x%08x)", how, v);
+	v = dma_read_iova0();
+	report(v != ENOLINK, "%s: DMA reaches translation again: %s", how, strerror(v));
 }
 
 int main(void)
