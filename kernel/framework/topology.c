@@ -1550,6 +1550,8 @@ int pciem_topo_join(struct pciem_root_complex *v)
 	int bus = v->mode_state.virtual_root.assigned_busnr;
 
 	lockdep_assert_held(&pciem_switch_lock);
+	if (!mine->params_set)
+		return -EINVAL;
 	topo_apply_defaults(mine);
 	v->topo_port = mine->p.port;
 	if (bus + 2 + mine->p.switch_ports > 255)

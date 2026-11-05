@@ -680,7 +680,8 @@ struct pciem_link
  * @switch_ports set with another placement than PCIEM_PLACEMENT_SWITCH, a
  * switch without @switch_ports or with a @port that is not below it, or a
  * switch without PCIEM_CREATE_FLAG_FIXED_ADDRESS (checked at REGISTER too);
- * EBUSY after REGISTER.
+ * EBUSY after REGISTER. A switch placement needs it: REGISTER without it
+ * fails with EINVAL.
  *
  * @param flags          PCIEM_TOPO_FLAG_*.
  * @param rp_speed       Root Port Max Link Speed (PCIEM_LINK_SPEED_*).
