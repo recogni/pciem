@@ -1724,6 +1724,9 @@ void pciem_topo_activate(struct pciem_root_complex *v)
 			}
 		}
 	}
-	if (v->pciem_pdev)
-		pci_bus_add_device(v->pciem_pdev);
+	if (v->pciem_pdev) {
+		pci_lock_rescan_remove();
+		pci_bus_add_devices(v->pciem_pdev->bus);
+		pci_unlock_rescan_remove();
+	}
 }
