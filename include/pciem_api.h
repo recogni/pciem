@@ -181,6 +181,7 @@ struct pciem_event
 #define PCIEM_EVENT_CONFIG_WRITE 4
 #define PCIEM_EVENT_MSI_ACK 5
 #define PCIEM_EVENT_RESET 6
+#define PCIEM_EVENT_LINK 7
 
 /*
  * Reset.
@@ -251,6 +252,139 @@ struct pciem_event
 /* Kinds of reset. */
 #define PCIEM_RESET_FLR 1
 #define PCIEM_RESET_PM  2
+
+/*
+ * Link.
+ *
+ * A function's link can be taken down and brought back up, as a hot reset
+ * of the link does on hardware: a device that reprograms its own SerDes
+ * after enumeration holds its PCIe PIPE in reset, the LTSSM leaves L0 and
+ * retrains, and the function comes back with its configuration space reset,
+ * though the host asked for nothing. PCIEM_IOCTL_LINK (struct pciem_link)
+ * does it to one function, and so does writing "down", or "up <speed>
+ * <width>" (decimal, as in struct pciem_link), to
+ * /sys/kernel/debug/pciem/<domain:bus:dev.fn>/link, a test control (root
+ * only, there while the function is registered; reading it gives the state
+ * in the same words), which drives the scenario without the device model
+ * taking part. Both need a function with a PCIe capability, or fail with
+ * EOPNOTSUPP, and refuse with EALREADY to take down a link that is down, or
+ * bring up one that is up.
+ *
+ * While the link is down the function does not answer. The host is not
+ * told: there is no port above the function to report the link going down,
+ * so nothing in Linux saves or restores anything, and nothing resets the
+ * device.
+ *
+ * - A config read from the PCI core completes with all-ones, as a root port
+ *   completes one that got no answer, so lspci, the sysfs config file, what
+ *   vfio-pci reads from the device for its user, and the kernel's own
+ *   accessors all read ff. A config write is dropped. Linux's view of the
+ *   device (/sys/bus/pci/devices/<bdf>/vendor, enable and resource, its
+ *   pci_dev) is what it was.
+ * - A read of a traced part of a BAR returns all-ones and a write to one is
+ *   dropped, whoever makes it (a kernel driver through ioremap(), a vfio-pci
+ *   user through mmap(), read() or write(), a sysfs resource file), without
+ *   reaching the device model: no PCIEM_EVENT_MMIO_* is queued. Untraced
+ *   parts of a BAR, and pages of a mapping made before the BAR was traced,
+ *   keep reading and writing the backing memory: pciem has no bus to answer
+ *   for them.
+ * - A synchronous read (PCIEM_TRACE_SYNC_READS) waiting for an answer fails
+ *   as on a reset: the access returns all-ones, and an answer the device
+ *   model writes for it afterwards fails with EINVAL.
+ * - Interrupts are not stopped: an MSI or INTx the device model raises
+ *   reaches the host, where the hardware could send nothing.
+ *
+ * PCIEM_LINK_UP brings the function back as the retrain leaves it:
+ *
+ * - Its config state is reset exactly as a Function Level Reset resets it
+ *   (see "Reset": PCI_COMMAND 0, the BARs 0 but for their size and type
+ *   bits, INTx deasserted, MSI, MSI-X, PCIe Device Control and PASID at
+ *   their reset values). Unlike after a reset, Linux restores nothing: the
+ *   function stays with memory decoding off, its BARs unprogrammed and MSI
+ *   and MSI-X disabled until the host's driver sets them up again, while
+ *   /sys/bus/pci/devices/<bdf>/enable and resource, and the host's irq
+ *   state, still say what they said before.
+ * - Link Status reads the given speed (PCIEM_LINK_SPEED_*) and width, so
+ *   lspci -vv shows the link as retrained: 32GT/s x16 after a retrain to
+ *   Gen5, say, where it showed 5GT/s before. Max Link Speed and Maximum
+ *   Link Width in Link Capabilities are raised to them if lower (pciem
+ *   renders both as 0, unknown, to begin with); Link Capabilities 2 is
+ *   left alone. Link Training and Data Link Layer Link Active are not
+ *   modelled, and nothing else in the capability changes.
+ * - BAR memory is not touched, the MSI-X table included: the device keeps
+ *   its state through the retrain, as a chip does.
+ * - Interrupts: pciem delivers a vector by what the host has set up, not by
+ *   the function's MSI or MSI-X Enable bit, so vectors the host had keep
+ *   arriving, where the hardware would send none until the host enabled
+ *   them again.
+ *
+ * The device model gets one PCIEM_EVENT_LINK per operation, with @offset
+ * the function index, @data the op (PCIEM_LINK_DOWN or PCIEM_LINK_UP) in
+ * bits 0-7 and, for PCIEM_LINK_UP, the speed in bits 8-15 and the width in
+ * bits 16-23 (PCIEM_LINK_EVENT_SPEED_SHIFT, PCIEM_LINK_EVENT_WIDTH_SHIFT),
+ * and @bar and @size 0. A model that retrains its own link, through the
+ * ioctl, needs nothing from the event; one driven from the debugfs file
+ * learns from it that the host has lost its configuration. pciem resets
+ * nothing of the model's own state, and the event does not ask it to.
+ *
+ * Order: the event is queued before the link state changes, after the
+ * function's unreported resets. It comes after the events of every access
+ * to the function made before the operation and before those of every
+ * access made after it; an access made while the link goes down or up may
+ * come on either side, and is served as the link was when it was made. A
+ * synchronous read ahead of a PCIEM_LINK_DOWN event on the ring fails, and
+ * an answer to it fails with EINVAL, which must not be taken as an error of
+ * the device model; one after the event is answered as usual. With the ring
+ * full, pciem waits up to a second for the device model to make room, and
+ * failing that the operation fails with ENOSPC and changes nothing. No
+ * acknowledgement is expected.
+ *
+ * vfio-pci is not told either, and PCIEM_LINK_DOWN does not wait for a
+ * read or write its user has in progress, as VFIO_DEVICE_RESET does by
+ * taking memory_lock: a synchronous read in progress fails as above, and
+ * an access already being served completes as it would have. A user that
+ * resets the device afterwards (VFIO_DEVICE_RESET, which vfio-pci also does
+ * on open and on the last close) resets a function that is reset already,
+ * and gets its PCIEM_EVENT_RESET as usual.
+ */
+
+/* PCIEM_IOCTL_LINK operations, and the op of a PCIEM_EVENT_LINK. */
+#define PCIEM_LINK_DOWN 1
+#define PCIEM_LINK_UP   2
+
+/* Link speeds: the encoding of Current Link Speed in Link Status. */
+#define PCIEM_LINK_SPEED_2_5GT 1
+#define PCIEM_LINK_SPEED_5GT   2
+#define PCIEM_LINK_SPEED_8GT   3
+#define PCIEM_LINK_SPEED_16GT  4
+#define PCIEM_LINK_SPEED_32GT  5
+#define PCIEM_LINK_SPEED_64GT  6
+
+/* Where a PCIEM_LINK_UP's speed and width sit in a PCIEM_EVENT_LINK's @data. */
+#define PCIEM_LINK_EVENT_SPEED_SHIFT 8
+#define PCIEM_LINK_EVENT_WIDTH_SHIFT 16
+
+/**
+ * Parameters for PCIEM_IOCTL_LINK; see "Link" above.
+ *
+ * @param func   Function index (0–PCIEM_MAX_FUNCTIONS-1).
+ * @param op     PCIEM_LINK_DOWN or PCIEM_LINK_UP.
+ * @param speed  PCIEM_LINK_UP: the speed the link comes back at,
+ *               PCIEM_LINK_SPEED_*. Must be 0 for PCIEM_LINK_DOWN.
+ * @param width  PCIEM_LINK_UP: the width the link comes back at: 1, 2, 4,
+ *               8, 12, 16 or 32. Must be 0 for PCIEM_LINK_DOWN.
+ * @param flags  Must be zero.
+ *
+ * Anything else fails with EINVAL.
+ */
+struct pciem_link
+{
+    uint8_t  func;
+    uint8_t  op;
+    uint8_t  speed;
+    uint8_t  width;
+    uint32_t flags;
+};
 
 struct pciem_response
 {
@@ -563,6 +697,7 @@ struct pciem_trace_bar_ranges
 #define PCIEM_IOCTL_TRACE_BAR _IOWR(PCIEM_IOCTL_MAGIC, 25, struct pciem_trace_bar)
 #define PCIEM_IOCTL_START _IO(PCIEM_IOCTL_MAGIC, 26)
 #define PCIEM_IOCTL_TRACE_BAR_RANGES _IOW(PCIEM_IOCTL_MAGIC, 27, struct pciem_trace_bar_ranges)
+#define PCIEM_IOCTL_LINK _IOW(PCIEM_IOCTL_MAGIC, 28, struct pciem_link)
 
 #define PCIEM_RING_SIZE 256
 #define PCIEM_MAX_IRQFDS 32

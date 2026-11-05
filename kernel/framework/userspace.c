@@ -29,6 +29,7 @@
 #include <linux/version.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
+#include <linux/debugfs.h>
 
 struct pciem_irqfd
 {
@@ -72,10 +73,17 @@ struct pciem_reset_state {
     u8 func;
     atomic_t pending[2];        /* PCIEM_RESET_FLR, PCIEM_RESET_PM */
     /* Synchronous reads of the function with a seq below @fail_seq, that
-     * of its last reset event, are on the ring ahead of the reset, and fail
-     * once @fail_needed is seen. */
+     * of its last reset or link-down event, are on the ring ahead of it,
+     * and fail with @fail_status once @fail_needed is seen. */
     atomic_t fail_needed;
     atomic64_t fail_seq;
+    int fail_status;
+};
+
+struct pciem_link_knob {
+    struct pciem_userspace_state *us;
+    struct dentry *dir;
+    u8 func;
 };
 
 struct pciem_slot_state {
@@ -113,6 +121,9 @@ struct pciem_userspace_state
     struct mutex trace_lock;
 
     struct pciem_reset_state resets[PCIEM_MAX_FUNCTIONS];
+
+    struct pciem_link_knob link_knobs[PCIEM_MAX_FUNCTIONS];
+    struct mutex link_lock;
 
     /* Event sequence numbers, given out under shared_ring_lock as each
      * event goes on the ring, so they increase in ring order. Sync-read
@@ -403,8 +414,10 @@ struct pciem_userspace_state *pciem_userspace_create(void)
         rs->us = us;
         rs->func = i;
         INIT_WORK(&rs->work, pciem_reset_work);
+        us->link_knobs[i].us = us;
+        us->link_knobs[i].func = i;
     }
-
+    mutex_init(&us->link_lock);
 
     return us;
 }
@@ -418,6 +431,9 @@ static void pciem_userspace_destroy(struct kref *refcnt)
 
     if (!us)
         return;
+
+    for (f = 0; f < PCIEM_MAX_FUNCTIONS; f++)
+        debugfs_remove_recursive(us->link_knobs[f].dir);
 
     /* Fail every request still waiting on a response, and refuse new
      * ones, before destroying the tracers: destroying one waits for any
@@ -445,6 +461,7 @@ static void pciem_userspace_destroy(struct kref *refcnt)
 
     pciem_tracing_destroy(us);
     mutex_destroy(&us->trace_lock);
+    mutex_destroy(&us->link_lock);
     pciem_irqfds_shutdown(&us->irqfds);
 
     pciem_shared_ring_destroy(us);
@@ -501,6 +518,13 @@ static bool pciem_shared_ring_put(struct pciem_userspace_state *us,
     return true;
 }
 
+static void pciem_fail_reads_from(struct pciem_reset_state *rs, u64 seq, int status)
+{
+    atomic64_set(&rs->fail_seq, seq);
+    rs->fail_status = status;
+    atomic_set_release(&rs->fail_needed, 1);
+}
+
 /* Queues a PCIEM_EVENT_RESET for each reset of @rs's function not reported
  * yet. Caller holds shared_ring_lock. False if the ring fills up first. */
 static bool pciem_shared_ring_put_resets(struct pciem_userspace_state *us,
@@ -520,8 +544,7 @@ static bool pciem_shared_ring_put_resets(struct pciem_userspace_state *us,
             if (!pciem_shared_ring_put(us, &ev))
                 return false;
             atomic_dec(&rs->pending[k]);
-            atomic64_set(&rs->fail_seq, ev.seq);
-            atomic_set_release(&rs->fail_needed, 1);
+            pciem_fail_reads_from(rs, ev.seq, -ECONNRESET);
         }
     }
 
@@ -552,8 +575,14 @@ static int pciem_shared_ring_push(struct pciem_userspace_state *us,
         return -ENOSPC;
     if (!event)
         return 0;
-    if (!req)
-        return pciem_shared_ring_put(us, event) ? 0 : -ENOSPC;
+    if (!req) {
+        if (!pciem_shared_ring_put(us, event))
+            return -ENOSPC;
+        if (func >= 0 && event->type == PCIEM_EVENT_LINK &&
+            (u8)event->data == PCIEM_LINK_DOWN)
+            pciem_fail_reads_from(&us->resets[func], event->seq, -ENOLINK);
+        return 0;
+    }
     if (!pciem_shared_ring_has_room(us))
         return -ENOSPC;
 
@@ -594,9 +623,9 @@ static void pciem_userspace_kick(struct pciem_userspace_state *us)
 
 /*
  * Fails the synchronous reads of @rs's function that are on the ring ahead
- * of its last reset event, once that is queued. Each is unpublished before
- * it completes, so a late answer finds nothing and pciem_device_write()
- * refuses it.
+ * of its last reset or link-down event, once that is queued. Each is
+ * unpublished before it completes, so a late answer finds nothing and
+ * pciem_device_write() refuses it.
  */
 static void pciem_reset_fail_reads(struct pciem_userspace_state *us,
                                    struct pciem_reset_state *rs)
@@ -604,11 +633,12 @@ static void pciem_reset_fail_reads(struct pciem_userspace_state *us,
     struct pciem_pending_request *req;
     struct hlist_node *tmp;
     u64 seq;
-    int i;
+    int i, status;
 
     if (!atomic_xchg(&rs->fail_needed, 0))
         return;
     seq = atomic64_read(&rs->fail_seq);
+    status = rs->fail_status;
 
     guard(spinlock_irqsave)(&us->pending_lock);
     for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++) {
@@ -616,7 +646,7 @@ static void pciem_reset_fail_reads(struct pciem_userspace_state *us,
             if (req->func != rs->func || req->seq > seq)
                 continue;
             hlist_del_init(&req->node);
-            req->response_status = -ECONNRESET;
+            req->response_status = status;
             complete(&req->done);
         }
     }
@@ -1060,6 +1090,182 @@ static long pciem_ioctl_set_config(struct pciem_userspace_state *us, struct pcie
     return 0;
 }
 
+static struct dentry *pciem_debugfs;
+
+static bool pciem_link_width_valid(u8 width)
+{
+    switch (width) {
+    case 1:
+    case 2:
+    case 4:
+    case 8:
+    case 12:
+    case 16:
+    case 32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void pciem_tracers_set_link_down(struct pciem_userspace_state *us,
+                                        struct pciem_root_complex *v, u8 func, bool down)
+{
+    unsigned int bar;
+
+    guard(write_lock)(&v->bars_lock);
+    for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+        struct pciem_tracer *tracer = &us->tracers[func][bar];
+
+        if (tracer->us)
+            WRITE_ONCE(tracer->ctx.link_down, down);
+    }
+}
+
+static int pciem_link_set(struct pciem_userspace_state *us, u8 func, u8 op, u8 speed, u8 width)
+{
+    struct pciem_root_complex *v;
+    struct pciem_event ev = {
+        .type = PCIEM_EVENT_LINK,
+        .offset = func,
+        .data = op | ((u64)speed << PCIEM_LINK_EVENT_SPEED_SHIFT) |
+                ((u64)width << PCIEM_LINK_EVENT_WIDTH_SHIFT),
+    };
+    int ret;
+
+    ret = pciem_check_registered(us);
+    if (ret)
+        return ret;
+
+    switch (op) {
+    case PCIEM_LINK_DOWN:
+        if (speed || width)
+            return -EINVAL;
+        break;
+    case PCIEM_LINK_UP:
+        if (speed < PCIEM_LINK_SPEED_2_5GT || speed > PCIEM_LINK_SPEED_64GT ||
+            !pciem_link_width_valid(width))
+            return -EINVAL;
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    v = us_get_rc(us, func);
+    if (!v)
+        return -ENODEV;
+    if (!pciem_cap_present(v, PCIEM_CAP_PCIE))
+        return -EOPNOTSUPP;
+
+    guard(mutex)(&us->link_lock);
+
+    if (READ_ONCE(v->link_down) == (op == PCIEM_LINK_DOWN))
+        return -EALREADY;
+
+    ret = pciem_userspace_queue_event(us, &ev, NULL, true, func);
+    if (ret)
+        return ret;
+
+    if (op == PCIEM_LINK_DOWN) {
+        pciem_link_down(v);
+        pciem_tracers_set_link_down(us, v, func, true);
+        return 0;
+    }
+
+    ret = pciem_link_up(v, speed, width);
+    if (ret)
+        return ret;
+    pciem_tracers_set_link_down(us, v, func, false);
+    return 0;
+}
+
+static ssize_t pciem_link_debugfs_read(struct file *file, char __user *buf, size_t count,
+                                       loff_t *ppos)
+{
+    struct pciem_link_knob *knob = file->private_data;
+    struct pciem_root_complex *v = us_get_rc(knob->us, knob->func);
+    char line[32];
+    u8 speed, width;
+    int len;
+
+    if (!v)
+        return -ENODEV;
+    if (READ_ONCE(v->link_down))
+        len = scnprintf(line, sizeof(line), "down\n");
+    else if (pciem_cap_pcie_get_link(v, &speed, &width))
+        return -EOPNOTSUPP;
+    else
+        len = scnprintf(line, sizeof(line), "up %u %u\n", speed, width);
+
+    return simple_read_from_buffer(buf, count, ppos, line, len);
+}
+
+static ssize_t pciem_link_debugfs_write(struct file *file, const char __user *buf, size_t count,
+                                        loff_t *ppos)
+{
+    struct pciem_link_knob *knob = file->private_data;
+    unsigned int speed, width;
+    char line[32], extra;
+    int ret;
+
+    if (count >= sizeof(line))
+        return -EINVAL;
+    if (copy_from_user(line, buf, count))
+        return -EFAULT;
+    line[count] = '\0';
+
+    if (sysfs_streq(line, "down"))
+        ret = pciem_link_set(knob->us, knob->func, PCIEM_LINK_DOWN, 0, 0);
+    else if (sscanf(line, "up %u %u %c", &speed, &width, &extra) == 2 &&
+             speed <= U8_MAX && width <= U8_MAX)
+        ret = pciem_link_set(knob->us, knob->func, PCIEM_LINK_UP, speed, width);
+    else
+        ret = -EINVAL;
+
+    return ret ?: count;
+}
+
+static const struct file_operations pciem_link_debugfs_fops = {
+    .owner = THIS_MODULE,
+    .open = simple_open,
+    .read = pciem_link_debugfs_read,
+    .write = pciem_link_debugfs_write,
+    .llseek = default_llseek,
+};
+
+static void pciem_link_debugfs_create(struct pciem_userspace_state *us)
+{
+    int f;
+
+    for (f = 0; f < PCIEM_MAX_FUNCTIONS; f++) {
+        struct pciem_root_complex *v = us->slot.funcs[f];
+        struct pciem_link_knob *knob = &us->link_knobs[f];
+
+        if (!v || !v->pciem_pdev)
+            continue;
+        knob->dir = debugfs_create_dir(pci_name(v->pciem_pdev), pciem_debugfs);
+        debugfs_create_file("link", 0600, knob->dir, knob, &pciem_link_debugfs_fops);
+    }
+}
+
+static long pciem_ioctl_link(struct pciem_userspace_state *us, struct pciem_link __user *arg)
+{
+    struct pciem_link link;
+    int ret;
+
+    ret = pciem_check_registered(us);
+    if (ret)
+        return ret;
+
+    if (copy_from_user(&link, arg, sizeof(link)))
+        return -EFAULT;
+
+    if (link.flags)
+        return -EINVAL;
+
+    return pciem_link_set(us, link.func, link.op, link.speed, link.width);
+}
+
 static long pciem_ioctl_register(struct pciem_userspace_state *us)
 {
     int ret, fd, f;
@@ -1108,6 +1314,7 @@ static long pciem_ioctl_register(struct pciem_userspace_state *us)
     }
 
     pciem_complete_registration(us);
+    pciem_link_debugfs_create(us);
 
     fd = anon_inode_getfd("pciem_instance", &pciem_instance_fops, us, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
@@ -1757,7 +1964,8 @@ static void pciem_notif_read(struct smptrace_ctx *ctx, struct smptrace_io *io)
  *
  * Returns 0 with io->data holding the value on success; -ETIMEDOUT if
  * the daemon never answered, -ECONNRESET if a reset cancelled the read,
- * -ENOSPC if the ring stayed full, -ENODEV if the device is going away.
+ * -ENOLINK if the link going down did, -ENOSPC if the ring stayed full,
+ * -ENODEV if the device is going away.
  * The caller (smptrace_emulate_read) treats a nonzero return as a failed
  * transaction and returns the standard PCIe master-abort sentinel (all-1s).
  */
@@ -1811,11 +2019,12 @@ static int pciem_notif_read_sync(struct smptrace_ctx *ctx, struct smptrace_io *i
     answered = answered || completion_done(&req.done);
     spin_unlock_irqrestore(&us->pending_lock, flags);
 
-    if (answered && req.response_status == -ECONNRESET) {
-        pr_info_ratelimited("sync read cancelled by a reset of func%u (bar=%llu off=0x%llx seq=%llu)\n",
+    if (answered && (req.response_status == -ECONNRESET || req.response_status == -ENOLINK)) {
+        pr_info_ratelimited("sync read cancelled by %s of func%u (bar=%llu off=0x%llx seq=%llu)\n",
+                            req.response_status == -ENOLINK ? "link down" : "a reset",
                             tracer->func, (unsigned long long)ev.bar,
                             (unsigned long long)ev.offset, (unsigned long long)ev.seq);
-        return -ECONNRESET;
+        return req.response_status;
     }
     if (!answered || req.response_status) {
         pr_warn_ratelimited("sync read timed out/failed (bar=%llu off=0x%llx seq=%llu status=%d)\n",
@@ -1948,6 +2157,7 @@ static int pciem_trace_bar(struct pciem_userspace_state *us, u32 bar_index, u32 
      */
     {
         guard(write_lock)(&v->bars_lock);
+        tracer->ctx.link_down = READ_ONCE(v->link_down);
         tracer->us = us;
     }
 
@@ -2062,6 +2272,9 @@ static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned lon
     case PCIEM_IOCTL_TRACE_BAR_RANGES:
         return pciem_ioctl_trace_bar_ranges(us, (struct pciem_trace_bar_ranges __user *)arg);
 
+    case PCIEM_IOCTL_LINK:
+        return pciem_ioctl_link(us, (struct pciem_link __user *)arg);
+
     default:
         return -ENOTTY;
     }
@@ -2069,12 +2282,15 @@ static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned lon
 
 int pciem_userspace_init(void)
 {
+    pciem_debugfs = debugfs_create_dir("pciem", NULL);
     pr_info("Userspace device support initialized\n");
     return 0;
 }
 
 void pciem_userspace_cleanup(void)
 {
+    debugfs_remove(pciem_debugfs);
+    pciem_debugfs = NULL;
     pr_info("Userspace device support cleanup\n");
 }
 

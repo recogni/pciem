@@ -11,6 +11,7 @@
 #include "capabilities.h"
 #include "pciem_api.h"
 
+#include <linux/bitfield.h>
 #include <linux/pci_regs.h>
 #include <linux/slab.h>
 #include <linux/version.h>
@@ -1078,4 +1079,63 @@ void pciem_cap_reset(struct pciem_root_complex *v)
             break;
         }
     }
+}
+
+bool pciem_cap_present(struct pciem_root_complex *v, u32 type)
+{
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+    return v->cap_mgr && pciem_cap_manager_find(v->cap_mgr, type);
+}
+
+static struct pciem_cap_entry *pciem_cap_pcie_locked(struct pciem_root_complex *v)
+{
+    lockdep_assert_held(&v->cap_lock);
+    return v->cap_mgr ? pciem_cap_manager_find(v->cap_mgr, PCIEM_CAP_PCIE) : NULL;
+}
+
+int pciem_cap_pcie_set_link(struct pciem_root_complex *v, u8 speed, u8 width)
+{
+    struct pciem_cap_entry *cap;
+    u8 *storage;
+    u32 lnkcap;
+    u16 lnksta;
+
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+
+    cap = pciem_cap_pcie_locked(v);
+    if (!cap)
+        return -EOPNOTSUPP;
+    storage = &v->cfg[cap->offset];
+
+    lnkcap = get_unaligned_le32(storage + PCI_EXP_LNKCAP);
+    if (FIELD_GET(PCI_EXP_LNKCAP_SLS, lnkcap) < speed)
+        lnkcap = (lnkcap & ~PCI_EXP_LNKCAP_SLS) | FIELD_PREP(PCI_EXP_LNKCAP_SLS, speed);
+    if (FIELD_GET(PCI_EXP_LNKCAP_MLW, lnkcap) < width)
+        lnkcap = (lnkcap & ~PCI_EXP_LNKCAP_MLW) | FIELD_PREP(PCI_EXP_LNKCAP_MLW, width);
+    put_unaligned_le32(lnkcap, storage + PCI_EXP_LNKCAP);
+
+    lnksta = get_unaligned_le16(storage + PCI_EXP_LNKSTA);
+    lnksta &= ~(PCI_EXP_LNKSTA_CLS | PCI_EXP_LNKSTA_NLW);
+    lnksta |= FIELD_PREP(PCI_EXP_LNKSTA_CLS, speed) | FIELD_PREP(PCI_EXP_LNKSTA_NLW, width);
+    put_unaligned_le16(lnksta, storage + PCI_EXP_LNKSTA);
+
+    cap->config.pcie.link_speed = speed;
+    cap->config.pcie.link_width = width;
+    return 0;
+}
+
+int pciem_cap_pcie_get_link(struct pciem_root_complex *v, u8 *speed, u8 *width)
+{
+    struct pciem_cap_entry *cap;
+    u16 lnksta;
+
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+
+    cap = pciem_cap_pcie_locked(v);
+    if (!cap)
+        return -EOPNOTSUPP;
+    lnksta = get_unaligned_le16(&v->cfg[cap->offset + PCI_EXP_LNKSTA]);
+    *speed = FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta);
+    *width = FIELD_GET(PCI_EXP_LNKSTA_NLW, lnksta);
+    return 0;
 }

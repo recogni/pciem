@@ -178,6 +178,7 @@ struct pciem_root_complex
     bool activated;
 
     bool detaching;
+    bool link_down;
 };
 
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector);
@@ -185,6 +186,8 @@ struct pciem_root_complex *pciem_rc_from_pdev(struct pci_dev *pdev);
 void pciem_set_intx(struct pciem_root_complex *v, bool asserted);
 void pciem_set_reset_notify(struct pciem_root_complex *v,
                             void (*fn)(void *data, u32 kind), void *data);
+void pciem_link_down(struct pciem_root_complex *v);
+int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width);
 int pciem_complete_init(struct pciem_root_complex *v);
 int pciem_start_device(struct pciem_root_complex *v);
 void pciem_set_multifunction(struct pciem_root_complex *func0,

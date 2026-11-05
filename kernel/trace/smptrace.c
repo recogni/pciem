@@ -183,6 +183,11 @@ void smptrace_emulate_read_may_sleep(struct smptrace_ctx *ctx, struct smptrace_m
 		return;
 	}
 
+	if (READ_ONCE(ctx->link_down)) {
+		memset(dst, 0xff, size);
+		return;
+	}
+
 	/* Handler-routed read: the device model produces the value. */
 	if (ctx->notif.read_sync) {
 		io.offset = off;
@@ -231,6 +236,9 @@ void smptrace_emulate_write_may_sleep(struct smptrace_ctx *ctx, struct smptrace_
 		memcpy_toio(ctx->shadow_va + off, src, size);
 		return;
 	}
+
+	if (READ_ONCE(ctx->link_down))
+		return;
 
 	if (!ctx->stop_writes)
 		memcpy_toio(ctx->shadow_va + off, src, size);
