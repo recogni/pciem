@@ -554,9 +554,10 @@ struct pciem_link
  * makes the device stop answering at once; the partner is then gone, the
  * link falls to Recovery and, after recovery_timeout, to Detect.Quiet with
  * DLLLA 0, Negotiated Link Width 0, Current Link Speed 2.5GT/s and DLLSC
- * set. PCIEM_LINK_UP resets the function's config state and makes the
+ * set; that DL_Down resets the device's config state. PCIEM_LINK_UP makes the
  * partner present again; the ioctl returns while the link trains, and the
- * device is reachable once DL_Up is reached, after the RRS window. Reading
+ * device is reachable once DL_Up is reached, after the RRS window. A
+ * PCIEM_LINK_UP within recovery_timeout resumes Recovery in DL_Up. Reading
  * the debugfs "link" file gives "down" until then. Either must not
  * be repeated: EALREADY is judged on what the device last asked for, not on
  * where the link is. PCIEM_LINK_EQ_LIMIT sets the equalization limit of
@@ -572,7 +573,8 @@ struct pciem_link
  * - A write of Target Link Speed is stored, and caps the next training or
  *   retrain. It does not retrain by itself.
  * - Link Disable puts the link in Disabled with DL_Down, and clearing it in
- *   Detect.Quiet. Linux uses it before it resets a port.
+ *   Detect.Quiet. Linux uses it before it resets a port. Its DL_Down resets
+ *   the device's config state, as every DL_Down of the device's link does.
  * - Secondary Bus Reset (Bridge Control bit 6), 0 to 1, puts the link in
  *   HotReset with DL_Down, and resets the device as a Function Level Reset
  *   does: the device model gets PCIEM_EVENT_RESET with @data PCIEM_RESET_HOT.

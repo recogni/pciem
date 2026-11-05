@@ -271,6 +271,8 @@ static void link_dl_down(struct pciem_plink *l, bool sdes)
 		pciem_port_dllsc(l->port);
 		if (sdes)
 			pciem_port_sdes(l->port);
+		if (l->slot && l->slot->v)
+			pciem_function_reset_state(l->slot->v);
 		pciem_topo_kick_work(t);
 	}
 	pciem_port_lnksta_set(l->port, PCIEM_LINK_SPEED_2_5GT, 0, 0, 0);
@@ -543,6 +545,9 @@ void pciem_link_partner(struct pciem_plink *l, bool present, u8 speed, u8 width)
 				l->prev_speed = l->speed;
 				l->stage = STAGE_POST_EQ;
 				link_goto(l, LT_REC_RCVRCFG, PT_WHY_PARTNER_UP);
+			} else if (l->state > LT_REC_RCVRLOCK && l->state <= LT_REC_IDLE) {
+				link_cancel(l);
+				link_arm(l, l->timing[pciem_state_timing[l->state]]);
 			} else {
 				link_goto_detect(l, PT_WHY_PARTNER_UP);
 			}

@@ -403,7 +403,6 @@ int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width)
     int ret;
 
     if (v->topo) {
-        pciem_function_reset_state(v);
         smp_store_release(&v->link_down, false);
         pr_info("func%u: link up requested, %s x%u\n", v->func_index,
                 speed < ARRAY_SIZE(pciem_link_speed_names) ? pciem_link_speed_names[speed] : "unknown",
