@@ -1696,6 +1696,7 @@ void pciem_topo_leave(struct pciem_root_complex *v)
 			pciem_link_detach(s->link);
 		}
 		synchronize_rcu();
+		flush_work(&t->work);
 	}
 	v->topo = NULL;
 	v->root_bus = NULL;
