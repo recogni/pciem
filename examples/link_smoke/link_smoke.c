@@ -358,8 +358,8 @@ int main(void)
 	report(rc == EINVAL, "speed 0: %s", strerror(rc));
 	rc = link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_5GT, 3, 0);
 	report(rc == EINVAL, "width 3: %s", strerror(rc));
-	rc = link_op(3, 0, 0, 0);
-	report(rc == EINVAL, "op 3: %s", strerror(rc));
+	rc = link_op(4, 0, 0, 0);
+	report(rc == EINVAL, "op 4: %s", strerror(rc));
 
 	rc = link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_5GT, 16, 0);
 	report(rc == 0, "PCIEM_LINK_UP 5GT/s x16: %s", strerror(rc));

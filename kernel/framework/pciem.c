@@ -15,6 +15,8 @@
 #include "userspace.h"
 #include "iommu_stub.h"
 #include "msi_domain.h"
+#include "pcitrace.h"
+#include "topology.h"
 
 #include <linux/pci.h>
 #include <linux/pci_ids.h>
@@ -131,10 +133,15 @@ static int pciem_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
     unsigned int func = PCI_FUNC(dev->devfn);
 
     /* pin is 1-4 (INTA-INTD). Each function can have its own virtual INTx lines. */
-    if (!priv || func >= PCIEM_MAX_FUNCTIONS)
+    if (!priv)
         return 0;
 
-    v = priv->funcs[func];
+    if (priv->topo)
+        v = pciem_topo_ep_dev(priv->topo, dev->bus, dev->devfn);
+    else if (func < PCIEM_MAX_FUNCTIONS)
+        v = priv->funcs[func];
+    else
+        v = NULL;
     if (!v)
         return 0;
 
@@ -150,11 +157,64 @@ struct pciem_root_complex *pciem_rc_from_pdev(struct pci_dev *pdev)
     unsigned int func = PCI_FUNC(pdev->devfn);
     struct pciem_host_bridge_priv *priv;
 
-    if (pdev->bus->ops != &vph_pci_ops || func >= PCIEM_MAX_FUNCTIONS)
+    if (pdev->bus->ops != &vph_pci_ops)
         return NULL;
 
     priv = pci_host_bridge_priv(pci_find_host_bridge(pdev->bus));
+    if (priv->topo)
+        return pciem_topo_ep_dev(priv->topo, pdev->bus, pdev->devfn);
+    if (func >= PCIEM_MAX_FUNCTIONS)
+        return NULL;
     return priv->funcs[func];
+}
+
+struct pciem_msi_vecs *pciem_msi_vecs_from_pdev(struct pci_dev *pdev)
+{
+    struct pciem_host_bridge_priv *priv;
+    struct pciem_root_complex *v;
+
+    if (pdev->bus->ops != &vph_pci_ops)
+        return NULL;
+
+    priv = pci_host_bridge_priv(pci_find_host_bridge(pdev->bus));
+    if (priv->topo)
+        return pciem_topo_msi_vecs(priv->topo, pdev->bus, pdev->devfn);
+    v = pciem_rc_from_pdev(pdev);
+    return v ? &v->msi : NULL;
+}
+
+static int pciem_pdev_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+    struct device *dev = data;
+    struct pciem_root_complex *v;
+    struct pci_dev *pdev, *old;
+
+    if (action != BUS_NOTIFY_ADD_DEVICE || !dev_is_pci(dev))
+        return NOTIFY_DONE;
+
+    pdev = to_pci_dev(dev);
+    v = pciem_rc_from_pdev(pdev);
+    if (!v || !v->topo)
+        return NOTIFY_DONE;
+
+    old = READ_ONCE(v->pciem_pdev);
+    if (!old || old == pdev)
+        return NOTIFY_DONE;
+
+    WRITE_ONCE(v->pciem_pdev, pci_dev_get(pdev));
+    pci_dev_put(old);
+    return NOTIFY_OK;
+}
+
+static struct notifier_block pciem_pdev_nb = {
+    .notifier_call = pciem_pdev_notify,
+};
+
+static struct pciem_trace *pciem_rc_trace(struct pciem_root_complex *v)
+{
+    if (v->trace)
+        return v->trace;
+    return v->bridge_priv ? v->bridge_priv->trace : NULL;
 }
 
 /*
@@ -270,7 +330,7 @@ void pciem_set_reset_notify(struct pciem_root_complex *v,
 }
 EXPORT_SYMBOL(pciem_set_reset_notify);
 
-static void pciem_function_reset_state(struct pciem_root_complex *v)
+void pciem_function_reset_state(struct pciem_root_complex *v)
 {
     int i;
 
@@ -302,10 +362,12 @@ static void pciem_function_reset_state(struct pciem_root_complex *v)
  * Nothing waits for the device afterwards: it is ready at once, so
  * pci_dev_wait() finds PCI_COMMAND readable on its first try.
  */
-static void pciem_function_reset(struct pciem_root_complex *v, u32 kind)
+void pciem_function_reset(struct pciem_root_complex *v, u32 kind)
 {
     pr_info("func%u: %s reset\n", v->func_index,
-            kind == PCIEM_RESET_FLR ? "function level" : "PM");
+            kind == PCIEM_RESET_FLR ? "function level" :
+            kind == PCIEM_RESET_HOT ? "hot" : "PM");
+    pciem_trace_reset(pciem_rc_trace(v), PT_FN_EP0 + v->func_index, kind - 1);
 
     pciem_function_reset_state(v);
 
@@ -328,6 +390,8 @@ void pciem_link_down(struct pciem_root_complex *v)
     WRITE_ONCE(v->link_down, true);
     pciem_config_access_drain(v);
     pr_info("func%u: link down\n", v->func_index);
+    if (v->topo)
+        pciem_topo_dev_down(v);
 }
 EXPORT_SYMBOL(pciem_link_down);
 
@@ -338,6 +402,15 @@ static const char *const pciem_link_speed_names[] = {
 int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width)
 {
     int ret;
+
+    if (v->topo) {
+        pciem_function_reset_state(v);
+        smp_store_release(&v->link_down, false);
+        pr_info("func%u: link up requested, %s x%u\n", v->func_index,
+                speed < ARRAY_SIZE(pciem_link_speed_names) ? pciem_link_speed_names[speed] : "unknown",
+                width);
+        return pciem_topo_dev_up(v, speed, width);
+    }
 
     ret = pciem_cap_pcie_set_link(v, speed, width);
     if (ret)
@@ -374,6 +447,13 @@ int pciem_register_bar(struct pciem_root_complex *v, u32 bar_num, resource_size_
         return -EINVAL;
     }
 
+    if (v->placement) {
+        v->bars[bar_num].size = size;
+        v->bars[bar_num].flags = flags;
+        v->bars[bar_num].base_addr_val = 0;
+        return 0;
+    }
+
     phys = pciem_pool_alloc(size);
     if (!phys)
         return -ENOMEM;
@@ -400,7 +480,10 @@ int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
         return -ENODEV;
     }
 
-    ret = pciem_msi_deliver(v, vector);
+    if (READ_ONCE(pciem_trace_ep_irq))
+        pciem_trace_irq(pciem_rc_trace(v), PT_FN_EP0 + v->func_index, PT_IRQ_EP, vector, true);
+
+    ret = pciem_msi_deliver(&v->msi, vector);
     if (ret != -ENOENT)
         return ret;
 
@@ -482,8 +565,11 @@ static void pciem_intx_irq_work_func(struct irq_work *work)
         raise = pulse || v->intx_level;
     }
 
-    if (raise)
+    if (raise) {
+        if (READ_ONCE(pciem_trace_ep_irq))
+            pciem_trace_irq(pciem_rc_trace(v), PT_FN_EP0 + v->func_index, PT_IRQ_EP, 0, true);
         generic_handle_irq(dev->irq);
+    }
 
     if (pulse) {
         guard(raw_spinlock_irqsave)(&v->intx_lock);
@@ -584,7 +670,7 @@ static void pciem_cleanup_bar(struct pciem_bar_info *bar)
         kfree(bar->allocated_res);
         bar->allocated_res = NULL;
     }
-    if (bar->carved_start) {
+    if (bar->carved_start && !bar->in_chunk) {
         pciem_pool_free(bar->carved_start, bar->carved_end - bar->carved_start + 1);
         bar->carved_start = 0;
         bar->carved_end = 0;
@@ -599,6 +685,8 @@ static void pciem_cleanup_bars(struct pciem_root_complex *v)
 {
     for (int i = 0; i < PCI_STD_NUM_BARS; i++)
         pciem_cleanup_bar(&v->bars[i]);
+    if (v->topo)
+        pciem_topo_free_chunks(v->topo);
 }
 
 static u32 pciem_read_bar_address(const struct pciem_root_complex *v, u32 idx)
@@ -871,26 +959,66 @@ static int vph_read_config(struct pci_bus *bus, unsigned int devfn,
 {
     struct pciem_host_bridge_priv *priv = pciem_bus_bridge_priv(bus);
     struct pciem_root_complex *v;
- 
+    int ret;
+
+    if (priv->topo) {
+        rcu_read_lock();
+        ret = pciem_topo_cfg_read(priv->topo, bus->number, devfn, where, size, value, &v);
+        if (v) {
+            ret = pciem_conf_read_impl(v, where, size, value);
+            pciem_trace_cfg_access(v->trace, PT_FN_EP0 + PCI_FUNC(devfn), bus->number, devfn,
+                                   false, where, size, *value,
+                                   ret ? PT_RES_NODEV : PT_RES_OK);
+        }
+        rcu_read_unlock();
+        return ret;
+    }
+
     v = vph_get_rc_for_devfn(priv, devfn);
     if (!v) {
         *value = ~0U;
+        pciem_trace_cfg_access(priv->trace, PT_FN_NONE, bus->number, devfn, false, where, size,
+                               ~0U, PT_RES_NODEV);
         return PCIBIOS_DEVICE_NOT_FOUND;
     }
 
-    return pciem_conf_read_impl(v, where, size, value);
+    ret = pciem_conf_read_impl(v, where, size, value);
+    pciem_trace_cfg_access(priv->trace, PT_FN_EP0 + PCI_FUNC(devfn), bus->number, devfn, false,
+                           where, size, *value,
+                           ret ? PT_RES_NODEV : READ_ONCE(v->link_down) ? PT_RES_UR : PT_RES_OK);
+    return ret;
 }
 
 static int vph_write_config(struct pci_bus *bus, unsigned int devfn, int where, int size, u32 value)
 {
     struct pciem_host_bridge_priv *priv = pciem_bus_bridge_priv(bus);
     struct pciem_root_complex *v;
- 
+    int ret;
+
+    if (priv->topo) {
+        rcu_read_lock();
+        ret = pciem_topo_cfg_write(priv->topo, bus->number, devfn, where, size, value, &v);
+        if (v) {
+            ret = pciem_conf_write_impl(v, where, size, value);
+            pciem_trace_cfg_access(v->trace, PT_FN_EP0 + PCI_FUNC(devfn), bus->number, devfn,
+                                   true, where, size, value, ret ? PT_RES_NODEV : PT_RES_OK);
+        }
+        rcu_read_unlock();
+        return ret;
+    }
+
     v = vph_get_rc_for_devfn(priv, devfn);
-    if (!v)
+    if (!v) {
+        pciem_trace_cfg_access(priv->trace, PT_FN_NONE, bus->number, devfn, true, where, size,
+                               value, PT_RES_NODEV);
         return PCIBIOS_DEVICE_NOT_FOUND;
- 
-    return pciem_conf_write_impl(v, where, size, value);
+    }
+
+    ret = pciem_conf_write_impl(v, where, size, value);
+    pciem_trace_cfg_access(priv->trace, PT_FN_EP0 + PCI_FUNC(devfn), bus->number, devfn, true,
+                           where, size, value,
+                           ret ? PT_RES_NODEV : READ_ONCE(v->link_down) ? PT_RES_UR : PT_RES_OK);
+    return ret;
 }
 
 static struct pci_ops vph_pci_ops = {
@@ -1023,9 +1151,12 @@ static void pciem_activation_work_func(struct work_struct *work)
     int f;
 
     pr_info("activate: adding device to subsystem now\n");
+    pciem_trace_phase(pciem_rc_trace(v), PT_PH_ACTIVATE_BEGIN);
 
     if (v->bus_mode == PCIEM_BUS_MODE_VIRTUAL_ROOT) {
-        if (v->root_bus)
+        if (v->placement == PCIEM_PLACEMENT_SWITCH)
+            pciem_topo_activate(v);
+        else if (v->root_bus)
             pci_bus_add_devices(v->root_bus);
     } else if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
         for (f = 0; f < PCIEM_MAX_FUNCTIONS; f++) {
@@ -1045,6 +1176,7 @@ static void pciem_activation_work_func(struct work_struct *work)
      */
 
     v->activated = true;
+    pciem_trace_phase(pciem_rc_trace(v), PT_PH_ACTIVATE_DONE);
 }
 
 void pciem_set_multifunction(struct pciem_root_complex *func0,
@@ -1058,13 +1190,62 @@ void pciem_set_multifunction(struct pciem_root_complex *func0,
 }
 EXPORT_SYMBOL(pciem_set_multifunction);
 
+static bool pciem_bus_range_busy(int domain, int busnr, int depth)
+{
+    int b;
+
+    for (b = busnr; b <= busnr + depth; b++)
+        if (pci_find_bus(domain, b))
+            return true;
+    return false;
+}
+
+void pciem_mark_ep_bars(struct pciem_root_complex *v)
+{
+    int i;
+
+    for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+        struct pciem_bar_info *bar = &v->bars[i];
+
+        if (!bar->size)
+            continue;
+        v->pciem_pdev->resource[i].flags |= IORESOURCE_PCI_FIXED;
+        bar->res = &v->pciem_pdev->resource[i];
+    }
+}
+
+static int pciem_init_intx(struct pciem_root_complex *v)
+{
+    v->intx_domain = irq_domain_add_linear(NULL, 4, &irq_domain_simple_ops, v);
+    if (!v->intx_domain) {
+        pr_err("init: failed to create INTx irq_domain\n");
+        return -ENOMEM;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        v->intx_virq[i] = irq_create_mapping(v->intx_domain, i);
+        irq_set_chip_and_handler(v->intx_virq[i], &pciem_intx_chip,
+                                 handle_simple_irq);
+    }
+    irq_set_chip_data(v->intx_virq[0], v);
+    return 0;
+}
+
 static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
                                         struct list_head *resources)
 {
     bool fixed = v->mode_state.virtual_root.fixed;
+    struct pciem_topo *topo = v->topo;
     int rc, busnr = 1, domain = 0;
+    int depth = topo ? pciem_topo_depth(topo) : 0;
+    bool sw = topo && topo->placement == PCIEM_PLACEMENT_SWITCH;
     struct pci_host_bridge *bridge;
     struct pciem_host_bridge_priv *priv;
+
+    if (sw && topo->shared) {
+        v->bridge_priv = topo->priv;
+        return pciem_init_intx(v);
+    }
 
     if (fixed) {
         domain = v->mode_state.virtual_root.assigned_domain;
@@ -1079,6 +1260,7 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
 
     memset(priv->funcs, 0, sizeof(priv->funcs));
     priv->funcs[v->func_index] = v;
+    priv->trace = v->trace;
     v->bridge_priv = priv;
 
     pciem_fixup_bridge_domain(bridge, priv, domain);
@@ -1105,21 +1287,13 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
      */
     dev_set_msi_domain(&bridge->dev, pciem_msi_domain());
 
-    v->intx_domain = irq_domain_add_linear(NULL, 4, &irq_domain_simple_ops, v);
-    if (!v->intx_domain) {
-        pr_err("init: failed to create INTx irq_domain\n");
+    rc = pciem_init_intx(v);
+    if (rc) {
         dev_set_msi_domain(&bridge->dev, NULL);
         pciem_iommu_stub_unregister_bridge(&bridge->dev);
         pci_free_host_bridge(bridge);
-        return -ENOMEM;
+        return rc;
     }
- 
-    for (int i = 0; i < 4; i++) {
-        v->intx_virq[i] = irq_create_mapping(v->intx_domain, i);
-        irq_set_chip_and_handler(v->intx_virq[i], &pciem_intx_chip,
-                                 handle_simple_irq);
-    }
-    irq_set_chip_data(v->intx_virq[0], v);
  
     bridge->map_irq     = pciem_map_irq;
     bridge->swizzle_irq = pci_common_swizzle;
@@ -1134,9 +1308,9 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
      * set up; pciem's teardown removes the bus under the same lock.
      */
     pci_lock_rescan_remove();
-    while (pci_find_bus(domain, busnr)) {
+    while (pciem_bus_range_busy(domain, busnr, depth)) {
         busnr++;
-        if (fixed || busnr > 255) {
+        if (fixed || busnr + depth > 255) {
             pci_unlock_rescan_remove();
             if (fixed)
                 pr_err("init: Bus %04x:%02x is taken\n", domain, busnr - 1);
@@ -1161,9 +1335,26 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
      * lives in the bridge's private data, as long as the bridge's list
      * entry for it.
      */
-    priv->busn = (struct resource)DEFINE_RES_NAMED(busnr, 1, "pciem bus",
+    priv->busn = (struct resource)DEFINE_RES_NAMED(busnr, depth + 1, "pciem bus",
                                                    IORESOURCE_BUS);
     pci_add_resource(&bridge->windows, &priv->busn);
+
+    if (topo) {
+        rc = pciem_topo_program(v, domain, busnr);
+        if (rc) {
+            pci_unlock_rescan_remove();
+            pr_err("init: Programming the bridges failed: %d\n", rc);
+            dev_set_msi_domain(&bridge->dev, NULL);
+            pciem_iommu_stub_unregister_bridge(&bridge->dev);
+            pci_free_host_bridge(bridge);
+            return rc;
+        }
+        priv->topo = topo;
+        bridge->native_aer = bridge->native_dpc = !!(topo->p.flags & PCIEM_TOPO_FLAG_NATIVE_AER);
+        pciem_topo_start(topo);
+        pciem_topo_wait_trained(topo);
+    }
+    pciem_trace_phase(priv->trace, PT_PH_SCAN_BEGIN);
 
     /*
      * pci_scan_root_bus_bridge() fails only in pci_register_host_bridge(),
@@ -1182,6 +1373,8 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
     rc = pci_scan_root_bus_bridge(bridge);
     if (rc < 0) {
         pci_unlock_rescan_remove();
+        if (topo)
+            pciem_topo_quiesce(topo);
         pr_err("init: pci_scan_root_bus_bridge failed: %d\n", rc);
         dev_set_msi_domain(&bridge->dev, NULL);
         pciem_iommu_stub_unregister_bridge(&bridge->dev);
@@ -1205,19 +1398,28 @@ static int pciem_init_virtual_root_mode(struct pciem_root_complex *v,
      * could be given the platform's. Set pciem's on every scanned device
      * before any driver can bind.
      */
-    {
+    if (topo) {
+        pci_bus_claim_resources(v->root_bus);
+        pciem_topo_scanned(topo, v->root_bus);
+        if (!sw) {
+            v->pciem_pdev = pci_get_domain_bus_and_slot(domain, busnr + 1, PCI_DEVFN(0, 0));
+            if (v->pciem_pdev)
+                pciem_mark_ep_bars(v);
+        }
+    } else {
         struct pci_dev *pdev;
 
         list_for_each_entry(pdev, &v->root_bus->devices, bus_list)
             dev_set_msi_domain(&pdev->dev, pciem_msi_domain());
+
+        pciem_bus_init_resources(v);
+        pci_bus_assign_resources(v->root_bus);
+
+        v->pciem_pdev = pci_get_domain_bus_and_slot(domain, v->root_bus->number, PCI_DEVFN(0, v->func_index));
     }
-
-    pciem_bus_init_resources(v);
-    pci_bus_assign_resources(v->root_bus);
-
-    v->pciem_pdev = pci_get_domain_bus_and_slot(domain, v->root_bus->number, PCI_DEVFN(0, v->func_index));
     pci_unlock_rescan_remove();
-    if (!v->pciem_pdev) {
+    pciem_trace_phase(priv->trace, PT_PH_SCAN_DONE);
+    if (!sw && !v->pciem_pdev) {
         pr_err("init: Failed to find emulated device (func %u)\n", v->func_index);
         return -ENODEV;
     }
@@ -1338,7 +1540,7 @@ static int pciem_init_attach_to_host_mode(struct pciem_root_complex *v)
     return 0;
 }
 
-int pciem_complete_init(struct pciem_root_complex *v)
+static int pciem_complete_init_one(struct pciem_root_complex *v)
 {
     int rc = 0;
     struct resource *mem_res = NULL;
@@ -1352,17 +1554,25 @@ int pciem_complete_init(struct pciem_root_complex *v)
         .num_res = 0,
     };
     
-    v->shared_bridge_pdev = platform_device_register_full(&pdevinfo);
+    if (!(v->topo && v->topo->shared)) {
+        v->shared_bridge_pdev = platform_device_register_full(&pdevinfo);
 
-    if (IS_ERR(v->shared_bridge_pdev))
-    {
-        rc = PTR_ERR(v->shared_bridge_pdev);
-        goto fail_pdev_null;
+        if (IS_ERR(v->shared_bridge_pdev))
+        {
+            rc = PTR_ERR(v->shared_bridge_pdev);
+            goto fail_pdev_null;
+        }
     }
 
     rc = pciem_p2p_init(v, p2p_regions);
     if (rc) {
         pr_warn("pciem: P2P init failed: %d (non-fatal)\n", rc);
+    }
+
+    if (v->topo) {
+        rc = pciem_topo_layout_bars(v, &resources);
+        if (rc)
+            goto fail_res_list;
     }
 
     for (i = 0; i < PCI_STD_NUM_BARS; i++)
@@ -1385,6 +1595,15 @@ int pciem_complete_init(struct pciem_root_complex *v)
             pr_err("init: BAR%u has no physical address assigned.\n", i);
             rc = -ENOMEM;
             goto fail_bars;
+        }
+
+        if (v->topo) {
+            bar->phys_addr = bar->carved_start;
+            bar->pages = NULL;
+            bar->base_addr_val = (u32)(bar->phys_addr & 0xFFFFFFFF);
+            if ((bar->flags & PCI_BASE_ADDRESS_MEM_TYPE_64) && (i + 1 < PCI_STD_NUM_BARS))
+                v->bars[i + 1].base_addr_val = (u32)(bar->phys_addr >> 32);
+            continue;
         }
 
         mem_res = kzalloc(sizeof(*mem_res), GFP_KERNEL);
@@ -1428,9 +1647,11 @@ int pciem_complete_init(struct pciem_root_complex *v)
         }
     }
 
-    rc = pciem_reserve_bars_res(v, &resources);
-    if (rc)
-        goto fail_res_list;
+    if (!v->topo) {
+        rc = pciem_reserve_bars_res(v, &resources);
+        if (rc)
+            goto fail_res_list;
+    }
 
     switch (v->bus_mode) {
     case PCIEM_BUS_MODE_VIRTUAL_ROOT:
@@ -1453,12 +1674,20 @@ int pciem_complete_init(struct pciem_root_complex *v)
     if (rc)
         goto fail_device;
 
+    if (v->placement == PCIEM_PLACEMENT_SWITCH && !v->topo->shared) {
+        pciem_topo_make_shared(v, v->mode_state.virtual_root.bridge, v->bridge_priv,
+                               v->shared_bridge_pdev);
+        v->shared_bridge_pdev = NULL;
+    }
+
     pr_info("init: Device ready (mode: %s)\n",
             v->bus_mode == PCIEM_BUS_MODE_VIRTUAL_ROOT ? "virtual-root" : "attach-to-host");
 
     return 0;
 
 fail_device:
+    if (v->topo)
+        pciem_topo_quiesce(v->topo);
     if (v->pciem_pdev) {
         if (v->bus_mode == PCIEM_BUS_MODE_ATTACH_TO_HOST) {
             pci_stop_and_remove_bus_device_locked(v->pciem_pdev);
@@ -1493,6 +1722,22 @@ fail_pdev_null:
     v->shared_bridge_pdev = NULL;
     return rc;
 }
+
+int pciem_complete_init(struct pciem_root_complex *v)
+{
+    int rc;
+
+    if (v->placement != PCIEM_PLACEMENT_SWITCH)
+        return pciem_complete_init_one(v);
+
+    guard(mutex)(pciem_switch_mutex());
+    rc = pciem_topo_join(v);
+    if (!rc)
+        rc = pciem_complete_init_one(v);
+    if (!rc)
+        rc = pciem_topo_attach(v);
+    return rc;
+}
 EXPORT_SYMBOL(pciem_complete_init);
 
 int pciem_start_device(struct pciem_root_complex *v)
@@ -1509,6 +1754,10 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
 {
     pr_info("exit: tearing down pciem device\n");
 
+    pciem_trace_phase(pciem_rc_trace(v), PT_PH_TEARDOWN);
+    if (v->topo)
+        pciem_topo_quiesce(v->topo);
+
     cancel_work_sync(&v->activation_work);
 
     irq_work_sync(&v->msi_irq_work);
@@ -1523,11 +1772,16 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
         }
 
         pci_stop_and_remove_bus_device_locked(v->pciem_pdev);
+        if (v->topo && v->topo->shared)
+            pci_dev_put(v->pciem_pdev);
         WRITE_ONCE(v->pciem_pdev, NULL);
     }
 
     /* Config writes during the removal may have queued an INTx. */
     irq_work_sync(&v->intx_irq_work);
+
+    if (v->topo && v->topo->shared)
+        pciem_topo_leave(v);
 
     if (v->root_bus)
     {
@@ -1561,6 +1815,10 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
         v->root_bus = NULL;
     }
 
+    if (v->topo) {
+        pciem_topo_quiesce(v->topo);
+        pciem_topo_release_pdevs(v->topo);
+    }
     pciem_cleanup_bars(v);
 
     for (int i = 0; i < 4; i++) {
@@ -1583,7 +1841,13 @@ static void pciem_teardown_device(struct pciem_root_complex *v)
 
     pciem_cleanup_cap_manager(v);
     pciem_p2p_cleanup(v);
-    pciem_msi_rc_destroy(v);
+    pciem_msi_vecs_destroy(&v->msi);
+    if (v->topo) {
+        pciem_topo_free(v->topo);
+        v->topo = NULL;
+    }
+    pciem_trace_free(v->trace);
+    v->trace = NULL;
 }
 
 static int __init pciem_init(void)
@@ -1594,9 +1858,15 @@ static int __init pciem_init(void)
     ret = pciem_pool_init(pciem_phys_region);
     if (ret) return ret;
 
+    pciem_ltssm_defaults_init();
+
     ret = pciem_msi_domain_init();
     if (ret)
         goto fail_msi_domain;
+
+    ret = bus_register_notifier(&pci_bus_type, &pciem_pdev_nb);
+    if (ret)
+        goto fail_notifier;
 
     ret = pciem_userspace_init();
     if (ret) {
@@ -1633,6 +1903,8 @@ static int __init pciem_init(void)
 fail_misc:
     pciem_userspace_cleanup();
 fail_userspace:
+    bus_unregister_notifier(&pci_bus_type, &pciem_pdev_nb);
+fail_notifier:
     pciem_msi_domain_exit();
 fail_msi_domain:
     pciem_pool_exit();
@@ -1648,6 +1920,7 @@ static void __exit pciem_exit(void)
     pciem_iommu_stub_exit();
     misc_deregister(&pciem_dev);
     pciem_userspace_cleanup();
+    bus_unregister_notifier(&pci_bus_type, &pciem_pdev_nb);
     pciem_msi_domain_exit();
     pciem_pool_exit();
     pr_info("exit: Unregistered /dev/pciem\n");
@@ -1756,7 +2029,7 @@ struct pciem_root_complex *pciem_alloc_root_complex(void)
 
     /* Essential initialization that must happen */
     init_irq_work(&v->msi_irq_work, pciem_msi_irq_work_func);
-    pciem_msi_rc_init(v);
+    pciem_msi_vecs_init(&v->msi);
     raw_spin_lock_init(&v->intx_lock);
     init_irq_work(&v->intx_irq_work, pciem_intx_irq_work_func);
     INIT_WORK(&v->activation_work, pciem_activation_work_func);

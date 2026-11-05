@@ -1124,6 +1124,46 @@ int pciem_cap_pcie_set_link(struct pciem_root_complex *v, u8 speed, u8 width)
     return 0;
 }
 
+int pciem_cap_pcie_topo_setup(struct pciem_root_complex *v, u8 speed, u8 width)
+{
+    struct pciem_cap_entry *cap;
+    u8 *storage;
+    u32 lnkcap;
+
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+
+    cap = pciem_cap_pcie_locked(v);
+    if (!cap)
+        return -EOPNOTSUPP;
+    storage = &v->cfg[cap->offset];
+
+    lnkcap = get_unaligned_le32(storage + PCI_EXP_LNKCAP);
+    lnkcap &= ~(PCI_EXP_LNKCAP_SLS | PCI_EXP_LNKCAP_MLW);
+    lnkcap |= FIELD_PREP(PCI_EXP_LNKCAP_SLS, speed) | FIELD_PREP(PCI_EXP_LNKCAP_MLW, width);
+    put_unaligned_le32(lnkcap, storage + PCI_EXP_LNKCAP);
+    put_unaligned_le32((1u << (speed + 1)) - 2, storage + PCI_EXP_LNKCAP2);
+    put_unaligned_le16(speed, storage + PCI_EXP_LNKCTL2);
+    return 0;
+}
+
+void pciem_cap_pcie_set_lnksta(struct pciem_root_complex *v, u8 cls, u8 nlw)
+{
+    struct pciem_cap_entry *cap;
+    u8 *storage;
+    u16 lnksta;
+
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+
+    cap = pciem_cap_pcie_locked(v);
+    if (!cap)
+        return;
+    storage = &v->cfg[cap->offset];
+    lnksta = get_unaligned_le16(storage + PCI_EXP_LNKSTA);
+    lnksta &= ~(PCI_EXP_LNKSTA_CLS | PCI_EXP_LNKSTA_NLW);
+    lnksta |= FIELD_PREP(PCI_EXP_LNKSTA_CLS, cls) | FIELD_PREP(PCI_EXP_LNKSTA_NLW, nlw);
+    put_unaligned_le16(lnksta, storage + PCI_EXP_LNKSTA);
+}
+
 int pciem_cap_pcie_get_link(struct pciem_root_complex *v, u8 *speed, u8 *width)
 {
     struct pciem_cap_entry *cap;

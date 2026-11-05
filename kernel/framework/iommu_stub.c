@@ -247,9 +247,8 @@ static void pciem_stub_release_device(struct device *dev)
 
 static struct iommu_group *pciem_stub_device_group(struct device *dev)
 {
-    /* One group per device. Synthetic pcim devices have no aliasing
-     * concerns because there's no real shared bridge upstream — so
-     * isolated single-device groups are correct. */
+    if (dev_is_pci(dev))
+        return pci_device_group(dev);
     return iommu_group_alloc();
 }
 
@@ -339,10 +338,10 @@ static bool pciem_stub_owns_bus(struct pci_bus *bus)
     struct device *bridge_dev;
     bool found = false;
 
-    if (!bus || !bus->bridge)
+    if (!bus)
         return false;
 
-    bridge_dev = bus->bridge;
+    bridge_dev = &pci_find_host_bridge(bus)->dev;
 
     mutex_lock(&pciem_stub_bridges_lock);
     list_for_each_entry(entry, &pciem_stub_bridges, list) {

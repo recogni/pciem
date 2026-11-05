@@ -70,14 +70,14 @@ static int pciem_msi_domain_alloc(struct irq_domain *d, unsigned int virq,
                                   unsigned int nr_irqs, void *arg)
 {
     msi_alloc_info_t *info = arg;
-    struct pciem_root_complex *v;
+    struct pciem_msi_vecs *v;
     unsigned int i;
     int ret;
 
     if (!info->desc || !dev_is_pci(info->desc->dev))
         return -EINVAL;
 
-    v = pciem_rc_from_pdev(to_pci_dev(info->desc->dev));
+    v = pciem_msi_vecs_from_pdev(to_pci_dev(info->desc->dev));
     if (!v)
         return -ENODEV;
 
@@ -86,13 +86,13 @@ static int pciem_msi_domain_alloc(struct irq_domain *d, unsigned int virq,
      * MSI vector of a multi-vector block) as the hwirq. The parent's hwirq
      * only has to be unique within it, so it is the Linux irq number.
      */
-    guard(mutex)(&v->msi_lock);
+    guard(mutex)(&v->lock);
     for (i = 0; i < nr_irqs; i++) {
-        ret = xa_err(xa_store(&v->msi_virqs, info->hwirq + i,
+        ret = xa_err(xa_store(&v->virqs, info->hwirq + i,
                               xa_mk_value(virq + i), GFP_KERNEL));
         if (ret) {
             while (i--) {
-                xa_erase(&v->msi_virqs, info->hwirq + i);
+                xa_erase(&v->virqs, info->hwirq + i);
                 irq_domain_reset_irq_data(irq_domain_get_irq_data(d, virq + i));
             }
             return ret;
@@ -110,16 +110,16 @@ static void pciem_msi_domain_free(struct irq_domain *d, unsigned int virq,
 
     for (i = 0; i < nr_irqs; i++) {
         struct irq_data *data = irq_domain_get_irq_data(d, virq + i);
-        struct pciem_root_complex *v = data ? irq_data_get_irq_chip_data(data) : NULL;
+        struct pciem_msi_vecs *v = data ? irq_data_get_irq_chip_data(data) : NULL;
 
         if (v) {
             unsigned long vector;
             void *entry;
 
-            guard(mutex)(&v->msi_lock);
-            xa_for_each(&v->msi_virqs, vector, entry) {
+            guard(mutex)(&v->lock);
+            xa_for_each(&v->virqs, vector, entry) {
                 if (xa_to_value(entry) == virq + i) {
-                    xa_erase(&v->msi_virqs, vector);
+                    xa_erase(&v->virqs, vector);
                     break;
                 }
             }
@@ -217,16 +217,16 @@ void pciem_msi_domain_exit(void)
     pciem_msi_parent = NULL;
 }
 
-void pciem_msi_rc_init(struct pciem_root_complex *v)
+void pciem_msi_vecs_init(struct pciem_msi_vecs *vecs)
 {
-    mutex_init(&v->msi_lock);
-    xa_init(&v->msi_virqs);
+    mutex_init(&vecs->lock);
+    xa_init(&vecs->virqs);
 }
 
-void pciem_msi_rc_destroy(struct pciem_root_complex *v)
+void pciem_msi_vecs_destroy(struct pciem_msi_vecs *vecs)
 {
-    WARN_ON(!xa_empty(&v->msi_virqs));
-    xa_destroy(&v->msi_virqs);
+    WARN_ON(!xa_empty(&vecs->virqs));
+    xa_destroy(&vecs->virqs);
 }
 
 /*
@@ -241,23 +241,22 @@ void pciem_msi_rc_destroy(struct pciem_root_complex *v)
  * keeps the vector's irq from being freed, and its number reused, before the
  * handler has run.
  */
-int pciem_msi_deliver(struct pciem_root_complex *v, int vector)
+int pciem_msi_deliver(struct pciem_msi_vecs *v, int vector)
 {
     void *entry = NULL;
 
     might_sleep();
 
-    guard(mutex)(&v->msi_lock);
+    guard(mutex)(&v->lock);
 
-    if (xa_empty(&v->msi_virqs))
+    if (xa_empty(&v->virqs))
         return -ENOENT;
 
     if (vector >= 0)
-        entry = xa_load(&v->msi_virqs, vector);
+        entry = xa_load(&v->virqs, vector);
     if (!entry) {
-        pr_warn_ratelimited("%s: vector %d has no interrupt, raising vector 0\n",
-                            v->pciem_pdev ? pci_name(v->pciem_pdev) : "?", vector);
-        entry = xa_load(&v->msi_virqs, 0);
+        pr_warn_ratelimited("vector %d has no interrupt, raising vector 0\n", vector);
+        entry = xa_load(&v->virqs, 0);
         if (!entry)
             return -EINVAL;
     }
