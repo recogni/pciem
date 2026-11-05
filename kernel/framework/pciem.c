@@ -475,7 +475,7 @@ EXPORT_SYMBOL(pciem_register_bar);
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
 {
     struct pci_dev *dev = v->pciem_pdev;
-    bool reachable;
+    bool reachable, msg;
     int irq, ret;
 
     if (!dev) {
@@ -489,9 +489,12 @@ int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
     if (!reachable)
         return -ENOLINK;
 
-    ret = pciem_msi_deliver(&v->msi, vector);
-    if (ret != -ENOENT)
-        return ret;
+    msg = pciem_cap_msg_irq_enabled(v);
+    if (msg) {
+        ret = pciem_msi_deliver(&v->msi, vector);
+        if (ret != -ENOENT)
+            return ret;
+    }
 
     if (dev->msix_enabled) {
         int max_vec = pci_msix_vec_count(dev);
@@ -510,7 +513,7 @@ int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
         return -EINVAL;
     }
 
-    if (!dev->msix_enabled && !dev->msi_enabled)
+    if (!msg || (!dev->msix_enabled && !dev->msi_enabled))
         return pciem_intx_pulse(v);
 
     atomic_set(&v->pending_msi_irq, irq);

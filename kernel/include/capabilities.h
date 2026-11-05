@@ -82,6 +82,7 @@ bool pciem_handle_cap_write(struct pciem_root_complex *v, int where, int size, u
                             u32 *reset);
 void pciem_cap_reset(struct pciem_root_complex *v);
 bool pciem_cap_present(struct pciem_root_complex *v, u32 type);
+bool pciem_cap_msg_irq_enabled(struct pciem_root_complex *v);
 int pciem_cap_pcie_set_link(struct pciem_root_complex *v, u8 speed, u8 width);
 int pciem_cap_pcie_topo_setup(struct pciem_root_complex *v, u8 speed, u8 width);
 void pciem_cap_pcie_set_lnksta(struct pciem_root_complex *v, u8 cls, u8 nlw);

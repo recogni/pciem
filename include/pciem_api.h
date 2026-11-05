@@ -331,10 +331,6 @@ struct pciem_event
  *   modelled, and nothing else in the capability changes.
  * - BAR memory is not touched, the MSI-X table included: the device keeps
  *   its state through the retrain, as a chip does.
- * - Interrupts: pciem delivers a vector by what the host has set up, not by
- *   the function's MSI or MSI-X Enable bit, so vectors the host had keep
- *   arriving, where the hardware would send none until the host enabled
- *   them again.
  *
  * The device model gets one PCIEM_EVENT_LINK per operation, with @offset
  * the function index, @data the op (PCIEM_LINK_DOWN or PCIEM_LINK_UP) in
@@ -735,8 +731,8 @@ struct pciem_response
 /*
  * Interrupts.
  *
- * With MSI-X or MSI enabled by the host, PCIEM_IOCTL_INJECT_IRQ (flags 0)
- * and a plain irqfd send the given vector.
+ * With MSI-X or MSI enabled by the host and by the function's own Enable bit,
+ * PCIEM_IOCTL_INJECT_IRQ with flags 0 and a plain irqfd send the given vector.
  *
  * Otherwise they use the function's INTx line (INTA). The line is either
  * asserted or not, as on hardware:
