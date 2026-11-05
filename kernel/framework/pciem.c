@@ -393,7 +393,6 @@ void pciem_link_down(struct pciem_root_complex *v)
     if (v->topo)
         pciem_topo_dev_down(v);
 }
-EXPORT_SYMBOL(pciem_link_down);
 
 static const char *const pciem_link_speed_names[] = {
     "unknown", "2.5GT/s", "5GT/s", "8GT/s", "16GT/s", "32GT/s", "64GT/s",
@@ -423,7 +422,6 @@ int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width)
             width);
     return 0;
 }
-EXPORT_SYMBOL(pciem_link_up);
 
 int pciem_register_bar(struct pciem_root_complex *v, u32 bar_num, resource_size_t size, u32 flags)
 {
