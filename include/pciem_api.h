@@ -441,7 +441,8 @@ struct pciem_link
  * PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL, and is for single-function devices. An
  * older pciem.ko does not know the placement bits and ignores them, so a
  * caller that needs one checks where the device landed (the depth of its
- * path in /sys/bus/pci/devices, 1, 2 or 4).
+ * path in /sys/bus/pci/devices, 1, 2 or 4). A placed device whose REGISTER
+ * fails can only be closed: a second REGISTER fails with EINVAL.
  *
  * Shared switch. The first device to REGISTER at (domain, N) creates the
  * switch: the host bridge, the Root Port, the Upstream Port and all P

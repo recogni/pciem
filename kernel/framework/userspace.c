@@ -49,6 +49,7 @@ struct pciem_irqfd
 #define PCIEM_UNREGISTERED 0
 #define PCIEM_REGISTERING  1
 #define PCIEM_REGISTERED   2
+#define PCIEM_FAILED       3
 
 struct pciem_irqfds {
     spinlock_t lock;
@@ -741,7 +742,7 @@ static int pciem_check_unregistered(struct pciem_userspace_state *us)
     registered = atomic_read_acquire(&us->registered);
     if (registered == PCIEM_REGISTERING)
         return -EBUSY;
-    if (registered == PCIEM_REGISTERED)
+    if (registered != PCIEM_UNREGISTERED)
         return -EINVAL;
 
     return 0;
@@ -757,7 +758,7 @@ static int pciem_check_registered(struct pciem_userspace_state *us)
     registered = atomic_read_acquire(&us->registered);
     if (registered == PCIEM_REGISTERING)
         return -EBUSY;
-    if (registered == PCIEM_UNREGISTERED)
+    if (registered != PCIEM_REGISTERED)
         return -EINVAL;
 
     return 0;
@@ -776,14 +777,13 @@ static int pciem_start_registration(struct pciem_userspace_state *us)
     if (val == PCIEM_REGISTERING)
         return -EBUSY;
 
-    /* If the cmpxchg() failed the state can only be REGISTERING
-     * (checked above) or REGISTERED (this case), so return EINVAL */
     return -EINVAL;
 }
 
 static void pciem_cancel_registration(struct pciem_userspace_state *us)
 {
-    atomic_set_release(&us->registered, PCIEM_UNREGISTERED);
+    atomic_set_release(&us->registered,
+                       us->slot.funcs[0]->placement ? PCIEM_FAILED : PCIEM_UNREGISTERED);
 }
 
 static void pciem_complete_registration(struct pciem_userspace_state *us)
