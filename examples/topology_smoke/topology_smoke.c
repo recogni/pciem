@@ -548,7 +548,7 @@ static int wait_service(const char *bdf, const char *svc, int ms)
 static void step_enumerate(void)
 {
 	int want_depth = placement == PCIEM_PLACEMENT_SWITCH ? 4 : 2;
-	static const uint16_t ids[] = { 0xd130, 0xd131, 0xd132 };
+	static const uint16_t ids[] = { PCIEM_BRIDGE_DEVICE_RP, PCIEM_BRIDGE_DEVICE_USP, PCIEM_BRIDGE_DEVICE_DSP };
 	char buf[64];
 	int i;
 
@@ -564,9 +564,9 @@ static void step_enumerate(void)
 		ven = read_hex(p);
 		snprintf(p, sizeof(p), "/sys/bus/pci/devices/%s/class", chain[i]);
 		cls = read_hex(p);
-		report(ven == 0x1eb2 && dev == want && cls == 0x060400,
+		report(ven == PCIEM_BRIDGE_VENDOR_ID && dev == want && cls == 0x060400,
 		       "%s is %04lx:%04lx class %06lx (expected %04x:%04x class 060400)", chain[i], ven, dev,
-		       cls, 0x1eb2, want);
+		       cls, PCIEM_BRIDGE_VENDOR_ID, want);
 	}
 	report(wait_service(chain[0], "pcie001", 3000), "RP %s has the PME service", chain[0]);
 	report(wait_service(chain[0], "pcie010", 3000), "RP %s has the bandwidth controller service",
@@ -1263,7 +1263,7 @@ static int count_ids(uint16_t dev)
 		if (strlen(de->d_name) != 12)
 			continue;
 		snprintf(p, sizeof(p), "/sys/bus/pci/devices/%s/vendor", de->d_name);
-		if (read_hex(p) != 0x1eb2)
+		if (read_hex(p) != PCIEM_BRIDGE_VENDOR_ID)
 			continue;
 		snprintf(p, sizeof(p), "/sys/bus/pci/devices/%s/device", de->d_name);
 		if (read_hex(p) == dev)
@@ -1325,9 +1325,9 @@ static void multi_enumerate(int n)
 	char b[600], js[4096];
 	int g[MAXDEV], k, j, distinct = 1, alone = 1, acs_ok = 1;
 
-	report(count_ids(0xd130) == 1 && count_ids(0xd131) == 1 && count_ids(0xd132) == n,
+	report(count_ids(PCIEM_BRIDGE_DEVICE_RP) == 1 && count_ids(PCIEM_BRIDGE_DEVICE_USP) == 1 && count_ids(PCIEM_BRIDGE_DEVICE_DSP) == n,
 	       "one Root Port, one Upstream Port and %d Downstream Ports (%d, %d, %d)", n,
-	       count_ids(0xd130), count_ids(0xd131), count_ids(0xd132));
+	       count_ids(PCIEM_BRIDGE_DEVICE_RP), count_ids(PCIEM_BRIDGE_DEVICE_USP), count_ids(PCIEM_BRIDGE_DEVICE_DSP));
 	for (k = 0; k < n; k++) {
 		char path[300], real[PATH_MAX];
 
@@ -1718,9 +1718,9 @@ static int multi_main(int n)
 		order[i] = n - 1 - i;
 	multi_run_close_all(n, order);
 	end = now_ms() + 5000;
-	while (now_ms() < end && (count_ids(0xd130) || count_ids(0xd131) || count_ids(0xd132)))
+	while (now_ms() < end && (count_ids(PCIEM_BRIDGE_DEVICE_RP) || count_ids(PCIEM_BRIDGE_DEVICE_USP) || count_ids(PCIEM_BRIDGE_DEVICE_DSP)))
 		usleep(50000);
-	report(!count_ids(0xd130) && !count_ids(0xd131) && !count_ids(0xd132),
+	report(!count_ids(PCIEM_BRIDGE_DEVICE_RP) && !count_ids(PCIEM_BRIDGE_DEVICE_USP) && !count_ids(PCIEM_BRIDGE_DEVICE_DSP),
 	       "no port of the switch remains after the last device left");
 	report(!path_exists("%s", sw_dbg), "the switch debugfs directory is gone");
 	report(dmesg_count("WARNING:") == warn_before && dmesg_count("BUG:") == bug_before,

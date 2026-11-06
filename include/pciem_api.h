@@ -41,6 +41,12 @@ typedef atomic_int atomic_t;
 #define PCIEM_PLACEMENT_ROOT_PORT 1   /* root bus -> Root Port -> device */
 #define PCIEM_PLACEMENT_SWITCH    2   /* root bus -> Root Port -> switch Upstream Port -> Downstream Port -> device */
 
+/** IDs of the emulated bridges; see "Topology" below. */
+#define PCIEM_BRIDGE_VENDOR_ID  0x1eb2
+#define PCIEM_BRIDGE_DEVICE_RP  0xd130
+#define PCIEM_BRIDGE_DEVICE_USP 0xd131
+#define PCIEM_BRIDGE_DEVICE_DSP 0xd132
+
 /**
  * Parameters for PCIEM_IOCTL_CREATE_DEVICE.
  *
@@ -468,8 +474,8 @@ struct pciem_link
  * EINVAL.
  *
  * The bridges are PCI-to-PCI bridges with PCIe capability version 2. Their
- * IDs are vendor 0x1eb2, device 0xd130 (Root Port), 0xd131 (Upstream Port)
- * and 0xd132 (Downstream Port); class 0x060400. Modelled: the type 1
+ * IDs are PCIEM_BRIDGE_VENDOR_ID with PCIEM_BRIDGE_DEVICE_RP, _USP or _DSP;
+ * class 0x060400. Modelled: the type 1
  * header (no I/O window, no BARs, Interrupt Pin 0), the memory and
  * prefetchable windows, Bridge Control, the PCIe capability with Link and
  * Slot registers (Slot Capabilities report a present device and no

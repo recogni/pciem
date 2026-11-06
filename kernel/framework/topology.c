@@ -14,7 +14,8 @@
 #include <linux/sizes.h>
 #include <linux/sort.h>
 
-#define PCIEM_VENDOR_ID 0x1eb2
+static const u16 pciem_bridge_ids[] = { PCIEM_BRIDGE_DEVICE_RP, PCIEM_BRIDGE_DEVICE_USP, PCIEM_BRIDGE_DEVICE_DSP };
+
 #define PCIEM_PORT_PCIE 0x40
 #define PCIEM_PORT_MSI  0x80
 #define PCIEM_PORT_PM   0xa0
@@ -152,8 +153,8 @@ static void port_build(struct pciem_port *p)
 	memset(p->rw, 0, sizeof(p->rw));
 	memset(p->w1c, 0, sizeof(p->w1c));
 
-	w16(p, PCI_VENDOR_ID, PCIEM_VENDOR_ID);
-	w16(p, PCI_DEVICE_ID, 0xd130 + p->role);
+	w16(p, PCI_VENDOR_ID, PCIEM_BRIDGE_VENDOR_ID);
+	w16(p, PCI_DEVICE_ID, pciem_bridge_ids[p->role]);
 	w16(p, PCI_STATUS, PCI_STATUS_CAP_LIST);
 	rwm(p, PCI_COMMAND, 2, 0x0546);
 	w1cm(p, PCI_STATUS, 2, 0xf900);
