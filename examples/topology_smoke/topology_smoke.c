@@ -564,9 +564,9 @@ static void step_enumerate(void)
 		ven = read_hex(p);
 		snprintf(p, sizeof(p), "/sys/bus/pci/devices/%s/class", chain[i]);
 		cls = read_hex(p);
-		report(ven == 0x1ab8 && dev == want && cls == 0x060400,
+		report(ven == 0x1eb2 && dev == want && cls == 0x060400,
 		       "%s is %04lx:%04lx class %06lx (expected %04x:%04x class 060400)", chain[i], ven, dev,
-		       cls, 0x1ab8, want);
+		       cls, 0x1eb2, want);
 	}
 	report(wait_service(chain[0], "pcie001", 3000), "RP %s has the PME service", chain[0]);
 	report(wait_service(chain[0], "pcie010", 3000), "RP %s has the bandwidth controller service",
@@ -1263,7 +1263,7 @@ static int count_ids(uint16_t dev)
 		if (strlen(de->d_name) != 12)
 			continue;
 		snprintf(p, sizeof(p), "/sys/bus/pci/devices/%s/vendor", de->d_name);
-		if (read_hex(p) != 0x1ab8)
+		if (read_hex(p) != 0x1eb2)
 			continue;
 		snprintf(p, sizeof(p), "/sys/bus/pci/devices/%s/device", de->d_name);
 		if (read_hex(p) == dev)

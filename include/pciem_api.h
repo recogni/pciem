@@ -468,7 +468,7 @@ struct pciem_link
  * EINVAL.
  *
  * The bridges are PCI-to-PCI bridges with PCIe capability version 2. Their
- * IDs are vendor 0x1ab8, device 0xd130 (Root Port), 0xd131 (Upstream Port)
+ * IDs are vendor 0x1eb2, device 0xd130 (Root Port), 0xd131 (Upstream Port)
  * and 0xd132 (Downstream Port); class 0x060400. Modelled: the type 1
  * header (no I/O window, no BARs, Interrupt Pin 0), the memory and
  * prefetchable windows, Bridge Control, the PCIe capability with Link and

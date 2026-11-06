@@ -14,7 +14,7 @@
 #include <linux/sizes.h>
 #include <linux/sort.h>
 
-#define PCIEM_VENDOR_ID 0x1ab8
+#define PCIEM_VENDOR_ID 0x1eb2
 #define PCIEM_PORT_PCIE 0x40
 #define PCIEM_PORT_MSI  0x80
 #define PCIEM_PORT_PM   0xa0
