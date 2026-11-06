@@ -1087,6 +1087,20 @@ bool pciem_cap_present(struct pciem_root_complex *v, u32 type)
     return v->cap_mgr && pciem_cap_manager_find(v->cap_mgr, type);
 }
 
+bool pciem_cap_msg_irq_enabled(struct pciem_root_complex *v)
+{
+    struct pciem_cap_entry *cap;
+
+    guard(raw_spinlock_irqsave)(&v->cap_lock);
+    if (!v->cap_mgr)
+        return false;
+    cap = pciem_cap_manager_find(v->cap_mgr, PCIEM_CAP_MSIX);
+    if (cap && (cap->state.msix_state.control & PCI_MSIX_FLAGS_ENABLE))
+        return true;
+    cap = pciem_cap_manager_find(v->cap_mgr, PCIEM_CAP_MSI);
+    return cap && (cap->state.msi_state.control & PCI_MSI_FLAGS_ENABLE);
+}
+
 static struct pciem_cap_entry *pciem_cap_pcie_locked(struct pciem_root_complex *v)
 {
     lockdep_assert_held(&v->cap_lock);

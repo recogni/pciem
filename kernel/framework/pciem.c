@@ -393,7 +393,6 @@ void pciem_link_down(struct pciem_root_complex *v)
     if (v->topo)
         pciem_topo_dev_down(v);
 }
-EXPORT_SYMBOL(pciem_link_down);
 
 static const char *const pciem_link_speed_names[] = {
     "unknown", "2.5GT/s", "5GT/s", "8GT/s", "16GT/s", "32GT/s", "64GT/s",
@@ -404,7 +403,6 @@ int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width)
     int ret;
 
     if (v->topo) {
-        pciem_function_reset_state(v);
         smp_store_release(&v->link_down, false);
         pr_info("func%u: link up requested, %s x%u\n", v->func_index,
                 speed < ARRAY_SIZE(pciem_link_speed_names) ? pciem_link_speed_names[speed] : "unknown",
@@ -423,7 +421,11 @@ int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width)
             width);
     return 0;
 }
-EXPORT_SYMBOL(pciem_link_up);
+
+bool pciem_ep_reachable(struct pciem_root_complex *v)
+{
+    return !READ_ONCE(v->link_down) && !READ_ONCE(v->dl_down);
+}
 
 int pciem_register_bar(struct pciem_root_complex *v, u32 bar_num, resource_size_t size, u32 flags)
 {
@@ -473,6 +475,7 @@ EXPORT_SYMBOL(pciem_register_bar);
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
 {
     struct pci_dev *dev = v->pciem_pdev;
+    bool reachable, msg;
     int irq, ret;
 
     if (!dev) {
@@ -480,12 +483,18 @@ int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
         return -ENODEV;
     }
 
+    reachable = pciem_ep_reachable(v);
     if (READ_ONCE(pciem_trace_ep_irq))
-        pciem_trace_irq(pciem_rc_trace(v), PT_FN_EP0 + v->func_index, PT_IRQ_EP, vector, true);
+        pciem_trace_irq(pciem_rc_trace(v), PT_FN_EP0 + v->func_index, PT_IRQ_EP, vector, reachable);
+    if (!reachable)
+        return -ENOLINK;
 
-    ret = pciem_msi_deliver(&v->msi, vector);
-    if (ret != -ENOENT)
-        return ret;
+    msg = pciem_cap_msg_irq_enabled(v);
+    if (msg) {
+        ret = pciem_msi_deliver(&v->msi, vector);
+        if (ret != -ENOENT)
+            return ret;
+    }
 
     if (dev->msix_enabled) {
         int max_vec = pci_msix_vec_count(dev);
@@ -504,7 +513,7 @@ int pciem_trigger_msi(struct pciem_root_complex *v, int vector)
         return -EINVAL;
     }
 
-    if (!dev->msix_enabled && !dev->msi_enabled)
+    if (!msg || (!dev->msix_enabled && !dev->msi_enabled))
         return pciem_intx_pulse(v);
 
     atomic_set(&v->pending_msi_irq, irq);
@@ -526,6 +535,9 @@ EXPORT_SYMBOL(pciem_trigger_msi);
 void pciem_set_intx(struct pciem_root_complex *v, bool asserted)
 {
     bool raise;
+
+    if (asserted && !pciem_ep_reachable(v))
+        return;
 
     scoped_guard(raw_spinlock_irqsave, &v->intx_lock) {
         raise = asserted && !v->intx_level && !pciem_intx_disabled(v);

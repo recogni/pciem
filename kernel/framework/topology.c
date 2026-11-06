@@ -1550,6 +1550,8 @@ int pciem_topo_join(struct pciem_root_complex *v)
 	int bus = v->mode_state.virtual_root.assigned_busnr;
 
 	lockdep_assert_held(&pciem_switch_lock);
+	if (!mine->params_set)
+		return -EINVAL;
 	topo_apply_defaults(mine);
 	v->topo_port = mine->p.port;
 	if (bus + 2 + mine->p.switch_ports > 255)
@@ -1694,6 +1696,7 @@ void pciem_topo_leave(struct pciem_root_complex *v)
 			pciem_link_detach(s->link);
 		}
 		synchronize_rcu();
+		flush_work(&t->work);
 	}
 	v->topo = NULL;
 	v->root_bus = NULL;
@@ -1721,6 +1724,9 @@ void pciem_topo_activate(struct pciem_root_complex *v)
 			}
 		}
 	}
-	if (v->pciem_pdev)
-		pci_bus_add_device(v->pciem_pdev);
+	if (v->pciem_pdev) {
+		pci_lock_rescan_remove();
+		pci_bus_add_devices(v->pciem_pdev->bus);
+		pci_unlock_rescan_remove();
+	}
 }

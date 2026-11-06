@@ -186,6 +186,7 @@ struct pciem_root_complex
 
     bool detaching;
     bool link_down;
+    bool dl_down;
 };
 
 int pciem_trigger_msi(struct pciem_root_complex *v, int vector);
@@ -197,6 +198,7 @@ void pciem_set_reset_notify(struct pciem_root_complex *v,
                             void (*fn)(void *data, u32 kind), void *data);
 void pciem_link_down(struct pciem_root_complex *v);
 int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width);
+bool pciem_ep_reachable(struct pciem_root_complex *v);
 int pciem_complete_init(struct pciem_root_complex *v);
 void pciem_mark_ep_bars(struct pciem_root_complex *v);
 int pciem_start_device(struct pciem_root_complex *v);

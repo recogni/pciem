@@ -292,7 +292,8 @@ struct pciem_event
  * told (with PCIEM_PLACEMENT_ROOT_BUS; see "Topology" for the others):
  * there is no port above the function to report the link going down,
  * so nothing in Linux saves or restores anything, and nothing resets the
- * device.
+ * device. Interrupts and DMA stop: INJECT_IRQ fails with ENOLINK unless it
+ * deasserts, an irqfd's interrupt is dropped, and DMA and P2P ioctls fail too.
  *
  * - A config read from the PCI core completes with all-ones, as a root port
  *   completes one that got no answer, so lspci, the sysfs config file, what
@@ -310,8 +311,6 @@ struct pciem_event
  * - A synchronous read (PCIEM_TRACE_SYNC_READS) waiting for an answer fails
  *   as on a reset: the access returns all-ones, and an answer the device
  *   model writes for it afterwards fails with EINVAL.
- * - Interrupts are not stopped: an MSI or INTx the device model raises
- *   reaches the host, where the hardware could send nothing.
  *
  * PCIEM_LINK_UP brings the function back as the retrain leaves it:
  *
@@ -332,10 +331,6 @@ struct pciem_event
  *   modelled, and nothing else in the capability changes.
  * - BAR memory is not touched, the MSI-X table included: the device keeps
  *   its state through the retrain, as a chip does.
- * - Interrupts: pciem delivers a vector by what the host has set up, not by
- *   the function's MSI or MSI-X Enable bit, so vectors the host had keep
- *   arriving, where the hardware would send none until the host enabled
- *   them again.
  *
  * The device model gets one PCIEM_EVENT_LINK per operation, with @offset
  * the function index, @data the op (PCIEM_LINK_DOWN or PCIEM_LINK_UP) in
@@ -441,7 +436,8 @@ struct pciem_link
  * PCIEM_CREATE_FLAG_BUS_MODE_VIRTUAL, and is for single-function devices. An
  * older pciem.ko does not know the placement bits and ignores them, so a
  * caller that needs one checks where the device landed (the depth of its
- * path in /sys/bus/pci/devices, 1, 2 or 4).
+ * path in /sys/bus/pci/devices, 1, 2 or 4). A placed device whose REGISTER
+ * fails can only be closed: a second REGISTER fails with EINVAL.
  *
  * Shared switch. The first device to REGISTER at (domain, N) creates the
  * switch: the host bridge, the Root Port, the Upstream Port and all P
@@ -553,14 +549,16 @@ struct pciem_link
  * makes the device stop answering at once; the partner is then gone, the
  * link falls to Recovery and, after recovery_timeout, to Detect.Quiet with
  * DLLLA 0, Negotiated Link Width 0, Current Link Speed 2.5GT/s and DLLSC
- * set. PCIEM_LINK_UP resets the function's config state and makes the
+ * set; that DL_Down resets the device's config state. PCIEM_LINK_UP makes the
  * partner present again; the ioctl returns while the link trains, and the
- * device is reachable once DL_Up is reached, after the RRS window. Reading
+ * device is reachable once DL_Up is reached, after the RRS window. A
+ * PCIEM_LINK_UP within recovery_timeout resumes Recovery in DL_Up. Reading
  * the debugfs "link" file gives "down" until then. Either must not
  * be repeated: EALREADY is judged on what the device last asked for, not on
  * where the link is. PCIEM_LINK_EQ_LIMIT sets the equalization limit of
  * the device's link (@speed, 0 for none, with @width 0); it takes effect
- * at the next equalization and does not retrain.
+ * at the next equalization and does not retrain. While the device is not
+ * reachable, interrupts and DMA stop as "Link" describes.
  *
  * The host operates the ports as on hardware, in config writes:
  *
@@ -571,7 +569,8 @@ struct pciem_link
  * - A write of Target Link Speed is stored, and caps the next training or
  *   retrain. It does not retrain by itself.
  * - Link Disable puts the link in Disabled with DL_Down, and clearing it in
- *   Detect.Quiet. Linux uses it before it resets a port.
+ *   Detect.Quiet. Linux uses it before it resets a port. Its DL_Down resets
+ *   the device's config state, as every DL_Down of the device's link does.
  * - Secondary Bus Reset (Bridge Control bit 6), 0 to 1, puts the link in
  *   HotReset with DL_Down, and resets the device as a Function Level Reset
  *   does: the device model gets PCIEM_EVENT_RESET with @data PCIEM_RESET_HOT.
@@ -600,7 +599,8 @@ struct pciem_link
  * - PCIEM_TOPO_FLAG_HOTPLUG: the port above the device is Hot-Plug Capable
  *   and Surprise Hot-Plug capable; Slot Status DLLSC and PDC raise its
  *   interrupt when Slot Control enables it, and pciehp removes and
- *   re-enumerates the device on link down and up.
+ *   re-enumerates the device on link down and up. DMA fails with ENODEV
+ *   from the removal until Linux enumerates the device again.
  * - PCIEM_TOPO_FLAG_NATIVE_AER: the host bridge grants Linux AER and DPC
  *   (native_aer, native_dpc), so the AER and DPC drivers bind to the Root
  *   Port. Without it Linux leaves them to the firmware and does nothing.
@@ -679,7 +679,8 @@ struct pciem_link
  * @switch_ports set with another placement than PCIEM_PLACEMENT_SWITCH, a
  * switch without @switch_ports or with a @port that is not below it, or a
  * switch without PCIEM_CREATE_FLAG_FIXED_ADDRESS (checked at REGISTER too);
- * EBUSY after REGISTER.
+ * EBUSY after REGISTER. A switch placement needs it: REGISTER without it
+ * fails with EINVAL.
  *
  * @param flags          PCIEM_TOPO_FLAG_*.
  * @param rp_speed       Root Port Max Link Speed (PCIEM_LINK_SPEED_*).
@@ -730,8 +731,8 @@ struct pciem_response
 /*
  * Interrupts.
  *
- * With MSI-X or MSI enabled by the host, PCIEM_IOCTL_INJECT_IRQ (flags 0)
- * and a plain irqfd send the given vector.
+ * With MSI-X or MSI enabled by the host and by the function's own Enable bit,
+ * PCIEM_IOCTL_INJECT_IRQ with flags 0 and a plain irqfd send the given vector.
  *
  * Otherwise they use the function's INTx line (INTA). The line is either
  * asserted or not, as on hardware:
@@ -763,7 +764,7 @@ struct pciem_response
  *
  * A pulse or MSI with nowhere to go (no driver has bound yet, so the INTx
  * line is not routed, and no MSI) fails with -EINVAL, or, from an irqfd, is
- * dropped with a warning. A level assertion always succeeds: it sets the
+ * dropped with a warning. A level assertion while the link is up sets the
  * line, and on a VIRTUAL bus the host is interrupted once it requests or
  * unmasks its irq.
  *

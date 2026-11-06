@@ -49,6 +49,7 @@ struct pciem_irqfd
 #define PCIEM_UNREGISTERED 0
 #define PCIEM_REGISTERING  1
 #define PCIEM_REGISTERED   2
+#define PCIEM_FAILED       3
 
 struct pciem_irqfds {
     spinlock_t lock;
@@ -78,7 +79,7 @@ struct pciem_reset_state {
      * of its last reset or link-down event, are on the ring ahead of it,
      * and fail with @fail_status once @fail_needed is seen. */
     atomic_t fail_needed;
-    atomic64_t fail_seq;
+    u64 fail_seq;
     int fail_status;
 };
 
@@ -523,7 +524,7 @@ static bool pciem_shared_ring_put(struct pciem_userspace_state *us,
 
 static void pciem_fail_reads_from(struct pciem_reset_state *rs, u64 seq, int status)
 {
-    atomic64_set(&rs->fail_seq, seq);
+    rs->fail_seq = seq;
     rs->fail_status = status;
     atomic_set_release(&rs->fail_needed, 1);
 }
@@ -640,8 +641,10 @@ static void pciem_reset_fail_reads(struct pciem_userspace_state *us,
 
     if (!atomic_xchg(&rs->fail_needed, 0))
         return;
-    seq = atomic64_read(&rs->fail_seq);
-    status = rs->fail_status;
+    scoped_guard(spinlock_irqsave, &us->shared_ring_lock) {
+        seq = rs->fail_seq;
+        status = rs->fail_status;
+    }
 
     guard(spinlock_irqsave)(&us->pending_lock);
     for (i = 0; i < ARRAY_SIZE(us->pending_requests); i++) {
@@ -739,7 +742,7 @@ static int pciem_check_unregistered(struct pciem_userspace_state *us)
     registered = atomic_read_acquire(&us->registered);
     if (registered == PCIEM_REGISTERING)
         return -EBUSY;
-    if (registered == PCIEM_REGISTERED)
+    if (registered != PCIEM_UNREGISTERED)
         return -EINVAL;
 
     return 0;
@@ -755,7 +758,7 @@ static int pciem_check_registered(struct pciem_userspace_state *us)
     registered = atomic_read_acquire(&us->registered);
     if (registered == PCIEM_REGISTERING)
         return -EBUSY;
-    if (registered == PCIEM_UNREGISTERED)
+    if (registered != PCIEM_REGISTERED)
         return -EINVAL;
 
     return 0;
@@ -774,14 +777,13 @@ static int pciem_start_registration(struct pciem_userspace_state *us)
     if (val == PCIEM_REGISTERING)
         return -EBUSY;
 
-    /* If the cmpxchg() failed the state can only be REGISTERING
-     * (checked above) or REGISTERED (this case), so return EINVAL */
     return -EINVAL;
 }
 
 static void pciem_cancel_registration(struct pciem_userspace_state *us)
 {
-    atomic_set_release(&us->registered, PCIEM_UNREGISTERED);
+    atomic_set_release(&us->registered,
+                       us->slot.funcs[0]->placement ? PCIEM_FAILED : PCIEM_UNREGISTERED);
 }
 
 static void pciem_complete_registration(struct pciem_userspace_state *us)
@@ -1471,6 +1473,8 @@ static long pciem_ioctl_inject_irq(struct pciem_userspace_state *us, struct pcie
         return 0;
     }
     if (inject.flags & PCIEM_IRQ_INJECT_FLAG_LEVEL) {
+        if (!pciem_ep_reachable(v))
+            return -ENOLINK;
         pciem_set_intx(v, true);
         return 0;
     }
@@ -1478,7 +1482,7 @@ static long pciem_ioctl_inject_irq(struct pciem_userspace_state *us, struct pcie
     pr_debug("Injecting MSI vector %d to func %u\n", inject.vector, inject.func);
 
     ret = pciem_trigger_msi(v, inject.vector);
-    if (ret)
+    if (ret && ret != -ENOLINK)
         pr_err_ratelimited("pciem_ioctl_inject_irq: Failed to trigger MSI for func %u, vector %d\n",
                            inject.func, inject.vector);
 
@@ -1549,6 +1553,9 @@ static long pciem_ioctl_dma_atomic(struct pciem_userspace_state *us, struct pcie
     struct pciem_root_complex *v = us_get_rc(us, atomic.func);
     if (!v)
         return -ENODEV;
+    ret = pciem_dma_check(v);
+    if (ret)
+        return ret;
 
     switch (atomic.op_type)
     {
@@ -1598,13 +1605,15 @@ static long pciem_ioctl_p2p(struct pciem_userspace_state *us, struct pciem_p2p_o
     if (op.length == 0)
         return -EINVAL;
 
-    kernel_buf = kmalloc(op.length, GFP_KERNEL);
-    if (!kernel_buf)
-        return -ENOMEM;
-
     struct pciem_root_complex *v = us_get_rc(us, op.func);
     if (!v)
         return -ENODEV;
+    if (!pciem_ep_reachable(v))
+        return -ENOLINK;
+
+    kernel_buf = kmalloc(op.length, GFP_KERNEL);
+    if (!kernel_buf)
+        return -ENOMEM;
 
     if (op.flags & PCIEM_DMA_FLAG_WRITE)
     {
@@ -1732,7 +1741,7 @@ static void pciem_irqfd_work(struct work_struct *work)
         return;
 
     ret = pciem_trigger_msi(v, irqfd->vector);
-    if (ret)
+    if (ret && ret != -ENOLINK)
         pr_warn_ratelimited("irqfd: func%u vector %u: interrupt dropped (%d)\n",
                             irqfd->func, irqfd->vector, ret);
 }
