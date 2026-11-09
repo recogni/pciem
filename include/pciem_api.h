@@ -17,6 +17,18 @@ typedef atomic_int atomic_t;
 
 #define PCIEM_MAX_FUNCTIONS         8
 
+/**
+ * Version of this interface: the ioctls, their structs and the shared ring.
+ * A change that breaks an existing user (a struct or ring layout, an ioctl
+ * number, or what an existing field or flag means) bumps MAJOR and resets
+ * MINOR. A change an older user can ignore (a new ioctl, flag or event)
+ * bumps MINOR. A user works with a module of the same MAJOR and a MINOR at
+ * least its own; PCIEM_IOCTL_GET_API_VERSION reports the module's.
+ */
+#define PCIEM_API_VERSION_MAJOR 1
+#define PCIEM_API_VERSION_MINOR 0
+
+
 /** Mask to extract the bus mode bits from the flags field. */
 #define PCIEM_CREATE_FLAG_BUS_MODE_MASK     0x00000003
 
@@ -1019,8 +1031,20 @@ struct pciem_trace_bar_ranges
     uint64_t ranges;
 };
 
+/**
+ * Result of PCIEM_IOCTL_GET_API_VERSION: the PCIEM_API_VERSION_* the module
+ * was built with. This struct and that ioctl never change, so a user built
+ * against any version can ask.
+ */
+struct pciem_api_version
+{
+    uint32_t major;
+    uint32_t minor;
+};
+
 #define PCIEM_IOCTL_MAGIC 0xAF
 
+#define PCIEM_IOCTL_GET_API_VERSION _IOR(PCIEM_IOCTL_MAGIC, 1, struct pciem_api_version)
 #define PCIEM_IOCTL_CREATE_DEVICE _IOWR(PCIEM_IOCTL_MAGIC, 10, struct pciem_create_device)
 #define PCIEM_IOCTL_ADD_BAR _IOW(PCIEM_IOCTL_MAGIC, 11, struct pciem_bar_config)
 #define PCIEM_IOCTL_ADD_CAPABILITY _IOW(PCIEM_IOCTL_MAGIC, 12, struct pciem_cap_config)

@@ -1,0 +1,19 @@
+name: API version
+
+on:
+  pull_request:
+    branches: [dev]
+    paths: [include/pciem_api.h]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: A header change bumps PCIEM_API_VERSION
+        run: scripts/check-api-version.sh "origin/${{ github.base_ref }}"

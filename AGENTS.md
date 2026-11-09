@@ -32,3 +32,10 @@ branch names, PR titles and descriptions, and issue text.
 - To send a fix upstream, branch from `upstream/main` and open the PR
   against the upstream repository, not this fork. Don't branch from `dev`,
   or fork-only files like this one will end up in the upstream PR.
+
+## Interface version
+
+- A change to `include/pciem_api.h` beyond its comments bumps
+  `PCIEM_API_VERSION_MAJOR` or `_MINOR`, as the comment above them says.
+  `scripts/check-api-version.sh` checks this, and CI runs it on PRs to `dev`.
+- `PCIEM_IOCTL_GET_API_VERSION` and `struct pciem_api_version` never change.

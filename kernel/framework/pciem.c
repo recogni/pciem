@@ -2139,3 +2139,5 @@ module_exit(pciem_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("cakehonolulu (cakehonolulu@protonmail.com)");
 MODULE_DESCRIPTION("Synthetic PCIe device framework");
+/* `modinfo -F pciem_api` reads it without loading the module. */
+MODULE_INFO(pciem_api, __stringify(PCIEM_API_VERSION_MAJOR) "." __stringify(PCIEM_API_VERSION_MINOR));
