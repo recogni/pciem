@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Fails when include/pciem_api.h changed since BASE (default origin/dev)
-# beyond its comments while PCIEM_API_VERSION_MAJOR/MINOR stayed the same.
+# Require a version bump for non-comment header changes since BASE (default origin/dev).
 set -euo pipefail
 
 base=${1:-origin/dev}

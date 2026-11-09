@@ -18,12 +18,9 @@ typedef atomic_int atomic_t;
 #define PCIEM_MAX_FUNCTIONS         8
 
 /**
- * Version of this interface: the ioctls, their structs and the shared ring.
- * A change that breaks an existing user (a struct or ring layout, an ioctl
- * number, or what an existing field or flag means) bumps MAJOR and resets
- * MINOR. A change an older user can ignore (a new ioctl, flag or event)
- * bumps MINOR. A user works with a module of the same MAJOR and a MINOR at
- * least its own; PCIEM_IOCTL_GET_API_VERSION reports the module's.
+ * Interface version. A breaking change (a struct or ring layout, an ioctl number,
+ * an existing field's meaning) bumps MAJOR and resets MINOR; an addition bumps MINOR.
+ * A user needs the same MAJOR and a module MINOR at least its own.
  */
 #define PCIEM_API_VERSION_MAJOR 1
 #define PCIEM_API_VERSION_MINOR 0
@@ -1031,11 +1028,7 @@ struct pciem_trace_bar_ranges
     uint64_t ranges;
 };
 
-/**
- * Result of PCIEM_IOCTL_GET_API_VERSION: the PCIEM_API_VERSION_* the module
- * was built with. This struct and that ioctl never change, so a user built
- * against any version can ask.
- */
+/** Never changes, with its ioctl, so a user of any version can ask. */
 struct pciem_api_version
 {
     uint32_t major;

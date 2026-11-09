@@ -1,11 +1,4 @@
 // SPDX-License-Identifier: MIT
-/*
- * api_version.c - print the loaded module's interface version and check it
- * against the header this was built with.
- *
- * Exits 0 when the module has the same major version and at least this
- * header's minor version, 1 otherwise.
- */
 #include <err.h>
 #include <fcntl.h>
 #include <stdint.h>
