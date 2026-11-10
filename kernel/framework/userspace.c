@@ -2327,12 +2327,25 @@ static int pciem_ioctl_trace_bar_ranges(struct pciem_userspace_state *us,
     return pciem_trace_bar(us, req.bar_index, req.flags, req.func, ranges, req.nr_ranges);
 }
 
+static long pciem_ioctl_get_api_version(struct pciem_api_version __user *arg)
+{
+    struct pciem_api_version v = {
+        .major = PCIEM_API_VERSION_MAJOR,
+        .minor = PCIEM_API_VERSION_MINOR,
+    };
+
+    return copy_to_user(arg, &v, sizeof(v)) ? -EFAULT : 0;
+}
+
 static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct pciem_userspace_state *us = file->private_data;
 
     switch (cmd)
     {
+    case PCIEM_IOCTL_GET_API_VERSION:
+        return pciem_ioctl_get_api_version((struct pciem_api_version __user *)arg);
+
     case PCIEM_IOCTL_CREATE_DEVICE:
         return pciem_ioctl_create_device(us, (struct pciem_create_device __user *)arg);
 

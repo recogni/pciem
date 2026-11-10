@@ -17,6 +17,15 @@ typedef atomic_int atomic_t;
 
 #define PCIEM_MAX_FUNCTIONS         8
 
+/**
+ * Interface version. A breaking change (a struct or ring layout, an ioctl number,
+ * an existing field's meaning) bumps MAJOR and resets MINOR; an addition bumps MINOR.
+ * A user needs the same MAJOR and a module MINOR at least its own.
+ */
+#define PCIEM_API_VERSION_MAJOR 1
+#define PCIEM_API_VERSION_MINOR 0
+
+
 /** Mask to extract the bus mode bits from the flags field. */
 #define PCIEM_CREATE_FLAG_BUS_MODE_MASK     0x00000003
 
@@ -1019,8 +1028,16 @@ struct pciem_trace_bar_ranges
     uint64_t ranges;
 };
 
+/** Never changes, with its ioctl, so a user of any version can ask. */
+struct pciem_api_version
+{
+    uint32_t major;
+    uint32_t minor;
+};
+
 #define PCIEM_IOCTL_MAGIC 0xAF
 
+#define PCIEM_IOCTL_GET_API_VERSION _IOR(PCIEM_IOCTL_MAGIC, 1, struct pciem_api_version)
 #define PCIEM_IOCTL_CREATE_DEVICE _IOWR(PCIEM_IOCTL_MAGIC, 10, struct pciem_create_device)
 #define PCIEM_IOCTL_ADD_BAR _IOW(PCIEM_IOCTL_MAGIC, 11, struct pciem_bar_config)
 #define PCIEM_IOCTL_ADD_CAPABILITY _IOW(PCIEM_IOCTL_MAGIC, 12, struct pciem_cap_config)
