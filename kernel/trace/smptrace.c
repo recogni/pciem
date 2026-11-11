@@ -179,11 +179,14 @@ void smptrace_emulate_read_may_sleep(struct smptrace_ctx *ctx, struct smptrace_m
 	 * through a huge page that a traced range shares, or by a vfio-pci
 	 * read() or write() that crosses a range's edge. */
 	if (!smptrace_traced(ctx, off, size)) {
-		memcpy_fromio(dst, ctx->shadow_va + off, size);
+		if (READ_ONCE(ctx->mem_off))
+			memset(dst, 0xff, size);
+		else
+			memcpy_fromio(dst, ctx->shadow_va + off, size);
 		return;
 	}
 
-	if (READ_ONCE(ctx->link_down)) {
+	if (READ_ONCE(ctx->link_down) || READ_ONCE(ctx->mem_off)) {
 		memset(dst, 0xff, size);
 		return;
 	}
@@ -233,11 +236,12 @@ void smptrace_emulate_write_may_sleep(struct smptrace_ctx *ctx, struct smptrace_
 	}
 
 	if (!smptrace_traced(ctx, off, size)) {
-		memcpy_toio(ctx->shadow_va + off, src, size);
+		if (!READ_ONCE(ctx->mem_off))
+			memcpy_toio(ctx->shadow_va + off, src, size);
 		return;
 	}
 
-	if (READ_ONCE(ctx->link_down))
+	if (READ_ONCE(ctx->link_down) || READ_ONCE(ctx->mem_off))
 		return;
 
 	if (!ctx->stop_writes)
@@ -477,6 +481,108 @@ bool smptrace_pa_traced(phys_addr_t pa, size_t len)
 	return ctx && smptrace_traced(ctx, pa - ctx->pa, len);
 }
 
+/* Whether an active tracer's range contains [pa, pa + len) */
+bool smptrace_pa_tracked(phys_addr_t pa, size_t len)
+{
+	return smptrace_find_ctx(pa, len) != NULL;
+}
+
+/* Whether an active tracer's range contains [pa, pa + len) and its gate is closed */
+bool smptrace_pa_gated(phys_addr_t pa, size_t len)
+{
+	struct smptrace_ctx *ctx = smptrace_find_ctx(pa, len);
+
+	return ctx && READ_ONCE(ctx->mem_off);
+}
+
+/* Records a user mapping of a tracked BAR so the gate can zap it. */
+int smptrace_umap_add(phys_addr_t pa, size_t len, struct vm_area_struct *vma)
+{
+	struct smptrace_umap *u;
+	struct smptrace_ctx *ctx;
+	unsigned long flags;
+
+	guard(smptrace_active)(&smptrace_active_srcu);
+	ctx = smptrace_find_ctx(pa, len);
+	if (!ctx)
+		return -ENOENT;
+	u = kzalloc(sizeof(*u), GFP_ATOMIC);
+	if (!u)
+		return -ENOMEM;
+	u->vma = vma;
+	spin_lock_irqsave(&ctx->lock, flags);
+	list_add_tail(&u->node, &ctx->umaps);
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	return 0;
+}
+
+/* Forgets a user mapping when its vma goes away. */
+void smptrace_umap_del(phys_addr_t pa, size_t len, struct vm_area_struct *vma)
+{
+	struct smptrace_umap *u, *found = NULL;
+	struct smptrace_ctx *ctx;
+	unsigned long flags;
+
+	guard(smptrace_active)(&smptrace_active_srcu);
+	ctx = smptrace_find_ctx(pa, len);
+	if (!ctx)
+		return;
+	spin_lock_irqsave(&ctx->lock, flags);
+	list_for_each_entry(u, &ctx->umaps, node) {
+		if (u->vma == vma) {
+			list_del(&u->node);
+			found = u;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	kfree(found);
+}
+
+/* Zaps the PTEs of every recorded user mapping when the gate changes. */
+static void smptrace_gate_work(struct work_struct *work)
+{
+	struct smptrace_ctx *ctx = container_of(work, struct smptrace_ctx, gate_work);
+
+	for (unsigned int i = 0;; i++) {
+		struct smptrace_umap *u;
+		struct inode *inode = NULL;
+		unsigned long flags;
+		loff_t start = 0;
+		size_t len = 0;
+		bool more = false;
+		unsigned int n = 0;
+
+		spin_lock_irqsave(&ctx->lock, flags);
+		list_for_each_entry(u, &ctx->umaps, node) {
+			if (n++ != i)
+				continue;
+			more = true;
+			if (u->vma->vm_file && u->vma->vm_file->f_mapping)
+				inode = igrab(u->vma->vm_file->f_mapping->host);
+			start = (loff_t)u->vma->vm_pgoff << PAGE_SHIFT;
+			len = u->vma->vm_end - u->vma->vm_start;
+			break;
+		}
+		spin_unlock_irqrestore(&ctx->lock, flags);
+		if (!more)
+			break;
+		if (inode) {
+			unmap_mapping_range(inode->i_mapping, start, len, 1);
+			iput(inode);
+		}
+	}
+}
+
+/* Closes or opens the gate; pages with a PTE follow from a work item */
+void smptrace_set_mem_off(struct smptrace_ctx *ctx, bool off)
+{
+	if (off)
+		smptrace_scratch_fill();
+	if (xchg(&ctx->mem_off, off) != off)
+		schedule_work(&ctx->gate_work);
+}
+
 /* Starts tracing. On failure the ranges smptrace_set_ranges() set are freed. */
 int smptrace_init(struct smptrace_ctx *ctx)
 {
@@ -488,6 +594,8 @@ int smptrace_init(struct smptrace_ctx *ctx)
 	atomic_set(&ctx->unmaps_pending, 0);
 	init_llist_head(&ctx->rejected);
 	INIT_WORK(&ctx->reject_work, smptrace_unmap_rejected);
+	INIT_WORK(&ctx->gate_work, smptrace_gate_work);
+	INIT_LIST_HEAD(&ctx->umaps);
 
 	ctx->in_pf = alloc_percpu_gfp(bool, GFP_KERNEL_ACCOUNT);
 	if (!ctx->in_pf) {
@@ -516,6 +624,8 @@ static void smptrace_deactivate(struct smptrace_ctx *ctx)
 {
 	struct smptrace_map *map, *tmp;
 	unsigned long flags;
+
+	cancel_work_sync(&ctx->gate_work);
 
 	/* Unpublish first: a user-mapping fault that already found this
 	 * tracer holds smptrace_active_srcu until it has finished with it. The
@@ -583,7 +693,13 @@ static void smptrace_deactivate(struct smptrace_ctx *ctx)
 
 void smptrace_destroy(struct smptrace_ctx *ctx)
 {
+	struct smptrace_umap *u, *tmp;
+
 	smptrace_deactivate(ctx);
+	list_for_each_entry_safe(u, tmp, &ctx->umaps, node) {
+		list_del(&u->node);
+		kfree(u);
+	}
 	free_percpu(ctx->in_pf);
 	/* Nothing can look at the ranges after deactivation: every probe is
 	 * unregistered and no SRCU reader can still find ctx */

@@ -261,6 +261,8 @@ struct pciem_event
  * does not touch BAR memory, including the MSI-X table). A reset does not
  * stop MMIO: accesses to the BARs keep being delivered afterwards, the host
  * restoring the MSI-X table among them.
+ * While Memory Space Enable is 0, as a reset leaves it, a BAR with a tracer reads
+ * all-ones and drops writes; untraced user pages follow in ms, kernel ones do not.
  *
  * Order: the event is queued once the reset of config state above is done.
  * It comes after the events of every access to the function made before
@@ -953,7 +955,8 @@ struct pciem_dma_indirect
 #define PCIEM_TRACE_SYNC_READS    (1 << 3)
 
 /**
- * Parameters for PCIEM_IOCTL_TRACE_BAR.
+ * Parameters for PCIEM_IOCTL_TRACE_BAR. User mapping gating is x86 only, and a store
+ * then load on a gated untraced page in one gated period can read the stored value.
  *
  * @param func  Function index whose BAR should be traced (0–PCIEM_MAX_FUNCTIONS-1).
  *              Defaults to 0 if zero-initialised.

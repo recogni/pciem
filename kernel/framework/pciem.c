@@ -309,15 +309,27 @@ static u32 pciem_read_status_intx(struct pciem_root_complex *v, int where, int s
     return pciem_intx_asserted(v) ? val | bit : val & ~bit;
 }
 
+void pciem_mem_gate_sync(struct pciem_root_complex *v)
+{
+    void (*cb)(struct pciem_root_complex *v, void *data);
+
+    guard(rcu)();
+    smp_mb();
+    cb = smp_load_acquire(&v->mem_gate_cb);
+    if (cb)
+        cb(v, v->mem_gate_data);
+}
+
 /* A write that covers any byte of PCI_COMMAND or PCI_STATUS. */
 static int pciem_write_command_status(struct pciem_root_complex *v, int where, int size, u32 value)
 {
-    bool was_disabled, raise;
+    bool was_disabled, raise, was_mem;
     int i;
 
     guard(raw_spinlock_irqsave)(&v->intx_lock);
 
     was_disabled = pciem_intx_disabled(v);
+    was_mem = v->cfg[PCI_COMMAND] & PCI_COMMAND_MEMORY;
 
     for (i = 0; i < size; i++) {
         int off = where + i;
@@ -340,6 +352,8 @@ static int pciem_write_command_status(struct pciem_root_complex *v, int where, i
     if (raise)
         irq_work_queue(&v->intx_irq_work);
 
+    if (was_mem != !!(v->cfg[PCI_COMMAND] & PCI_COMMAND_MEMORY))
+        pciem_mem_gate_sync(v);
     return PCIBIOS_SUCCESSFUL;
 }
 
@@ -363,9 +377,11 @@ EXPORT_SYMBOL(pciem_set_reset_notify);
 
 void pciem_function_reset_state(struct pciem_root_complex *v)
 {
+    bool was_mem;
     int i;
 
     scoped_guard(raw_spinlock_irqsave, &v->intx_lock) {
+        was_mem = v->cfg[PCI_COMMAND] & PCI_COMMAND_MEMORY;
         v->cfg[PCI_COMMAND] = 0;
         v->cfg[PCI_COMMAND + 1] = 0;
         v->cfg[PCI_STATUS] &= ~(PCIEM_STATUS_W1C & 0xff);
@@ -378,6 +394,8 @@ void pciem_function_reset_state(struct pciem_root_complex *v)
         v->bars[i].base_addr_val = 0;
 
     pciem_cap_reset(v);
+    if (was_mem)
+        pciem_mem_gate_sync(v);
 }
 
 /*

@@ -42,33 +42,63 @@ static vm_fault_t smptrace_user_insert(struct vm_fault *vmf, unsigned long pfn,
 	}
 }
 
+static struct page *smptrace_scratch;
+
+int smptrace_scratch_alloc(void)
+{
+	struct page *page;
+
+	if (smptrace_scratch)
+		return 0;
+	page = alloc_page(GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+	memset(page_address(page), 0xff, PAGE_SIZE);
+	smptrace_scratch = page;
+	return 0;
+}
+
+void smptrace_scratch_free(void)
+{
+	if (smptrace_scratch)
+		__free_page(smptrace_scratch);
+	smptrace_scratch = NULL;
+}
+
+void smptrace_scratch_fill(void)
+{
+	struct page *page = READ_ONCE(smptrace_scratch);
+
+	if (page)
+		memset(page_address(page), 0xff, PAGE_SIZE);
+}
+
 /*
- * Serves a fault of the given order in a user mapping of a BAR whose start,
- * vma->vm_start, maps physical address pa. Pages no traced range covers are
- * mapped at the orders asked for, when the huge page is wholly inside the vma
- * and aligned. An access to a traced page is emulated and never maps it. The
- * ranges are fixed while a tracer lives, so what is traced can only change to
- * nothing, when the tracer goes away, and a page mapped stays correctly
- * mapped. The caller applies its own rules for whether the device's memory
- * may be touched at all.
+ * Serves a fault in a user mapping of a BAR whose start maps physical address pa.
+ * A traced page is emulated; an untraced one maps the BAR, or ones while gated.
  */
 vm_fault_t smptrace_user_huge_fault(struct vm_fault *vmf, unsigned int order, phys_addr_t pa)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	unsigned long addr = vmf->address & ~((PAGE_SIZE << order) - 1);
 	unsigned long pfn = PHYS_PFN(pa) + ((addr - vma->vm_start) >> PAGE_SHIFT);
-	bool traced;
+	struct page *scratch = READ_ONCE(smptrace_scratch);
+	bool traced, gated;
 	int err;
 
 	if (order && (addr < vma->vm_start || addr + (PAGE_SIZE << order) > vma->vm_end ||
 	              pfn & ((1UL << order) - 1)))
 		return VM_FAULT_FALLBACK;
 
-	scoped_guard(smptrace_active, &smptrace_active_srcu)
+	scoped_guard(smptrace_active, &smptrace_active_srcu) {
 		traced = smptrace_pa_traced(PFN_PHYS(pfn), PAGE_SIZE << order);
-	/* A huge page with a traced part is faulted page by page */
-	if (traced && order)
+		gated = smptrace_pa_gated(PFN_PHYS(pfn), PAGE_SIZE << order);
+	}
+	/* A huge page with a traced part, or a gated one, is faulted page by page */
+	if ((traced || gated) && order)
 		return VM_FAULT_FALLBACK;
+	if (gated && !traced && !scratch)
+		traced = true;
 
 	/* Only a user-mode load or store has an instruction to emulate. A
 	 * kernel access (uaccess) gets -EFAULT, an instruction fetch SIGBUS. */
@@ -79,8 +109,18 @@ vm_fault_t smptrace_user_huge_fault(struct vm_fault *vmf, unsigned int order, ph
 	                                        vma->vm_start, vma->vm_end, pa) : -ENOENT;
 	if (!err || err == -EAGAIN)
 		return VM_FAULT_NOPAGE;
-	if (err == -ENOENT)
+	if (err == -ENOENT) {
 		/* Not traced, or no longer (the device model is gone) */
-		return smptrace_user_insert(vmf, pfn, order);
+		bool use_scratch = gated && scratch;
+		vm_fault_t ret = smptrace_user_insert(vmf, use_scratch ? page_to_pfn(scratch) : pfn, order);
+
+		smp_mb();
+		scoped_guard(smptrace_active, &smptrace_active_srcu)
+			gated = smptrace_pa_gated(PFN_PHYS(pfn), PAGE_SIZE << order);
+		if (gated == use_scratch)
+			return ret;
+		zap_vma_ptes(vma, addr, PAGE_SIZE << order);
+		return VM_FAULT_NOPAGE;
+	}
 	return VM_FAULT_SIGBUS;
 }
