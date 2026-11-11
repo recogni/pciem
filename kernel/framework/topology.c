@@ -1321,6 +1321,7 @@ void pciem_topo_dev_down(struct pciem_root_complex *v)
 
 	scoped_guard(raw_spinlock_irqsave, &t->lock) {
 		s->dev_down = true;
+		s->reach_last = false;
 		pciem_link_partner(s->link, false, 0, 0);
 	}
 	pciem_topo_kick_work(t);
