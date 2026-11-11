@@ -471,6 +471,18 @@ static void create_device(void)
 		err(1, "PCIEM_IOCTL_REGISTER");
 	if (ioctl(ctl_fd, PCIEM_IOCTL_START) < 0)
 		err(1, "PCIEM_IOCTL_START");
+	{
+		struct pciem_trace_bar tb = { .bar_index = 0 };
+		struct pciem_trace_range head = { .offset = 0, .length = 4096 };
+		struct pciem_trace_bar_ranges tr = {
+			.bar_index = 2, .nr_ranges = 1, .ranges = (uintptr_t)&head,
+		};
+
+		if (ioctl(ctl_fd, PCIEM_IOCTL_TRACE_BAR, &tb) < 0)
+			err(1, "PCIEM_IOCTL_TRACE_BAR");
+		if (ioctl(ctl_fd, PCIEM_IOCTL_TRACE_BAR_RANGES, &tr) < 0)
+			err(1, "PCIEM_IOCTL_TRACE_BAR_RANGES");
+	}
 }
 
 static int find_ep(void)
@@ -669,6 +681,106 @@ static void step_down_up(void)
 	report(bar1 == 0 && (bar0 & ~0xfu) == 0, "EP BARs read 0x%08x%08x after the link came back", bar1, bar0);
 	rc = dma_read_iova0(ctl_fd);
 	report(rc != ENOLINK, "DMA after the link came back reaches translation: %s", strerror(rc));
+	restore_ep_cfg();
+}
+
+static void step_mse(void)
+{
+	const uint32_t pat = 0xa5a5c3c3u, other = 0x5a5a3c3cu;
+	volatile uint32_t *map;
+	char path[300];
+	int fd, rc;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource0", ep_bdf);
+	fd = open(path, O_RDWR);
+	map = fd < 0 ? MAP_FAILED : mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	report(map != MAP_FAILED, "resource0 of %s maps", ep_bdf);
+	if (map == MAP_FAILED)
+		return;
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	map[16] = pat;
+	report(map[16] == pat, "BAR reads back 0x%08x with Memory Space Enable set", map[16]);
+	cfg_write16(ep_bdf, PCI_COMMAND, 0);
+	report(map[16] == 0xffffffffu, "BAR reads 0x%08x with Memory Space Enable clear", map[16]);
+	map[16] = other;
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	report(map[16] == pat, "BAR holds 0x%08x after a write with the bit clear and the bit set again", map[16]);
+
+	rc = link_op(PCIEM_LINK_DOWN, 0, 0);
+	report(rc == 0, "PCIEM_LINK_DOWN: %s", strerror(rc));
+	rc = link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+	report(rc == 0, "PCIEM_LINK_UP: %s", strerror(rc));
+	report(wait_state(2000, 4, "ltssm", "L0", "dl", "up") == 0, "link is back in L0");
+	cfg_write16(ep_bdf, PCI_COMMAND, 0);
+	map[16] = other;
+	report(map[16] == 0xffffffffu, "BAR reads 0x%08x with Command cleared again", map[16]);
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	report(map[16] == pat, "BAR holds 0x%08x once Command is restored", map[16]);
+	munmap((void *)map, 4096);
+	close(fd);
+	restore_ep_cfg();
+}
+
+static void step_mse_untraced(void)
+{
+	const uint32_t pat = 0x13572468u, other = 0xdeadbeefu;
+	const unsigned int idx = (5 * 4096) / 4;
+	volatile uint32_t *map;
+	char path[300];
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource2", ep_bdf);
+	fd = open(path, O_RDWR);
+	map = fd < 0 ? MAP_FAILED : mmap(NULL, 8 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	report(map != MAP_FAILED, "resource2 of %s maps", ep_bdf);
+	if (map == MAP_FAILED)
+		return;
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	map[idx] = pat;
+	report(map[idx] == pat, "untraced BAR page reads back 0x%08x with Memory Space Enable set", map[idx]);
+	{
+		unsigned char blk[256], pats[256];
+
+		memset(pats, 0xa5, sizeof(pats));
+		memcpy((void *)((char *)map + 5 * 4096 + 512), pats, sizeof(pats));
+		memcpy(blk, (const void *)((const char *)map + 5 * 4096 + 512), sizeof(blk));
+		report(!memcmp(blk, pats, sizeof(blk)), "a block copy of an untraced BAR page reads back its contents");
+	}
+	cfg_write16(ep_bdf, PCI_COMMAND, 0);
+	sleep_ms(100);
+	report(map[idx] == 0xffffffffu, "untraced BAR page, already mapped, reads 0x%08x with the bit clear", map[idx]);
+	{
+		unsigned char blk[256], ones[256];
+
+		memset(ones, 0xff, sizeof(ones));
+		memset(blk, 0, sizeof(blk));
+		memcpy(blk, (const void *)((const char *)map + 5 * 4096 + 512), sizeof(blk));
+		report(!memcmp(blk, ones, sizeof(blk)), "a block copy of a gated untraced page reads all 0xff without a signal");
+		memset(blk, 0x5a, sizeof(blk));
+		memcpy((void *)((char *)map + 5 * 4096 + 512), blk, sizeof(blk));
+	}
+	map[idx] = other;
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	sleep_ms(100);
+	report(map[idx] == pat, "untraced BAR page holds 0x%08x after a dropped write and the bit set again", map[idx]);
+	{
+		unsigned char blk[256], pats[256];
+
+		memset(pats, 0xa5, sizeof(pats));
+		memcpy(blk, (const void *)((const char *)map + 5 * 4096 + 512), sizeof(blk));
+		report(!memcmp(blk, pats, sizeof(blk)), "a block copy reads the original contents once the bit is set again");
+	}
+
+	link_op(PCIEM_LINK_DOWN, 0, 0);
+	sleep_ms(100);
+	report(map[idx] == 0xffffffffu, "untraced BAR page reads 0x%08x once the link drop has reset Command", map[idx]);
+	link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+	wait_state(2000, 4, "ltssm", "L0", "dl", "up");
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	sleep_ms(100);
+	report(map[idx] == pat, "untraced BAR page holds 0x%08x once Command is restored", map[idx]);
+	munmap((void *)map, 8 * 4096);
+	close(fd);
 	restore_ep_cfg();
 }
 
@@ -1218,6 +1330,245 @@ static int wait_path(const char *fmt, const char *a, int present, int ms)
 	return 0;
 }
 
+struct bar_snap {
+	char res[2][96];
+	uint64_t wsize;
+	uint32_t cfg[4];
+};
+
+static int res_line(const char *bdf, int idx, char *out, size_t size)
+{
+	char buf[2048], *line;
+	int i;
+
+	if (sys_read(bdf, "resource", buf, sizeof(buf)))
+		return -1;
+	line = buf;
+	for (i = 0; i < idx && line; i++) {
+		line = strchr(line, '\n');
+		if (line)
+			line++;
+	}
+	if (!line)
+		return -1;
+	snprintf(out, size, "%.*s", (int)strcspn(line, "\n"), line);
+	return 0;
+}
+
+static int res_range(const char *bdf, int idx, uint64_t *start, uint64_t *end)
+{
+	char line[96];
+	unsigned long long a, b;
+
+	if (res_line(bdf, idx, line, sizeof(line)) || sscanf(line, "%llx %llx", &a, &b) != 2)
+		return -1;
+	*start = a;
+	*end = b;
+	return 0;
+}
+
+static void snap_ep(const char *bdf, struct bar_snap *sn)
+{
+	memset(sn, 0, sizeof(*sn));
+	res_line(bdf, 0, sn->res[0], sizeof(sn->res[0]));
+	res_line(bdf, 2, sn->res[1], sizeof(sn->res[1]));
+	for (int i = 0; i < 4; i++)
+		cfg_read(bdf, PCI_BASE_ADDRESS_0 + 4 * i, 4, &sn->cfg[i]);
+}
+
+static void parent_of(const char *bdf, char *out, size_t size)
+{
+	char path[300], real[PATH_MAX], *slash;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s", bdf);
+	out[0] = '\0';
+	if (!realpath(path, real))
+		return;
+	slash = strrchr(real, '/');
+	if (!slash)
+		return;
+	*slash = '\0';
+	slash = strrchr(real, '/');
+	snprintf(out, size, "%.12s", slash ? slash + 1 : real);
+}
+
+static int bars_in_window(const char *ep, const char *par, uint64_t *wsize)
+{
+	uint64_t ws, we, bs, be;
+
+	if (res_range(par, 15, &ws, &we) || !we)
+		return 0;
+	*wsize = we;
+	*wsize -= ws;
+	for (int bar = 0; bar < 3; bar += 2) {
+		if (res_range(ep, bar, &bs, &be) || !bs)
+			return 0;
+		if ((bs & 0xffffffffu) < (ws & 0xffffffffu) || (be & 0xffffffffu) > (we & 0xffffffffu))
+			return 0;
+	}
+	return 1;
+}
+
+static int mmio_ok(const char *bdf)
+{
+	char path[300];
+	volatile uint32_t *map;
+	uint32_t a, b;
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/enable", bdf);
+	write_str(path, "1");
+	cfg_write16(bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource0", bdf);
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return 0;
+	map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED)
+		return 0;
+	map[16] = 0xa5a5c3c3u;
+	a = map[16];
+	map[16] = 0x5a5a3c3cu;
+	b = map[16];
+	munmap((void *)map, 4096);
+	if (a != 0xa5a5c3c3u || b != 0x5a5a3c3cu) {
+		uint32_t cmd = 0;
+
+		cfg_read(bdf, PCI_COMMAND, 2, &cmd);
+		note("%s: pattern reads 0x%08x 0x%08x, Command 0x%04x", bdf, a, b, cmd);
+	}
+	return a == 0xa5a5c3c3u && b == 0x5a5a3c3cu;
+}
+
+static int chain_holds(const char *ep, const char (*brs)[16], int nbr)
+{
+	char cur[16];
+
+	snprintf(cur, sizeof(cur), "%s", ep);
+	for (int depth = 0; depth < MAX_CHAIN + 2; depth++) {
+		uint64_t ws = 0, we = 0, bs, be;
+		char up[16];
+		int k, isbr = 0;
+
+		parent_of(cur, up, sizeof(up));
+		for (k = 0; k < nbr; k++)
+			isbr = isbr || !strcmp(up, brs[k]);
+		if (!isbr)
+			return 1;
+		if (res_range(up, 15, &ws, &we) || !we || res_range(ep, 0, &bs, &be) || bs < ws || be > we ||
+		    res_range(ep, 2, &bs, &be) || bs < ws || be > we)
+			return 0;
+		snprintf(cur, sizeof(cur), "%s", up);
+	}
+	return 1;
+}
+
+static void rescan_case(const char *what, const char *victim, const char (*eps)[16], int n,
+			const char (*brs)[16], int nbr, int flap)
+{
+	struct bar_snap before[MAXDEV], after[MAXDEV];
+	char path[300];
+	int i, back = 1, same = 1, inside = 1, regs = 1, mmio = 1, wins = 1, held_before[MAXDEV];
+	int dis_before = dmesg_count("disabling bridge window [mem 0x");
+
+	for (i = 0; i < n; i++) {
+		char par[16];
+
+		held_before[i] = chain_holds(eps[i], brs, nbr);
+		snap_ep(eps[i], &before[i]);
+		parent_of(eps[i], par, sizeof(par));
+		bars_in_window(eps[i], par, &before[i].wsize);
+	}
+	if (flap) {
+		link_op(PCIEM_LINK_DOWN, 0, 0);
+		link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+		wait_state(2000, 4, "ltssm", "L0", "dl", "up");
+		sleep_ms(1000);
+	}
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/remove", victim);
+	report(write_str(path, "1") == 0, "%s: removed %s", what, victim);
+	wait_path("/sys/bus/pci/devices/%s", victim, 0, 3000);
+	write_str("/sys/bus/pci/rescan", "1");
+	for (i = 0; i < n; i++)
+		back = back && wait_path("/sys/bus/pci/devices/%s", eps[i], 1, 5000);
+	sleep_ms(1000);
+	for (i = 0; i < n && back; i++) {
+		if (!chain_holds(eps[i], brs, nbr) && !(held_before[i] == 0 && !strcmp(victim, eps[i]))) {
+			wins = 0;
+			note("%s: a bridge window above %s does not hold its BARs", what, eps[i]);
+		}
+	}
+	for (i = 0; i < n && back; i++) {
+		char par[16];
+
+		snap_ep(eps[i], &after[i]);
+		same = same && !strncmp(before[i].res[0], after[i].res[0], 37) &&
+		       !strncmp(before[i].res[1], after[i].res[1], 37);
+		regs = regs && before[i].cfg[0] == after[i].cfg[0] && before[i].cfg[1] == after[i].cfg[1] &&
+		       before[i].cfg[2] == after[i].cfg[2] && before[i].cfg[3] == after[i].cfg[3] &&
+		       ((after[i].cfg[0] & ~0xfu) || after[i].cfg[1]) && ((after[i].cfg[2] & ~0xfu) || after[i].cfg[3]);
+		parent_of(eps[i], par, sizeof(par));
+		inside = inside && bars_in_window(eps[i], par, &after[i].wsize) && after[i].wsize == before[i].wsize;
+		for (int try = 0; try < 3; try++) {
+			if (mmio_ok(eps[i])) {
+				if (try)
+					note("%s: %s MMIO needed %d tries", what, eps[i], try + 1);
+				break;
+			}
+			sleep_ms(500);
+			if (try == 2)
+				mmio = 0;
+		}
+		if (!same || !regs || !inside)
+			note("%s: %s BAR0 %s -> %s, BAR2 %s -> %s, window size %llx -> %llx", what, eps[i],
+			     before[i].res[0], after[i].res[0], before[i].res[1], after[i].res[1],
+			     (unsigned long long)before[i].wsize, (unsigned long long)after[i].wsize);
+	}
+	report(back, "%s: all %d endpoints are back", what, n);
+	report(back && same, "%s: the BAR addresses are the same as before", what);
+	report(back && regs, "%s: the config BARs are programmed and match", what);
+	report(back && inside, "%s: the BARs lie inside the parent bridge window and it has its old size", what);
+	report(back && wins, "%s: every bridge window above an endpoint holds its BARs", what);
+	report(dmesg_count("disabling bridge window [mem 0x") == dis_before,
+	       "%s: no bridge window with an address was disabled", what);
+	report(back && mmio, "%s: MMIO reads back a written pattern on the re-added device", what);
+}
+
+static void rescan_run(const char *rp, const char *usp, const char (*dsp)[16], const char (*eps)[16], int n)
+{
+	char one[1][16], brs[MAXDEV + 2][16];
+	int nbr = 0, k;
+
+	snprintf(brs[nbr++], 16, "%.12s", rp);
+	if (usp)
+		snprintf(brs[nbr++], 16, "%.12s", usp);
+	for (k = 0; dsp && k < n; k++)
+		snprintf(brs[nbr++], 16, "%.12s", dsp[k]);
+
+	memcpy(one[0], eps[0], 16);
+	rescan_case("endpoint", eps[0], (const char (*)[16])one, 1, (const char (*)[16])brs, nbr, 0);
+	if (dsp) {
+		memcpy(one[0], eps[n > 1 ? 1 : 0], 16);
+		rescan_case("downstream port", dsp[n > 1 ? 1 : 0], (const char (*)[16])one, 1,
+			    (const char (*)[16])brs, nbr, 0);
+	}
+	if (usp)
+		rescan_case("upstream port", usp, eps, n, (const char (*)[16])brs, nbr, 0);
+	rescan_case("root port", rp, eps, n, (const char (*)[16])brs, nbr, 0);
+}
+
+
+static void step_rescan_flap(void)
+{
+	char eps[1][16], brs[1][16];
+
+	snprintf(eps[0], sizeof(eps[0]), "%s", ep_bdf);
+	snprintf(brs[0], sizeof(brs[0]), "%s", port_bdf);
+	rescan_case("endpoint after a link flap", ep_bdf, (const char (*)[16])eps, 1, (const char (*)[16])brs, 1, 1);
+	restore_ep_cfg();
+}
+
 static void msave(struct mdev *m)
 {
 	cfg_read(m->ep, PCI_BASE_ADDRESS_0, 4, &m->bar0);
@@ -1659,9 +2010,13 @@ static void multi_run_close_all(int n, const int *order)
 
 static int multi_partial(void)
 {
+	int warn_before = dmesg_count("WARNING:"), bug_before = dmesg_count("BUG:");
 	static const int ports[] = { 2, 0 };
+	char eps[2][16], dsps[3][16];
 	int i, rc;
 
+	snprintf(sw_rp, sizeof(sw_rp), "0000:%02x:00.0", SW_BUS);
+	snprintf(sw_usp, sizeof(sw_usp), "0000:%02x:00.0", SW_BUS + 1);
 	for (i = 0; i <= MAXDEV; i++)
 		md[i].ctl = -1;
 	for (i = 0; i < 2; i++) {
@@ -1671,8 +2026,53 @@ static int multi_partial(void)
 			return 1;
 		report(wait_path("/sys/bus/pci/devices/%s", md[ports[i]].ep, 1, 5000), "EP %s appeared", md[ports[i]].ep);
 	}
+	msel(&md[0]);
+	for (i = 0; i < 2; i++)
+		snprintf(eps[i], sizeof(eps[i]), "%s", md[ports[i]].ep);
+	for (i = 0; i < 3; i++)
+		snprintf(dsps[i], sizeof(dsps[i]), "0000:%02x:%02x.0", SW_BUS + 2, i);
+	{
+		char brs[5][16];
+		int nbr = 0;
+
+		snprintf(brs[nbr++], 16, "%s", sw_rp);
+		snprintf(brs[nbr++], 16, "%s", sw_usp);
+		for (i = 0; i < 3; i++)
+			snprintf(brs[nbr++], 16, "%s", dsps[i]);
+		rescan_case("empty downstream port", dsps[1], (const char (*)[16])eps, 2, (const char (*)[16])brs, nbr, 0);
+		rescan_case("upstream port with an empty slot", sw_usp, (const char (*)[16])eps, 2,
+			    (const char (*)[16])brs, nbr, 0);
+		rescan_case("root port with an empty slot", sw_rp, (const char (*)[16])eps, 2, (const char (*)[16])brs,
+			    nbr, 0);
+	}
+	rc = mdev_create(1, 3, 0, BAR2_SIZE, 1);
+	report(rc == 0, "device on the empty port 1 registered: %s", strerror(rc));
+	report(!rc && wait_path("/sys/bus/pci/devices/%s", md[1].ep, 1, 5000), "EP %s attached after the rescans appears",
+	       md[1].ep);
+	report(vendor_ok(md[1].ep), "EP %s answers config", md[1].ep);
+	{
+		struct bar_snap sn;
+
+		snap_ep(md[1].ep, &sn);
+		note("EP %s BAR0 %s, BAR2 %s, cfg %08x %08x", md[1].ep, sn.res[0], sn.res[1], sn.cfg[0], sn.cfg[2]);
+	}
+	sleep_ms(300);
+	report(mmio_ok(md[1].ep), "EP %s answers MMIO", md[1].ep);
+	report(dmesg_count("WARNING:") == warn_before && dmesg_count("BUG:") == bug_before,
+	       "dmesg has no new WARNING: or BUG: lines");
 	printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
 	return failures ? 1 : 0;
+}
+
+static void multi_rescan(int n)
+{
+	char eps[MAXDEV][16], dsps[MAXDEV][16];
+
+	for (int k = 0; k < n; k++) {
+		snprintf(eps[k], sizeof(eps[k]), "%s", md[k].ep);
+		snprintf(dsps[k], sizeof(dsps[k]), "%s", md[k].dsp);
+	}
+	rescan_run(sw_rp, sw_usp, (const char (*)[16])dsps, (const char (*)[16])eps, n);
 }
 
 static int multi_main(int n)
@@ -1711,6 +2111,7 @@ static int multi_main(int n)
 	multi_sbr(n);
 	multi_usp_sbr(n);
 	multi_detach(n);
+	multi_rescan(n);
 	if (n > 1)
 		multi_errors(n);
 
@@ -1790,8 +2191,17 @@ int main(int argc, char **argv)
 	if (getenv("TOPO_HOLD") && *getenv("TOPO_HOLD"))
 		sleep(atoi(getenv("TOPO_HOLD")));
 	step_initial_link();
+	if (placement == PCIEM_PLACEMENT_ROOT_PORT) {
+		char eps[1][16];
+
+		snprintf(eps[0], sizeof(eps[0]), "%s", ep_bdf);
+		rescan_run(chain[0], NULL, NULL, (const char (*)[16])eps, 1);
+	}
 	save_ep_cfg();
 	step_down_up();
+	step_mse();
+	step_mse_untraced();
+	step_rescan_flap();
 	step_rrs();
 	step_retrain();
 	step_recovery_resume();

@@ -212,6 +212,7 @@ int pciem_topo_layout_bars(struct pciem_root_complex *v, struct list_head *windo
 void pciem_topo_free_chunks(struct pciem_topo *t);
 int pciem_topo_program(struct pciem_root_complex *v, int domain, u8 root_bus);
 void pciem_topo_scanned(struct pciem_topo *t, struct pci_bus *root);
+void pciem_topo_port_readded(struct pciem_topo *t, struct pci_dev *pdev);
 void pciem_topo_start(struct pciem_topo *t);
 void pciem_topo_wait_trained(struct pciem_topo *t);
 void pciem_topo_quiesce(struct pciem_topo *t);
