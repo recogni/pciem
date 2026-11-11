@@ -183,9 +183,32 @@ struct pciem_msi_vecs *pciem_msi_vecs_from_pdev(struct pci_dev *pdev)
     return v ? &v->msi : NULL;
 }
 
+static void pciem_restore_ep_bars(struct pciem_root_complex *v, struct pci_dev *pdev)
+{
+    int i;
+
+    for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+        struct pciem_bar_info *bar = &v->bars[i];
+        struct resource *res = &pdev->resource[i];
+        phys_addr_t addr = bar->phys_addr ?: bar->carved_start;
+
+        if (!bar->size)
+            continue;
+        res->start = addr;
+        res->end = addr + bar->size - 1;
+        res->flags &= ~(IORESOURCE_UNSET | IORESOURCE_DISABLED);
+        res->flags |= IORESOURCE_MEM | IORESOURCE_PCI_FIXED;
+        bar->res = res;
+        bar->base_addr_val = (u32)addr;
+        if ((bar->flags & PCI_BASE_ADDRESS_MEM_TYPE_64) && i + 1 < PCI_STD_NUM_BARS)
+            v->bars[i + 1].base_addr_val = (u32)(addr >> 32);
+    }
+}
+
 static int pciem_pdev_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
     struct device *dev = data;
+    struct pciem_host_bridge_priv *priv;
     struct pciem_root_complex *v;
     struct pci_dev *pdev, *old;
 
@@ -193,8 +216,15 @@ static int pciem_pdev_notify(struct notifier_block *nb, unsigned long action, vo
         return NOTIFY_DONE;
 
     pdev = to_pci_dev(dev);
+    if (pdev->hdr_type == PCI_HEADER_TYPE_BRIDGE && pdev->bus->ops == &vph_pci_ops) {
+        priv = pci_host_bridge_priv(pci_find_host_bridge(pdev->bus));
+        if (priv->topo)
+            pciem_topo_port_readded(priv->topo, pdev);
+        return NOTIFY_DONE;
+    }
+
     v = pciem_rc_from_pdev(pdev);
-    if (!v || !v->topo)
+    if (!v)
         return NOTIFY_DONE;
 
     old = READ_ONCE(v->pciem_pdev);
@@ -203,6 +233,7 @@ static int pciem_pdev_notify(struct notifier_block *nb, unsigned long action, vo
 
     WRITE_ONCE(v->pciem_pdev, pci_dev_get(pdev));
     pci_dev_put(old);
+    pciem_restore_ep_bars(v, pdev);
     return NOTIFY_OK;
 }
 
