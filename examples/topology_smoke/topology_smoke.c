@@ -471,6 +471,18 @@ static void create_device(void)
 		err(1, "PCIEM_IOCTL_REGISTER");
 	if (ioctl(ctl_fd, PCIEM_IOCTL_START) < 0)
 		err(1, "PCIEM_IOCTL_START");
+	{
+		struct pciem_trace_bar tb = { .bar_index = 0 };
+		struct pciem_trace_range head = { .offset = 0, .length = 4096 };
+		struct pciem_trace_bar_ranges tr = {
+			.bar_index = 2, .nr_ranges = 1, .ranges = (uintptr_t)&head,
+		};
+
+		if (ioctl(ctl_fd, PCIEM_IOCTL_TRACE_BAR, &tb) < 0)
+			err(1, "PCIEM_IOCTL_TRACE_BAR");
+		if (ioctl(ctl_fd, PCIEM_IOCTL_TRACE_BAR_RANGES, &tr) < 0)
+			err(1, "PCIEM_IOCTL_TRACE_BAR_RANGES");
+	}
 }
 
 static int find_ep(void)
@@ -669,6 +681,106 @@ static void step_down_up(void)
 	report(bar1 == 0 && (bar0 & ~0xfu) == 0, "EP BARs read 0x%08x%08x after the link came back", bar1, bar0);
 	rc = dma_read_iova0(ctl_fd);
 	report(rc != ENOLINK, "DMA after the link came back reaches translation: %s", strerror(rc));
+	restore_ep_cfg();
+}
+
+static void step_mse(void)
+{
+	const uint32_t pat = 0xa5a5c3c3u, other = 0x5a5a3c3cu;
+	volatile uint32_t *map;
+	char path[300];
+	int fd, rc;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource0", ep_bdf);
+	fd = open(path, O_RDWR);
+	map = fd < 0 ? MAP_FAILED : mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	report(map != MAP_FAILED, "resource0 of %s maps", ep_bdf);
+	if (map == MAP_FAILED)
+		return;
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	map[16] = pat;
+	report(map[16] == pat, "BAR reads back 0x%08x with Memory Space Enable set", map[16]);
+	cfg_write16(ep_bdf, PCI_COMMAND, 0);
+	report(map[16] == 0xffffffffu, "BAR reads 0x%08x with Memory Space Enable clear", map[16]);
+	map[16] = other;
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	report(map[16] == pat, "BAR holds 0x%08x after a write with the bit clear and the bit set again", map[16]);
+
+	rc = link_op(PCIEM_LINK_DOWN, 0, 0);
+	report(rc == 0, "PCIEM_LINK_DOWN: %s", strerror(rc));
+	rc = link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+	report(rc == 0, "PCIEM_LINK_UP: %s", strerror(rc));
+	report(wait_state(2000, 4, "ltssm", "L0", "dl", "up") == 0, "link is back in L0");
+	cfg_write16(ep_bdf, PCI_COMMAND, 0);
+	map[16] = other;
+	report(map[16] == 0xffffffffu, "BAR reads 0x%08x with Command cleared again", map[16]);
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	report(map[16] == pat, "BAR holds 0x%08x once Command is restored", map[16]);
+	munmap((void *)map, 4096);
+	close(fd);
+	restore_ep_cfg();
+}
+
+static void step_mse_untraced(void)
+{
+	const uint32_t pat = 0x13572468u, other = 0xdeadbeefu;
+	const unsigned int idx = (5 * 4096) / 4;
+	volatile uint32_t *map;
+	char path[300];
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource2", ep_bdf);
+	fd = open(path, O_RDWR);
+	map = fd < 0 ? MAP_FAILED : mmap(NULL, 8 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	report(map != MAP_FAILED, "resource2 of %s maps", ep_bdf);
+	if (map == MAP_FAILED)
+		return;
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	map[idx] = pat;
+	report(map[idx] == pat, "untraced BAR page reads back 0x%08x with Memory Space Enable set", map[idx]);
+	{
+		unsigned char blk[256], pats[256];
+
+		memset(pats, 0xa5, sizeof(pats));
+		memcpy((void *)((char *)map + 5 * 4096 + 512), pats, sizeof(pats));
+		memcpy(blk, (const void *)((const char *)map + 5 * 4096 + 512), sizeof(blk));
+		report(!memcmp(blk, pats, sizeof(blk)), "a block copy of an untraced BAR page reads back its contents");
+	}
+	cfg_write16(ep_bdf, PCI_COMMAND, 0);
+	sleep_ms(100);
+	report(map[idx] == 0xffffffffu, "untraced BAR page, already mapped, reads 0x%08x with the bit clear", map[idx]);
+	{
+		unsigned char blk[256], ones[256];
+
+		memset(ones, 0xff, sizeof(ones));
+		memset(blk, 0, sizeof(blk));
+		memcpy(blk, (const void *)((const char *)map + 5 * 4096 + 512), sizeof(blk));
+		report(!memcmp(blk, ones, sizeof(blk)), "a block copy of a gated untraced page reads all 0xff without a signal");
+		memset(blk, 0x5a, sizeof(blk));
+		memcpy((void *)((char *)map + 5 * 4096 + 512), blk, sizeof(blk));
+	}
+	map[idx] = other;
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	sleep_ms(100);
+	report(map[idx] == pat, "untraced BAR page holds 0x%08x after a dropped write and the bit set again", map[idx]);
+	{
+		unsigned char blk[256], pats[256];
+
+		memset(pats, 0xa5, sizeof(pats));
+		memcpy(blk, (const void *)((const char *)map + 5 * 4096 + 512), sizeof(blk));
+		report(!memcmp(blk, pats, sizeof(blk)), "a block copy reads the original contents once the bit is set again");
+	}
+
+	link_op(PCIEM_LINK_DOWN, 0, 0);
+	sleep_ms(100);
+	report(map[idx] == 0xffffffffu, "untraced BAR page reads 0x%08x once the link drop has reset Command", map[idx]);
+	link_op(PCIEM_LINK_UP, PCIEM_LINK_SPEED_32GT, 8);
+	wait_state(2000, 4, "ltssm", "L0", "dl", "up");
+	cfg_write16(ep_bdf, PCI_COMMAND, PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	sleep_ms(100);
+	report(map[idx] == pat, "untraced BAR page holds 0x%08x once Command is restored", map[idx]);
+	munmap((void *)map, 8 * 4096);
+	close(fd);
 	restore_ep_cfg();
 }
 
@@ -2087,6 +2199,8 @@ int main(int argc, char **argv)
 	}
 	save_ep_cfg();
 	step_down_up();
+	step_mse();
+	step_mse_untraced();
 	step_rescan_flap();
 	step_rrs();
 	step_retrain();
