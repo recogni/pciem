@@ -71,10 +71,12 @@ static bool smptrace_vfio_mem_usable(struct vfio_pci_core_device *vdev)
 static void smptrace_vfio_vma_open(struct vm_area_struct *vma)
 {
 	__module_get(THIS_MODULE);
+	smptrace_umap_add(vma_phys(vma), vma->vm_end - vma->vm_start, vma);
 }
 
 static void smptrace_vfio_vma_close(struct vm_area_struct *vma)
 {
+	smptrace_umap_del(vma_phys(vma), vma->vm_end - vma->vm_start, vma);
 	module_put(THIS_MODULE);
 }
 
@@ -231,11 +233,10 @@ static int smptrace_vfio_enter_bar_rw(struct kprobe *kp, struct pt_regs *regs)
 	if (pos >= len || !count)
 		return 0;
 
-	/* Only a transfer that reaches a traced range goes to the tracer. One
-	 * that misses them all takes vfio-pci's path, whose mapping of the BAR
-	 * is not poisoned outside them. */
+	/* Every transfer to a tracked BAR goes to the tracer, so that it can
+	 * be gated while memory decoding is off. */
 	scoped_guard(smptrace_active, &smptrace_active_srcu)
-		traced = smptrace_pa_traced(start + pos, min_t(u64, count, len - pos));
+		traced = smptrace_pa_tracked(start + pos, min_t(u64, count, len - pos));
 	if (!traced || !try_module_get(THIS_MODULE))
 		return 0;
 
@@ -273,12 +274,13 @@ static int smptrace_vfio_exit_mmap(struct kretprobe_instance *ri, struct pt_regs
 		return 0;
 
 	/* The vma is not yet visible to other threads: mmap() inserts it only
-	 * after the file's ->mmap returns. One that no traced range reaches
-	 * keeps vfio-pci's own handler. */
+	 * after the file's ->mmap returns. One that no tracer reaches keeps
+	 * vfio-pci's own handler. */
 	scoped_guard(smptrace_active, &smptrace_active_srcu)
-		traced = smptrace_pa_traced(vma_phys(vma), vma->vm_end - vma->vm_start);
+		traced = smptrace_pa_tracked(vma_phys(vma), vma->vm_end - vma->vm_start);
 	if (!traced || !try_module_get(THIS_MODULE))
 		return 0;
+	smptrace_umap_add(vma_phys(vma), vma->vm_end - vma->vm_start, vma);
 
 	vma->vm_ops = &smptrace_vfio_vm_ops;
 	return 0;

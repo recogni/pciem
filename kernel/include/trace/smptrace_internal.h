@@ -61,6 +61,13 @@ DEFINE_LOCK_GUARD_1(smptrace_active, struct srcu_struct,
 		    int idx)
 struct smptrace_ctx *smptrace_find_ctx(phys_addr_t pa, size_t len);
 bool smptrace_pa_traced(phys_addr_t pa, size_t len);
+bool smptrace_pa_tracked(phys_addr_t pa, size_t len);
+bool smptrace_pa_gated(phys_addr_t pa, size_t len);
+int smptrace_scratch_alloc(void);
+void smptrace_scratch_free(void);
+void smptrace_scratch_fill(void);
+int smptrace_umap_add(phys_addr_t pa, size_t len, struct vm_area_struct *vma);
+void smptrace_umap_del(phys_addr_t pa, size_t len, struct vm_area_struct *vma);
 int smptrace_enter_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs);
 int smptrace_exit_ioremap(struct kretprobe_instance *ri, struct pt_regs *regs);
 void smptrace_untrace_map(struct smptrace_ctx *ctx, unsigned long va);

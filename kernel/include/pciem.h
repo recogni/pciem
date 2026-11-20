@@ -114,6 +114,8 @@ struct pciem_root_complex
     struct pciem_topo *topo;
     void (*topo_reach_cb)(void *data, bool reachable);
     void *topo_reach_data;
+    void (*mem_gate_cb)(struct pciem_root_complex *v, void *data);
+    void *mem_gate_data;
     struct pciem_trace *trace;
     struct pci_dev *pciem_pdev;
     struct pci_bus *root_bus;
@@ -197,6 +199,7 @@ void pciem_set_intx(struct pciem_root_complex *v, bool asserted);
 void pciem_set_reset_notify(struct pciem_root_complex *v,
                             void (*fn)(void *data, u32 kind), void *data);
 void pciem_link_down(struct pciem_root_complex *v);
+void pciem_mem_gate_sync(struct pciem_root_complex *v);
 int pciem_link_up(struct pciem_root_complex *v, u8 speed, u8 width);
 bool pciem_ep_reachable(struct pciem_root_complex *v);
 int pciem_complete_init(struct pciem_root_complex *v);

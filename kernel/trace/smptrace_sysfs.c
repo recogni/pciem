@@ -38,18 +38,11 @@
  * Once the tracer is gone every page is mapped on first touch and the mapping
  * keeps working against the backing memory.
  *
- * Memory decoding is not modelled on this path: an access reaches the tracer,
- * or the backing memory, whatever the device's PCI_COMMAND says. On hardware
- * a sysfs mapping keeps its PTEs when decoding is turned off and the bus
- * answers reads with all-ones; pciem has no bus, pages already mapped would
- * reach the backing memory anyway, and nothing (vfio-pci zaps only its own
- * mappings) revokes a sysfs mapping when the bit changes, so a check at fault
- * time could only be partial. pciem's trap of kernel mappings does not model
- * it either.
+ * While the function's Memory Space Enable is clear, a tracked BAR's pages read
+ * all-ones: the gate zaps every mapping of the range, /dev/mem ones included.
  *
- * A mapping made before its BAR was traced has all its PTEs already and is
- * not affected by the tracing: as for a vfio-pci mapping made then, its
- * accesses reach the backing memory unseen.
+ * A mapping made before its BAR was traced has all its PTEs already, so its
+ * accesses reach the backing memory unseen until the gate first closes.
  *
  * x86 only, like the vfio-pci mmap() trap: only x86 has a user-mode emulator.
  */
@@ -86,10 +79,12 @@ static bool smptrace_sysfs_resource_file(struct file *file)
 static void smptrace_sysfs_vma_open(struct vm_area_struct *vma)
 {
 	__module_get(THIS_MODULE);
+	smptrace_umap_add(PFN_PHYS(vma->vm_pgoff), vma->vm_end - vma->vm_start, vma);
 }
 
 static void smptrace_sysfs_vma_close(struct vm_area_struct *vma)
 {
+	smptrace_umap_del(PFN_PHYS(vma->vm_pgoff), vma->vm_end - vma->vm_start, vma);
 	module_put(THIS_MODULE);
 }
 
@@ -163,6 +158,8 @@ static int smptrace_sysfs_mmap_range(struct pci_dev *pdev, int bar, struct vm_ar
 	/* What remap_pfn_range() sets */
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 
+	smptrace_umap_add(PFN_PHYS(vma->vm_pgoff), vma->vm_end - vma->vm_start, vma);
+
 	if (kernfs) {
 		/* The kernfs_fop_mmap() return handler finishes this */
 		vma->vm_private_data = &smptrace_sysfs_owned;
@@ -195,7 +192,7 @@ static int smptrace_sysfs_enter_mmap_range(struct kprobe *kp, struct pt_regs *re
 
 	pa = PFN_PHYS((pci_resource_start(pdev, bar) >> PAGE_SHIFT) + vma->vm_pgoff);
 	scoped_guard(smptrace_active, &smptrace_active_srcu)
-		traced = smptrace_pa_traced(pa, vma->vm_end - vma->vm_start);
+		traced = smptrace_pa_tracked(pa, vma->vm_end - vma->vm_start);
 	if (!traced)
 		return 0;
 
@@ -253,11 +250,13 @@ static int smptrace_sysfs_exit_kernfs_mmap(struct kretprobe_instance *ri, struct
 		/* Not redirected: the original mapped it */
 		return 0;
 
-	if (regs_return_value(regs))
+	if (regs_return_value(regs)) {
+		smptrace_umap_del(PFN_PHYS(vma->vm_pgoff), vma->vm_end - vma->vm_start, vma);
 		module_put(THIS_MODULE);
-	else
+	} else {
 		/* In place of kernfs's wrapper around smptrace_sysfs_kernfs_vm_ops */
 		vma->vm_ops = &smptrace_sysfs_vm_ops;
+	}
 	return 0;
 }
 
@@ -270,6 +269,8 @@ void smptrace_sysfs_init(void)
 	/* Only architectures with a user-mode emulator trap user mappings. */
 	if (!IS_ENABLED(CONFIG_X86))
 		return;
+	if (smptrace_scratch_alloc())
+		pr_warn("no scratch page: gated BAR pages are emulated\n");
 
 	/* First, so that no sysfs mapping is redirected without it */
 	smptrace_sysfs_krp = (struct kretprobe){
@@ -309,4 +310,5 @@ void smptrace_sysfs_exit(void)
 		unregister_kretprobe(&smptrace_sysfs_krp);
 		smptrace_sysfs_krp_registered = false;
 	}
+	smptrace_scratch_free();
 }

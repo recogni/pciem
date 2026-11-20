@@ -171,6 +171,23 @@ static ssize_t pciem_device_write(struct file *file, const char __user *buf, siz
 static long pciem_device_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static int pciem_device_mmap(struct file *file, struct vm_area_struct *vma);
 static int pciem_instance_release(struct inode *inode, struct file *file);
+static void pciem_mem_gate(struct pciem_root_complex *v, void *data)
+{
+    struct pciem_userspace_state *us = data;
+    unsigned int bar;
+    bool off;
+
+    do {
+        off = !(READ_ONCE(v->cfg[PCI_COMMAND]) & PCI_COMMAND_MEMORY);
+        for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+            struct pciem_tracer *tracer = &us->tracers[v->func_index][bar];
+
+            if (smp_load_acquire(&tracer->us))
+                smptrace_set_mem_off(&tracer->ctx, off);
+        }
+    } while (off != !(READ_ONCE(v->cfg[PCI_COMMAND]) & PCI_COMMAND_MEMORY));
+}
+
 static void pciem_ep_reach(void *data, bool reachable);
 
 const struct file_operations pciem_device_fops = {
@@ -340,6 +357,12 @@ static void pciem_irqfds_shutdown(struct pciem_irqfds *irqfds)
 static void pciem_tracing_destroy(struct pciem_userspace_state *us)
 {
     unsigned int f, i;
+
+    for (f = 0; f < PCIEM_MAX_FUNCTIONS; ++f) {
+        if (us->slot.funcs[f])
+            smp_store_release(&us->slot.funcs[f]->mem_gate_cb, NULL);
+    }
+    synchronize_rcu();
 
     for (f = 0; f < PCIEM_MAX_FUNCTIONS; ++f) {
         for (i = 0; i < PCI_STD_NUM_BARS; ++i) {
@@ -2267,7 +2290,11 @@ static int pciem_trace_bar(struct pciem_userspace_state *us, u32 bar_index, u32 
     {
         guard(write_lock)(&v->bars_lock);
         tracer->ctx.link_down = READ_ONCE(v->link_down);
-        tracer->us = us;
+        smp_store_release(&tracer->us, us);
+        v->mem_gate_data = us;
+        smp_store_release(&v->mem_gate_cb, pciem_mem_gate);
+        smp_mb();
+        pciem_mem_gate(v, us);
     }
 
     if (nr)

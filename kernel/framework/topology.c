@@ -694,6 +694,53 @@ void pciem_topo_scanned(struct pciem_topo *t, struct pci_bus *root)
 														   t->ports[i].devfn);
 }
 
+static void port_claim_windows(struct pciem_topo *t, struct pci_dev *pdev, int k)
+{
+	static const unsigned long pref_flags = IORESOURCE_MEM | IORESOURCE_PREFETCH | IORESOURCE_MEM_64 |
+						PCI_PREF_RANGE_TYPE_64;
+	struct pciem_topo_chunk *np = &t->chunk[0], *pf = &t->chunk[1];
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		struct pciem_topo_chunk *c = i ? pf : np;
+		int idx = i ? PCI_BRIDGE_PREF_MEM_WINDOW : PCI_BRIDGE_MEM_WINDOW;
+		struct resource *r = &pdev->resource[idx];
+		u64 start, size;
+
+		if (!c->size || r->parent)
+			continue;
+		start = c->start + (k >= 0 ? k * c->stride : 0);
+		size = k >= 0 ? c->stride : c->size;
+		r->start = start;
+		r->end = start + size - 1;
+		r->flags = i ? pref_flags : IORESOURCE_MEM;
+		pci_claim_resource(pdev, idx);
+	}
+}
+
+void pciem_topo_port_readded(struct pciem_topo *t, struct pci_dev *pdev)
+{
+	int i, k;
+
+	for (i = 0; i < t->nports; i++) {
+		struct pciem_port *p = &t->ports[i];
+		struct pci_dev *old = READ_ONCE(p->pdev);
+
+		if (p->bus != pdev->bus->number || p->devfn != pdev->devfn)
+			continue;
+		if (!old || old == pdev)
+			return;
+		WRITE_ONCE(p->pdev, pci_dev_get(pdev));
+		pci_dev_put(old);
+		p->added = true;
+		k = p->role == PCIEM_ROLE_DSP ? PCI_SLOT(pdev->devfn) : -1;
+		scoped_guard(raw_spinlock_irqsave, &t->lock)
+			port_set_windows(p, t, k);
+		port_claim_windows(t, pdev, k);
+		return;
+	}
+}
+
 void pciem_topo_release_pdevs(struct pciem_topo *t)
 {
 	int i;
@@ -1274,6 +1321,7 @@ void pciem_topo_dev_down(struct pciem_root_complex *v)
 
 	scoped_guard(raw_spinlock_irqsave, &t->lock) {
 		s->dev_down = true;
+		s->reach_last = false;
 		pciem_link_partner(s->link, false, 0, 0);
 	}
 	pciem_topo_kick_work(t);

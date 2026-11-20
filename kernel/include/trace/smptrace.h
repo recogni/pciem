@@ -81,6 +81,12 @@ struct smptrace_map {
 	struct llist_node reject;
 };
 
+/* A user mapping of the tracer's BAR, to zap while the gate is closed */
+struct smptrace_umap {
+	struct list_head node;
+	struct vm_area_struct *vma;
+};
+
 struct smptrace_ctx {
 	/* User hooks */
 	struct smptrace_notifier notif;
@@ -93,6 +99,7 @@ struct smptrace_ctx {
 	/* Whether to emulate writes into the BAR */
 	bool stop_writes;
 	bool link_down;
+	bool mem_off;
 	/*
 	 * The parts of [pa, pa + len) that are traced: sorted, disjoint, not
 	 * adjacent, page aligned. NULL traces all of it. Accesses elsewhere go
@@ -143,6 +150,10 @@ struct smptrace_ctx {
 
 	/* Whether this CPU is handling #PF or not */
 	bool __percpu *in_pf;
+
+	/* Zaps the user mappings when the gate closes */
+	struct work_struct gate_work;
+	struct list_head umaps;
 };
 
 
@@ -150,6 +161,7 @@ int smptrace_set_ranges(struct smptrace_ctx *ctx, const struct smptrace_range *r
                         unsigned int nr);
 void smptrace_free_ranges(struct smptrace_ctx *ctx);
 bool smptrace_traced(const struct smptrace_ctx *ctx, u64 off, u64 len);
+void smptrace_set_mem_off(struct smptrace_ctx *ctx, bool off);
 int smptrace_init(struct smptrace_ctx *ctx);
 /* Route userspace vfio-pci accesses (mmap, read, write) of traced BARs */
 void smptrace_vfio_init(void);
