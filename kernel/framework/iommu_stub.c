@@ -58,6 +58,7 @@
 #include <linux/printk.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 #include <linux/xarray.h>
 #include <linux/module.h>
 
@@ -78,11 +79,20 @@ static struct pciem_stub_domain *to_stub_domain(struct iommu_domain *domain)
     return container_of(domain, struct pciem_stub_domain, domain);
 }
 
+/* attach_dev gained the previously attached domain as a third argument
+ * in v6.19, backported to 6.18.57. The stubs ignore it. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 57)
+#define PCIEM_ATTACH_DEV_ARGS \
+    struct iommu_domain *domain, struct device *dev, struct iommu_domain *old
+#else
+#define PCIEM_ATTACH_DEV_ARGS struct iommu_domain *domain, struct device *dev
+#endif
+
 /* ---------------------------------------------------------------- */
 /* domain ops — per-page iova->phys bookkeeping                     */
 /* ---------------------------------------------------------------- */
 
-static int pciem_stub_attach_dev(struct iommu_domain *domain, struct device *dev)
+static int pciem_stub_attach_dev(PCIEM_ATTACH_DEV_ARGS)
 {
     return 0;
 }
@@ -173,7 +183,7 @@ static const struct iommu_domain_ops pciem_stub_domain_ops = {
  * single-instance ops->blocked_domain so the core never allocates one
  * via domain_alloc_paging. attach is a no-op: a blocked domain has no
  * table, and the stub never translates through it. free is NULL because the core never tries to free statics. */
-static int pciem_stub_blocked_attach(struct iommu_domain *domain, struct device *dev)
+static int pciem_stub_blocked_attach(PCIEM_ATTACH_DEV_ARGS)
 {
     return 0;
 }
@@ -197,7 +207,7 @@ static struct iommu_domain pciem_stub_blocked_domain = {
  * An identity domain has no table: iommu_iova_to_phys() returns the IOVA
  * itself, which is what a host driver using the DMA API directly hands
  * the device. vfio attaches its own paging domain over it. */
-static int pciem_stub_identity_attach(struct iommu_domain *domain, struct device *dev)
+static int pciem_stub_identity_attach(PCIEM_ATTACH_DEV_ARGS)
 {
     return 0;
 }
